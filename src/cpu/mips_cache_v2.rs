@@ -7,13 +7,25 @@
 // - L2 can signal back to L1 for evictions
 
 use crate::traits::{BusRead64, BusDevice, Resettable, BUS_OK, BUS_BUSY, BUS_ERR, BUS_VCE};
-use crate::snapshot::{u32_slice_to_toml, u64_slice_to_toml, load_u32_slice, load_u64_slice, get_field, toml_bool, toml_u32, hex_u32};
+use crate::snapshot::{u32_slice_to_toml, u64_slice_to_toml, load_u32_slice, load_u64_slice, get_field, toml_bool, toml_u32, toml_u64, hex_u32, hex_u64};
 use crate::cpu::mips_exec::{DecodedInstr, ExecStatus, EXEC_COMPLETE, EXEC_RETRY, exec_exception_const, EXC_VCEI, EXC_VCED, EXC_IBE, FLAG_NOT_DECODED, FLAG_IMM_IS_NEXT, EXEC_CACHE_ERR};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_MISS, CACHE_LOG_OP, devlog_is_active, devlog_mask};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::cell::{Cell, UnsafeCell};
 use bitfield::bitfield;
+
+/// tcache, switchable at run time: `$tc` while the cache is transparent,
+/// `$real` (the cache holds the data) otherwise. Without the `tcache` feature
+/// this is `$real` alone, so such a build compiles exactly as before.
+macro_rules! tc_or {
+    ($s:expr, $tc:expr, $real:expr) => {{
+        #[cfg(feature = "tcache")]
+        { if $s.tc_live() { $tc } else { $real } }
+        #[cfg(not(feature = "tcache"))]
+        { $real }
+    }};
+}
 
 /// Result of a cache instruction fetch, shared by `MipsCache::fetch` and `fetch_instr_impl`.
 /// `status == EXEC_COMPLETE` means hit; `instr` points to the DecodedInstr slot (valid for
@@ -190,7 +202,7 @@ impl From<L1ITag> for u32 {
 /// `supported == false` means the cache cannot serve the inline path at all
 /// (no cache, or a shape the first implementation does not cover, e.g. R5000's
 /// 2-way L1-D — see docs/jit-inline-memory.md §4).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitDcGeometry {
     pub supported: bool,
     /// `addr >> line_shift & num_lines_mask` = tag index.
@@ -529,6 +541,11 @@ pub trait CpuModel: MipsCache {
     /// Region and PTEBase fields sit, which is how a 64-bit kernel finds the
     /// page-table entry for a faulting address.
     const VA_BITS: u32 = 40;
+    /// Implemented physical address bits: 36 on the R4x00/R5000, 40 on the
+    /// R10000. LLAddr holds `PA[PA_BITS-1:4]`.
+    const PA_BITS: u32 = 36;
+    /// The bits of LLAddr that exist.
+    const LLADDR_MASK: u64 = (1 << (Self::PA_BITS - 4)) - 1;
     /// Name as the guest and the benchmark report see it.
     const NAME: &'static str;
     /// "full" for the model whose arrays loads, stores and fetches consult;
@@ -555,6 +572,16 @@ pub trait MipsCache: Send + Sync {
     /// `base` must be ppmem's window base and `bitmap` a live `u64` that
     /// outlives this cache.
     unsafe fn set_tcache_window(&self, _base: *mut u8) {}
+
+    /// Whether `fetch` of cacheable RAM only reads: no line fill, no LRU or
+    /// tag change, no exception. Then a caller that does not need the
+    /// instruction (jitv2 entering compiled code) may leave the fetch out.
+    /// Default `false`: a model that keeps instruction-cache state does.
+    fn fetch_is_pure(&self) -> bool { false }
+
+    /// Write every dirty line back to memory, so RAM holds everything.
+    /// Default no-op: a cache that holds no data has nothing to write.
+    fn writeback_all(&self) {}
 
     /// tcache: pointer to this cache's inline mapped-region bitmap, for
     /// `MappedMemory::set_bitmap_sink2`. Null when the cache has no such field.
@@ -746,10 +773,10 @@ pub trait MipsCache: Send + Sync {
     fn set_llbit(&self, val: bool);
 
     /// Get Load-Linked address
-    fn get_lladdr(&self) -> u32;
+    fn get_lladdr(&self) -> u64;
 
     /// Set Load-Linked address
-    fn set_lladdr(&self, addr: u32);
+    fn set_lladdr(&self, addr: u64);
 
     /// Debug probe a virtual+physical address (optional, for debugging)
     fn debug_probe(&self, _cache_name: &str, _virt_addr: u64, _phys_addr: u64) -> String {
@@ -789,7 +816,7 @@ pub trait MipsCache: Send + Sync {
 pub struct PassthroughCacheOf<const MIPS4: bool> {
     downstream: Arc<dyn BusDevice>,
     llbit: UnsafeCell<bool>,
-    lladdr: UnsafeCell<u32>,
+    lladdr: UnsafeCell<u64>,
     /// Scratch slot for fetch() — no actual caching, just a place to decode into.
     fetch_scratch: UnsafeCell<DecodedInstr>,
 }
@@ -838,8 +865,11 @@ impl<const MIPS4: bool> MipsCache for PassthroughCacheOf<MIPS4> {
     const L2_SIZE: usize = 0;
     const L2_LINE: usize = 0;
 
+    /// A fetch is a bus read: no cache state to keep.
+    fn fetch_is_pure(&self) -> bool { true }
+
     fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
-        let r = self.downstream.read32(phys_addr as u32);
+        let r = self.downstream.read32(phys_addr);
         if r.is_ok() {
             let slot = unsafe { &mut *self.fetch_scratch.get() };
             slot.flags = FLAG_NOT_DECODED;
@@ -853,15 +883,15 @@ impl<const MIPS4: bool> MipsCache for PassthroughCacheOf<MIPS4> {
 
     fn read<const SIZE: usize>(&self, _virt_addr: u64, phys_addr: u64) -> BusRead64 {
         const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
-        if SIZE == 1 { let r = self.downstream.read8(phys_addr as u32);  BusRead64 { status: r.status, data: r.data as u64 } }
-        else if SIZE == 2 { let r = self.downstream.read16(phys_addr as u32); BusRead64 { status: r.status, data: r.data as u64 } }
-        else if SIZE == 4 { let r = self.downstream.read32(phys_addr as u32); BusRead64 { status: r.status, data: r.data as u64 } }
-        else               { self.downstream.read64(phys_addr as u32) }
+        if SIZE == 1 { let r = self.downstream.read8(phys_addr);  BusRead64 { status: r.status, data: r.data as u64 } }
+        else if SIZE == 2 { let r = self.downstream.read16(phys_addr); BusRead64 { status: r.status, data: r.data as u64 } }
+        else if SIZE == 4 { let r = self.downstream.read32(phys_addr); BusRead64 { status: r.status, data: r.data as u64 } }
+        else               { self.downstream.read64(phys_addr) }
     }
 
     fn write<const SIZE: usize>(&self, _virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
         const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
-        let addr = phys_addr as u32;
+        let addr = phys_addr;
         if SIZE == 1      { self.downstream.write8(addr, val as u8) }
         else if SIZE == 2 { self.downstream.write16(addr, val as u16) }
         else if SIZE == 4 { self.downstream.write32(addr, val as u32) }
@@ -870,7 +900,7 @@ impl<const MIPS4: bool> MipsCache for PassthroughCacheOf<MIPS4> {
 
     fn write64_masked(&self, _virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
         // SDL/SDR only — read-modify-write on the downstream device
-        let aligned_addr = (phys_addr & !7) as u32;
+        let aligned_addr = phys_addr & !7;
         let r = self.downstream.read64(aligned_addr);
         if !r.is_ok() { return r.status; }
         let new_val = (r.data & !mask) | (val & mask);
@@ -903,11 +933,11 @@ impl<const MIPS4: bool> MipsCache for PassthroughCacheOf<MIPS4> {
         unsafe { *self.llbit.get() = val; }
     }
 
-    fn get_lladdr(&self) -> u32 {
+    fn get_lladdr(&self) -> u64 {
         unsafe { *self.lladdr.get() }
     }
 
-    fn set_lladdr(&self, addr: u32) {
+    fn set_lladdr(&self, addr: u64) {
         unsafe { *self.lladdr.get() = addr; }
     }
 
@@ -1214,6 +1244,10 @@ pub struct CpuCache<
     const L2_NINSTRS: usize, const HAS_L2: bool,
     const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize,
     const MODEL: u8,
+    // tcache: whether this cache is transparent (RAM is the store) in a
+    // `tcache` build. Off for a cache that must hold data with nothing behind
+    // it: the O2 PROM keeps its stack in the data cache while it tests RAM.
+    const TC: bool = true,
 > {
     downstream: Arc<dyn BusDevice>,
 
@@ -1228,7 +1262,7 @@ pub struct CpuCache<
 
     // Load-Linked / Store-Conditional support
     llbit: UnsafeCell<bool>,
-    lladdr: UnsafeCell<u32>,
+    lladdr: UnsafeCell<u64>,
 
     /// L1-I hit counter — incremented on every fetch that finds a valid line (no fill needed).
     pub l1i_hit_count: Arc<AtomicU64>,
@@ -1299,12 +1333,12 @@ unsafe impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, co
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Send for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {}
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> Send for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {}
 unsafe impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Sync for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {}
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> Sync for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {}
 
 // Per-level cache types, parameterised so each CPU model monomorphises its own.
 type ICacheT<const S: usize, const L: usize, const W: usize, const T: usize> =
@@ -1371,10 +1405,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     // Model discriminator: folds to a literal, so it replaces #[cfg(feature = "r5k")].
     // Keyed on MODEL, not on associativity — see `mod model`.
     const IS_R5K: bool = MODEL == model::R5000;
+    /// Virtual coherency exceptions (VCEI/VCED) are an R4000/R4400 feature. The
+    /// R5000 dropped the secondary-index check altogether; the R10000 keeps the
+    /// index in its secondary tags but resolves a mismatch in hardware.
+    const HAS_VCE: bool = MODEL == model::R4400;
 
     /// IP28 bring-up watch: physical window to trace, from IRIS_IP28_WATCH.
     /// Folds to a constant `None` on every model but the R10000, so the
@@ -1526,7 +1564,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> From<Arc<dyn BusDevice>> for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> From<Arc<dyn BusDevice>> for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     fn from(downstream: Arc<dyn BusDevice>) -> Self {
         Self::new(downstream)
     }
@@ -1536,7 +1574,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     /// Check if we're tracking this physical address (for debug purposes)
     #[cfg(feature = "debug_cache")]
     #[inline]
@@ -1659,6 +1697,29 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         unsafe { *self.tc_gen.get() = gen_base };
     }
 
+    /// tcache: is this cache transparent? A constant (the feature and `TC`),
+    /// so every `tc_live()` branch folds away.
+    #[inline(always)]
+    fn tc_live(&self) -> bool {
+        cfg!(feature = "tcache") && TC
+    }
+
+    /// Write every dirty line back to memory: primary data into the
+    /// secondary, then the secondary to memory. Tags stay. For handing a
+    /// guest over from a cache that holds data to one that does not.
+    pub fn writeback_all_impl(&self) {
+        for eidx in 0..DC_WAYS * Self::DC_NUM_LINES {
+            if self.dc.get_tag(eidx).is_valid() {
+                self.writeback_l1d_line(eidx, false);
+            }
+        }
+        if HAS_L2 {
+            for idx in 0..Self::L2_NUM_LINES {
+                self.writeback_l2_line(idx);
+            }
+        }
+    }
+
     /// tcache + jitv2: bump the generation counter for `phys_addr`'s 4KB page.
     ///
     /// Mirrors what `PpMemory::write*` does internally. Only needed on the
@@ -1689,11 +1750,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         {
             TC_PROBES.fetch_add(1, Ordering::Relaxed);
         }
-        // `phys_addr` is a 32-bit physical address by construction — anything
-        // larger is a bug upstream, and the shift below will panic in debug
-        // rather than silently pretending the address is un-mapped.
-        let bits = unsafe { *self.tc_bitmap.get() };
-        let hit = bits & (1u64 << (phys_addr >> crate::ppmem::BITMAP_SHIFT)) != 0;
+        let hit = crate::ppmem::bitmap_maps(unsafe { *self.tc_bitmap.get() }, phys_addr);
         #[cfg(feature = "developer")]
         if hit {
             TC_HITS.fetch_add(1, Ordering::Relaxed);
@@ -1740,15 +1797,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 }
             }
         } else {
-            let a = phys_addr as u32;
             if ACC == 8 {
-                self.downstream.read64(a).data
+                self.downstream.read64(phys_addr).data
             } else if ACC == 4 {
-                self.downstream.read32(a).data as u64
+                self.downstream.read32(phys_addr).data as u64
             } else if ACC == 2 {
-                self.downstream.read16(a).data as u64
+                self.downstream.read16(phys_addr).data as u64
             } else {
-                self.downstream.read8(a).data as u64
+                self.downstream.read8(phys_addr).data as u64
             }
         }
     }
@@ -1777,15 +1833,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             // the gen bump it would have performed has to happen here.
             self.tc_bump_gen(phys_addr);
         } else {
-            let a = phys_addr as u32;
             if ACC == 8 {
-                self.downstream.write64(a, val);
+                self.downstream.write64(phys_addr, val);
             } else if ACC == 4 {
-                self.downstream.write32(a, val as u32);
+                self.downstream.write32(phys_addr, val as u32);
             } else if ACC == 2 {
-                self.downstream.write16(a, val as u16);
+                self.downstream.write16(phys_addr, val as u16);
             } else {
-                self.downstream.write8(a, val as u8);
+                self.downstream.write8(phys_addr, val as u8);
             }
         }
     }
@@ -1825,6 +1880,23 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         *word = (*word & !mask) | ((val as u64) << (set & 63));
     }
 
+    /// The line an R10000 index op names in this direct-mapped model: the
+    /// index within one way (half the cache), with bit 0 of the address as
+    /// the way, which becomes the top index bit.
+    #[inline]
+    fn r10k_way_index(addr: u64, line_shift: u32, lines_shift: u32) -> usize {
+        let half = 1usize << (lines_shift - 1);
+        (((addr >> line_shift) as usize) & (half - 1)) | ((addr as usize & 1) << (lines_shift - 1))
+    }
+
+    /// The same for an R10000 Index_Load/Store_Data: a doubleword slot in a
+    /// data array of `slots` doublewords.
+    #[inline]
+    fn r10k_way_slot(addr: u64, slots: usize) -> usize {
+        let half = slots / 2;
+        ((addr as usize >> 3) & (half - 1)) | ((addr as usize & 1) * half)
+    }
+
     fn pidx(&self, virt_addr: u64) -> u32 {
         ((virt_addr >> L2_PIDX_VADDR_SHIFT) & L2_PIDX_VADDR_MASK as u64) as u32
     }
@@ -1857,14 +1929,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
     /// Check if the given physical address overlaps with the Load Linked address.
     /// If so, clear llbit (the link is broken).
-    /// The lladdr stores bits [35:4] of the physical address.
+    /// The lladdr stores PA[PA_BITS-1:4].
     #[inline]
     fn check_and_clear_llbit(&self, phys_addr: u64, line_mask: usize) {
         unsafe {
             if !*self.llbit.get() {
                 return;
             }
-            let ll_addr = (*self.lladdr.get() as u64) << 4;
+            let ll_addr = *self.lladdr.get() << 4;
             let line_mask = line_mask as u64;
             let addr_line = phys_addr & !line_mask;
             let ll_line = ll_addr & !line_mask;
@@ -2001,6 +2073,46 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         self.l2.set_tag(idx, L2Tag::default());
     }
 
+    /// R10000: a secondary hit under a different virtual index than the line
+    /// was last used under. Where an R4400 raises a virtual coherency
+    /// exception, the R10000 writes back and drops the primary copies made
+    /// under the old index, records the new one, and carries on. Without
+    /// this, an R10000 kernel that never expects VCE (OpenBSD) dies on the
+    /// first page it maps at two colours.
+    fn realias_l2_line(&self, l2_idx: usize, new_pidx: u32) {
+        let l2_tag: L2Tag = self.l2.get_tag(l2_idx);
+        let phys_base = l2_tag_to_phys(l2_tag, (l2_idx << Self::L2_LINE_SHIFT) as u64);
+        let old = l2_tag.pidx();
+
+        let l1i_lines_per_l2 = 1 << (Self::L2_LINE_SHIFT - Self::IC_LINE_SHIFT);
+        let ic_base_idx = self.l2_idx_to_l1_base_idx(l2_idx, old, &self.ic);
+        for i in 0..l1i_lines_per_l2 {
+            let ic_idx = (ic_base_idx + i) & Self::IC_NUM_LINES_MASK;
+            let phys_addr = phys_base + ((i as u64) << Self::IC_LINE_SHIFT);
+            let ic_tag: L1ITag = self.ic.get_tag(ic_idx);
+            if ic_tag.matches_phys(phys_addr) {
+                self.invalidate_l1i_line(ic_idx, false);
+            }
+        }
+
+        let l1d_lines_per_l2 = 1 << (Self::L2_LINE_SHIFT - Self::DC_LINE_SHIFT);
+        let dc_base_idx = self.l2_idx_to_l1_base_idx(l2_idx, old, &self.dc);
+        for i in 0..l1d_lines_per_l2 {
+            let dc_idx = (dc_base_idx + i) & Self::DC_NUM_LINES_MASK;
+            let phys_addr = phys_base + ((i as u64) << Self::DC_LINE_SHIFT);
+            let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
+            if dc_tag.matches_line(phys_addr) {
+                self.writeback_l1d_line(dc_idx, false);
+                self.invalidate_l1d_line(dc_idx, false, false);
+            }
+        }
+
+        // Re-read: the writebacks above may have changed the line's state.
+        let mut t: L2Tag = self.l2.get_tag(l2_idx);
+        t.set_pidx(new_pidx);
+        self.l2.set_tag(l2_idx, t);
+    }
+
     /// Invalidate L2 line by physical address, if present and tag matches.
     fn invalidate_l2_line_phys(&self, phys_addr: u64) {
         let l2_idx = self.l2.get_index(phys_addr);
@@ -2067,10 +2179,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
         // tcache: the cache arrays are not storage — RAM is, so there is
         // nothing to copy out on a writeback. Both models.
-        #[cfg(feature = "tcache")]
-        let transparent = true;
-        #[cfg(not(feature = "tcache"))]
-        let transparent = false;
+        let transparent = self.tc_live();
 
         #[cfg(feature = "debug_cache")]
         {
@@ -2099,7 +2208,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 let l1_start_chunk = l1_idx << Self::DC_CHUNKS_PER_LINE_SHIFT;
                 let line_base = phys_addr & !(Self::DC_LINE_MASK as u64);
                 let src = &dc_data[l1_start_chunk..l1_start_chunk + Self::DC_CHUNKS_PER_LINE];
-                self.downstream.write_block(line_base as u32, src);
+                self.downstream.write_block(line_base, src);
             }
             let mut dc_tag: L1DTag = self.dc.get_tag(l1_idx);
             dc_tag.dirty = false;
@@ -2270,10 +2379,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // so there is nothing to flush. Unconditional: the bitmap decides *how*
         // to reach RAM (window vs bus), never whether L2 holds data. The state
         // transition below still runs exactly as it always does.
-        #[cfg(feature = "tcache")]
-        let tc_line = true;
-        #[cfg(not(feature = "tcache"))]
-        let tc_line = false;
+        let tc_line = self.tc_live();
 
         #[cfg(feature = "debug_cache")]
         if self.is_tracking_l2_idx(idx) {
@@ -2301,7 +2407,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let l2_data = self.l2.data();
             let start_chunk = idx << Self::L2_CHUNKS_PER_LINE_SHIFT;
             let src = &l2_data[start_chunk..start_chunk + Self::L2_CHUNKS_PER_LINE];
-            if self.downstream.write_block(phys_addr as u32, src) != BUS_OK {
+            if self.downstream.write_block(phys_addr, src) != BUS_OK {
                 return false;
             }
         }
@@ -2360,10 +2466,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // which a transparent line can never become. An instruction-origin fill
         // still reads, because R4400's decode slots live in `l2.instrs` and
         // cannot be reconstructed from a pointer.
-        #[cfg(feature = "tcache")]
-        let skip_data = !fill_instructions;
-        #[cfg(not(feature = "tcache"))]
-        let skip_data = false;
+        let skip_data = self.tc_live() && !fill_instructions;
 
         let l2_data = self.l2.data_mut();
         let start_chunk = l2_idx << Self::L2_CHUNKS_PER_LINE_SHIFT;
@@ -2411,7 +2514,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         }
         if skip_data {
             // Tags only; see `skip_data` above.
-        } else if let Some(src) = self.downstream.mem_ptr(line_base as u32) {
+        } else if let Some(src) = self.downstream.mem_ptr(line_base) {
             // Fast path: single pass over source — rotate into l2.data and fill l2.instrs.
             let l2_instrs = self.l2.instrs.get_mut();
             // Only fuse_pair! mutates prev_s1, and it is a no-op without opcodefusion.
@@ -2438,7 +2541,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             }
         } else {
             let dest = &mut l2_data[start_chunk..start_chunk + Self::L2_CHUNKS_PER_LINE];
-            let s = self.downstream.read_block(line_base as u32, dest);
+            let s = self.downstream.read_block(line_base, dest);
             if s != crate::traits::BUS_OK { return false; }
             if !Self::IS_R5K {
             {
@@ -2533,15 +2636,17 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             // fall through and do a real instruction fill below.
             let l2_hit = l2_tag.cs() != L2_CS_INVALID
                 && l2_tag.ptag() == l2_ptag
-                && (cfg!(not(feature = "tcache")) || l2_tag.has_code());
+                && (!self.tc_live() || l2_tag.has_code());
 
             if l2_hit {
                 // R4K only: check for Virtual Coherency Exception (VCEI).
-                // R5K dropped VCE — no pidx tracking needed.
-                if !Self::IS_R5K {
-                if self.pidx(index_addr) != l2_tag.pidx() {
-                    return exec_exception_const(EXC_VCEI);
-                }
+                // R5K dropped VCE — no pidx tracking needed; the R10000
+                // resolves the mismatch itself.
+                if !Self::IS_R5K && self.pidx(index_addr) != l2_tag.pidx() {
+                    if Self::HAS_VCE {
+                        return exec_exception_const(EXC_VCEI);
+                    }
+                    self.realias_l2_line(l2_idx, self.pidx(index_addr));
                 }
             } else {
                 // L2 miss — fill from memory into L2 first.
@@ -2566,10 +2671,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let ic_instrs = self.ic_instrs.get_mut();
             // tcache: `l2.data` holds nothing — instruction words come from RAM,
             // the same place the L2-disabled branch below reads them from.
-            #[cfg(feature = "tcache")]
-            let l2_has_data = false;
-            #[cfg(not(feature = "tcache"))]
-            let l2_has_data = self.l2_active();
+            let l2_has_data = !self.tc_live() && self.l2_active();
             if l2_has_data {
                 let l2_sub_offset = ((phys_addr as usize) & (Self::L2_LINE_MASK & !Self::IC_LINE_MASK)) >> 3;
                 let l2_chunk_base = (self.l2.get_index(phys_addr) << Self::L2_CHUNKS_PER_LINE_SHIFT)
@@ -2590,7 +2692,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             } else {
                 // L2 disabled: read directly from memory.
                 let line_base = phys_addr & !(Self::IC_LINE_MASK as u64);
-                if let Some(src) = self.downstream.mem_ptr(line_base as u32) {
+                if let Some(src) = self.downstream.mem_ptr(line_base) {
                     // Fast path: read word pairs directly from backing store.
                     // mem_ptr's raw u64s are host-native pairs of little-endian-loaded
                     // words; rotate_left(32) puts them in MIPS big-endian word order
@@ -2608,7 +2710,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     }
                 } else {
                     for i in 0..Self::IC_INSTRS_PER_LINE {
-                        let word_addr = (line_base + (i as u64) * 4) as u32;
+                        let word_addr = line_base + (i as u64) * 4;
                         let r = self.downstream.read32(word_addr);
                         let w = if r.is_ok() { r.data } else { 0 };
                         let d = &mut ic_instrs[ic_slot_base + i];
@@ -2752,7 +2854,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         let l2_ptag = self.l2_ptag(phys_addr);
         if l2_tag.cs() != L2_CS_INVALID && l2_tag.ptag() == l2_ptag {
             if !Self::IS_R5K && self.pidx(virt_addr) != l2_tag.pidx() {
-                return Err(BUS_VCE);
+                if Self::HAS_VCE {
+                    return Err(BUS_VCE);
+                }
+                self.realias_l2_line(l2_idx, self.pidx(virt_addr));
             }
             Ok(true)
         } else {
@@ -2845,10 +2950,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// The whole doubleword at `virt_addr` in resolved line `eidx`.
     fn l1d_dword(&self, eidx: usize, virt_addr: u64, phys_addr: u64) -> u64 {
         let _ = (eidx, virt_addr);
-        #[cfg(feature = "tcache")]
-        { self.tc_read::<8>(phys_addr & !7) }
-        #[cfg(not(feature = "tcache"))]
-        { let _ = phys_addr; self.dc.dc_read::<8>(Self::dc_data_addr(eidx, virt_addr & !7)) }
+        let _ = phys_addr;
+        tc_or!(self, self.tc_read::<8>(phys_addr & !7),
+            self.dc.dc_read::<8>(Self::dc_data_addr(eidx, virt_addr & !7)))
     }
 
     /// Check a load of the `lanes` of the doubleword at `virt_addr` against its
@@ -2899,10 +3003,8 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         if let Some(status) = self.l1d_parity_check(eidx, virt_addr, phys_addr, lane_mask(virt_addr, SIZE)) {
             return BusRead64 { status, data: 0 };
         }
-        #[cfg(feature = "tcache")]
-        let result = self.tc_read::<SIZE>(phys_addr);
-        #[cfg(not(feature = "tcache"))]
-        let result = self.dc.dc_read::<SIZE>(Self::dc_data_addr(eidx, virt_addr));
+        let result = tc_or!(self, self.tc_read::<SIZE>(phys_addr),
+            self.dc.dc_read::<SIZE>(Self::dc_data_addr(eidx, virt_addr)));
         BusRead64::ok(result)
     }
 
@@ -2911,13 +3013,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         let eidx = self.dc.get_index(virt_addr) | (self.perr().way as usize) << Self::DC_NUM_LINES_SHIFT;
         let before = self.l1d_dword(eidx, virt_addr, phys_addr);
         let merged = (before & !mask) | (val & mask);
-        #[cfg(feature = "tcache")]
-        {
+        tc_or!(self, {
             self.tc_write::<8>(phys_addr & !7, merged);
             self.tc_invalidate_l2_code(phys_addr);
-        }
-        #[cfg(not(feature = "tcache"))]
-        self.dc.dc_write::<8>(Self::dc_data_addr(eidx, virt_addr & !7), merged);
+        }, self.dc.dc_write::<8>(Self::dc_data_addr(eidx, virt_addr & !7), merged));
         self.mark_l1d_dirty(eidx);
         let lanes = (0..8).fold(0u8, |l, i| if (mask >> (8 * i)) & 0xff != 0 { l | 1 << i } else { l });
         self.l1d_parity_store(eidx, virt_addr, phys_addr, before, lanes);
@@ -2943,10 +3042,8 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let tag: L2Tag = self.l2.get_tag(idx);
             let off = virt_addr as usize & Self::L2_LINE_MASK & !7;
             let phys = l2_tag_to_phys(tag, ((idx << Self::L2_LINE_SHIFT) | off) as u64);
-            #[cfg(feature = "tcache")]
-            let data = self.downstream.read64(phys as u32).data;
-            #[cfg(not(feature = "tcache"))]
-            let data = self.l2.data()[(idx << Self::L2_CHUNKS_PER_LINE_SHIFT) + (off >> 3)];
+            let data = tc_or!(self, self.downstream.read64(phys).data,
+                self.l2.data()[(idx << Self::L2_CHUNKS_PER_LINE_SHIFT) + (off >> 3)]);
             return (l2_data_ecc(data) ^ self.l2_xor(phys)) as u32;
         }
         if is_icache {
@@ -3040,10 +3137,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     fn fill_l1d_line_raw(&self, virt_addr: u64, phys_addr: u64) -> u32 {
-        #[cfg(feature = "tcache")]
-        let transparent = true;
-        #[cfg(not(feature = "tcache"))]
-        let transparent = false;
+        let transparent = self.tc_live();
         // For R5K: pick victim way via LRU and encode into dc_idx via shift.
         // dc_ext_idx = set | (way << Self::DC_NUM_LINES_SHIFT)
         let (victim_way, dc_idx) = if Self::IS_R5K {
@@ -3063,24 +3157,23 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // coherency bug. The only difference is inside `fill_l2_line_for`,
         // which skips populating `l2.data` for a transparent line (`skip_data`)
         // because nothing will ever read it back out.
-        #[cfg(feature = "tcache")]
-        let l2_hit = if self.l2_active() {
+        let l2_hit = tc_or!(self, if self.l2_active() {
             match self.l2_probe_for_data(virt_addr, phys_addr) {
                 Ok(hit) => hit,
                 Err(status) => return status,
             }
         } else {
             false
-        };
-        #[cfg(not(feature = "tcache"))]
-        let l2_hit = if self.l2_active() {
+        }, if self.l2_active() {
             let l2_idx = self.l2.get_index(phys_addr);
             let l2_tag: L2Tag = self.l2.get_tag(l2_idx);
             let l2_ptag = self.l2_ptag(phys_addr);
             if l2_tag.cs() != L2_CS_INVALID && l2_tag.ptag() == l2_ptag {
-                // Check for Virtual Coherency Exception (R4K only; R5K dropped VCE)
-                if !Self::IS_R5K {
-                if self.pidx(virt_addr) != l2_tag.pidx() { return BUS_VCE; }
+                // Check for Virtual Coherency Exception (R4K only; R5K dropped
+                // VCE; the R10000 resolves the mismatch itself)
+                if !Self::IS_R5K && self.pidx(virt_addr) != l2_tag.pidx() {
+                    if Self::HAS_VCE { return BUS_VCE; }
+                    self.realias_l2_line(l2_idx, self.pidx(virt_addr));
                 }
                 true
             } else {
@@ -3093,7 +3186,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             }
         } else {
             false // L2 disabled: copy direct from memory below
-        };
+        });
         #[cfg(not(feature = "lightning"))]
         if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_MISS != 0 {
             crate::dlog!(LogModule::L1d, "fill virt={:#x} phys={:#x} eidx={}", virt_addr, phys_addr, dc_idx);
@@ -3121,7 +3214,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 // L2 disabled: copy directly from memory
                 let line_base = phys_addr & !(Self::DC_LINE_MASK as u64);
                 let dest = &mut dc_data[dc_start_chunk..dc_start_chunk + Self::DC_CHUNKS_PER_LINE];
-                self.downstream.read_block(line_base as u32, dest);
+                self.downstream.read_block(line_base, dest);
             }
         }
 
@@ -3279,18 +3372,15 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
         let Some(l2_idx) = self.hit_l2(line_base) else {
             // write_block bumps the jitv2 page generations it spans.
-            self.downstream.write_block(line_base as u32, chunks);
+            self.downstream.write_block(line_base, chunks);
             return;
         };
         // tcache: RAM is the store, so the words go there; dropping
         // `has_code` makes the next L1-I fill re-read them.
-        #[cfg(feature = "tcache")]
-        {
-            self.downstream.write_block(line_base as u32, chunks);
+        tc_or!(self, {
+            self.downstream.write_block(line_base, chunks);
             self.tc_invalidate_l2_code(line_base);
-        }
-        #[cfg(not(feature = "tcache"))]
-        {
+        }, {
             let off = ((line_base as usize) & Self::L2_LINE_MASK) >> 3;
             let base = (l2_idx << Self::L2_CHUNKS_PER_LINE_SHIFT) + off;
             self.l2.data_mut()[base..base + chunks.len()].copy_from_slice(chunks);
@@ -3307,7 +3397,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     slot.flags = FLAG_NOT_DECODED;
                 }
             }
-        }
+        });
         self.clear_l2_xor(line_base, n * 4);
         let mut tag: L2Tag = self.l2.get_tag(l2_idx);
         let cs = match tag.cs() {
@@ -3336,14 +3426,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             // tcache, where only an instruction-origin fill (`has_code`)
             // populates them.
             let l2_has_words = self.hit_l2(line_base).is_some_and(|l2_idx| {
-                cfg!(not(feature = "tcache")) || self.l2.get_tag(l2_idx).has_code()
+                !self.tc_live() || self.l2.get_tag(l2_idx).has_code()
             });
             if !Self::IS_R5K && l2_has_words {
                 self.snapshot_l1i_line(eidx, line_base);
                 continue;
             }
             for i in 0..n {
-                let r = self.downstream.read32((line_base + 4 * i as u64) as u32);
+                let r = self.downstream.read32(line_base + 4 * i as u64);
                 let w = if r.is_ok() { r.data } else { 0 };
                 if Self::IS_R5K {
                     let slot = &mut self.ic_instrs.get_mut()[(eidx << Self::IC_INSTR_SHIFT) + i];
@@ -3476,12 +3566,16 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuModel for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> CpuModel for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     const MIPS4: bool = MIPS4;
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
+    // 44 implemented virtual address bits on the R10000, as the shadow
+    // model already says; XContext's layout follows them.
+    const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };
+    const PA_BITS: u32 = if MODEL == model::R10000 { 40 } else { 36 };
     const NAME: &'static str = match MODEL {
         model::R5000 => "R5000",
         model::R10000 => "R10000",
@@ -3493,10 +3587,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> MipsCache for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> MipsCache for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     fn set_l1i_counters(&mut self, hit: Arc<AtomicU64>, fetch: Arc<AtomicU64>) {
         self.l1i_hit_count = hit;
         self.l1i_fetch_count = fetch;
+    }
+
+    fn writeback_all(&self) {
+        self.writeback_all_impl()
     }
 
     #[cfg(feature = "tcache")]
@@ -3540,6 +3638,11 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // every emitted access) is what lets the emitted code assume them.
         #[cfg(feature = "jitv2")]
         {
+            // The inline path is the transparent one; a cache that holds data
+            // (`TC = false`) must be reached through its own accesses.
+            if !self.tc_live() {
+                return JitDcGeometry::unsupported();
+            }
             if unsafe { *self.tc_base.get() }.is_null()
                 || unsafe { *self.tc_gen.get() }.is_null()
             {
@@ -3715,10 +3818,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // tcache: data comes from the ppmem window, so the region must be
         // mapped. Without tcache the resident line itself is authoritative
         // and no bitmap test is needed.
-        #[cfg(feature = "tcache")]
-        { self.tc_transparent(phys_addr) }
-        #[cfg(not(feature = "tcache"))]
-        { true }
+        tc_or!(self, self.tc_transparent(phys_addr), true)
     }
 
     fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
@@ -3757,10 +3857,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 crate::dlog!(LogModule::L1d, "read{} hit virt={:#x} phys={:#x} eidx={}", SIZE, virt_addr, phys_addr, dc_idx);
             }
             // tcache: the cache stores no data — read RAM (window or bus).
-            #[cfg(feature = "tcache")]
-            let result = self.tc_read::<SIZE>(phys_addr);
-            #[cfg(not(feature = "tcache"))]
-            let result = self.dc.dc_read::<SIZE>(virt_addr);
+            let result = tc_or!(self, self.tc_read::<SIZE>(phys_addr), self.dc.dc_read::<SIZE>(virt_addr));
             #[cfg(feature = "debug_cache")]
             if self.is_tracking_addr(virt_addr, phys_addr) {
                 println!("[CACHE DEBUG] read{} result: {} virt 0x{:016x} phys 0x{:016x} val=0x{:016x}",
@@ -3782,13 +3879,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 crate::dlog!(LogModule::L1d, "read{} hit virt={:#x} phys={:#x} eidx={}", SIZE, virt_addr, phys_addr, dc_eidx);
             }
             // tcache: the cache stores no data — read RAM (window or bus).
-            #[cfg(feature = "tcache")]
-            let result = self.tc_read::<SIZE>(phys_addr);
-            #[cfg(not(feature = "tcache"))]
-            let result = {
+            let result = tc_or!(self, self.tc_read::<SIZE>(phys_addr), {
                 let da = Self::dc_data_addr(dc_eidx, virt_addr);
                 self.dc.dc_read::<SIZE>(da)
-            };
+            });
             #[cfg(feature = "debug_cache")]
             if self.is_tracking_addr(virt_addr, phys_addr) {
                 println!("[CACHE DEBUG] read{} result: {} virt 0x{:016x} phys 0x{:016x} val=0x{:016x}",
@@ -3827,15 +3921,12 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1d, "write{} hit virt={:#x} phys={:#x} eidx={} val={:#x}", SIZE, virt_addr, phys_addr, dc_idx, val);
             }
-            #[cfg(feature = "tcache")]
-            {
+            tc_or!(self, {
                 // The cache stores no data — the write goes to RAM.
                 self.tc_write::<SIZE>(phys_addr, val);
                 // Writing the line makes L2's decoded slots for it stale.
                 self.tc_invalidate_l2_code(phys_addr);
-            }
-            #[cfg(not(feature = "tcache"))]
-            self.dc.dc_write::<SIZE>(virt_addr, val);
+            }, self.dc.dc_write::<SIZE>(virt_addr, val));
             self.mark_l1d_dirty(dc_idx);
             return BUS_OK;
         }
@@ -3868,16 +3959,13 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
                 crate::dlog!(LogModule::L1d, "write{} hit virt={:#x} phys={:#x} eidx={} val={:#x}", SIZE, virt_addr, phys_addr, dc_eidx, val);
             }
-            #[cfg(feature = "tcache")]
-            {
+            tc_or!(self, {
                 self.tc_write::<SIZE>(phys_addr, val);
                 self.tc_invalidate_l2_code(phys_addr);
-            }
-            #[cfg(not(feature = "tcache"))]
-            {
+            }, {
                 let da = Self::dc_data_addr(dc_eidx, virt_addr);
                 self.dc.dc_write::<SIZE>(da, val);
-            }
+            });
             self.mark_l1d_dirty(dc_eidx);
             BUS_OK
         }
@@ -3904,17 +3992,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     return r;
                 }
             }
-            #[cfg(feature = "tcache")]
-            {
+            tc_or!(self, {
                 let current = self.tc_read::<8>(phys_addr);
                 self.tc_write::<8>(phys_addr, (current & !mask) | (val & mask));
                 self.tc_invalidate_l2_code(phys_addr);
-            }
-            #[cfg(not(feature = "tcache"))]
-            {
+            }, {
                 let current = self.dc.dc_read::<8>(virt_addr);
                 self.dc.dc_write::<8>(virt_addr, (current & !mask) | (val & mask));
-            }
+            });
             self.mark_l1d_dirty(dc_idx);
             return BUS_OK;
         }
@@ -3927,18 +4012,15 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 return way;
             }
             let dc_eidx = self.dc.get_index(virt_addr) | (way as usize) << Self::DC_NUM_LINES_SHIFT;
-            #[cfg(feature = "tcache")]
-            {
+            tc_or!(self, {
                 let current = self.tc_read::<8>(phys_addr);
                 self.tc_write::<8>(phys_addr, (current & !mask) | (val & mask));
                 self.tc_invalidate_l2_code(phys_addr);
-            }
-            #[cfg(not(feature = "tcache"))]
-            {
+            }, {
                 let da = Self::dc_data_addr(dc_eidx, virt_addr);
                 let current = self.dc.dc_read::<8>(da);
                 self.dc.dc_write::<8>(da, (current & !mask) | (val & mask));
-            }
+            });
             self.mark_l1d_dirty(dc_eidx);
             BUS_OK
         }
@@ -3973,20 +4055,17 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 C_R10K_CBARRIER if sel == CACH_PI => return 0,
                 C_R10K_ILD if matches!(sel, CACH_PI | CACH_PD | CACH_SD) => {
                     let is_l2 = sel == CACH_SD;
-                    // The index is a byte offset into the data array. Bit 0
-                    // selects the way on real silicon; this model is
-                    // direct-mapped, and bit 0 falls below the u64 slot index,
-                    // so it drops out without any special case.
-                    let slot = (virt_addr as usize) >> 3;
+                    // The index is a byte offset into one way's data, and bit
+                    // 0 selects the way: the same folding as the tag ops
+                    // below, so data and tags name the same line.
                     if is_l2 && HAS_L2 {
-                        return self.l2.data()[slot & (L2_DATA - 1)];
+                        return self.l2.data()[Self::r10k_way_slot(virt_addr, L2_DATA)];
                     }
-                    return self.dc.data()[slot & (DC_DATA - 1)];
+                    return self.dc.data()[Self::r10k_way_slot(virt_addr, DC_DATA)];
                 }
                 C_R10K_ISD if matches!(sel, CACH_SI | CACH_SD) => {
-                    let slot = (virt_addr as usize) >> 3;
                     if HAS_L2 {
-                        self.l2.data_mut()[slot & (L2_DATA - 1)] = phys_addr;
+                        self.l2.data_mut()[Self::r10k_way_slot(virt_addr, L2_DATA)] = phys_addr;
                     }
                     return 0;
                 }
@@ -4027,8 +4106,24 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // `phys_addr` too, except for C_IST, where `phys_addr` carries
         // TagHi:TagLo). Hit ops and Create_Dirty_Exclusive need the
         // translated `phys_addr`.
+        // R10000 index ops (Index_WB_Inv, Index_Load_Tag, Index_Store_Tag)
+        // address one way: the low bits index within it and bit 0 picks the
+        // way. This model is direct-mapped at the full size, so way 1 is the
+        // upper half. Ignoring bit 0 sent both ways of a whole-cache flush to
+        // the lower half and never flushed the upper one: dirty lines there
+        // outlived the flush and were later written back over reused pages.
+        let r10k_index = Self::R10K_CACHE_OPS && matches!(operation, C_IWBINV | C_ILT | C_IST);
         let idx = if is_l2 {
-            self.l2.get_index(if operation == C_IST { virt_addr } else { phys_addr })
+            if r10k_index {
+                // Index ops carry the index address in virt_addr (untranslated).
+                Self::r10k_way_index(virt_addr, Self::L2_LINE_SHIFT, Self::L2_NUM_LINES_SHIFT)
+            } else {
+                self.l2.get_index(if operation == C_IST { virt_addr } else { phys_addr })
+            }
+        } else if r10k_index && is_icache {
+            Self::r10k_way_index(virt_addr, Self::IC_LINE_SHIFT, Self::IC_NUM_LINES_SHIFT)
+        } else if r10k_index {
+            Self::r10k_way_index(virt_addr, Self::DC_LINE_SHIFT, Self::DC_NUM_LINES_SHIFT)
         } else if is_icache {
             let set = self.ic.get_index(virt_addr);
             if Self::IS_R5K { set | (((virt_addr >> 14) as usize & 1) << Self::IC_NUM_LINES_SHIFT) } else { set }
@@ -4152,9 +4247,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 let tag_lo = phys_addr as u32;  // R4000-family tags are 32-bit
 
                 if is_l2 {
-                    if MODEL == model::R10000 {
-                        eprintln!("ip28: C_IST(SD) idx={idx:#x} taglo={tag_lo:#010x} phys={phys_addr:#018x}");
-                    }
                     // L2 TagLo format:  [31:13] ptag   [12:10] state   [9:7] PIdx
                     let ptag = (tag_lo >> 13) & L2_PTAG_MASK;
                     let state = (tag_lo >> 10) & 0x7;
@@ -4385,7 +4477,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         if !self.get_llbit() {
             return;
         }
-        let ll_addr = (self.get_lladdr() as u64) << 4;
+        let ll_addr = self.get_lladdr() << 4;
         let addr_line = phys_addr & !(Self::DC_LINE_MASK as u64);
         let ll_line = ll_addr & !(Self::DC_LINE_MASK as u64);
         if addr_line == ll_line {
@@ -4401,11 +4493,11 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         unsafe { *self.llbit.get() = val; }
     }
 
-    fn get_lladdr(&self) -> u32 {
+    fn get_lladdr(&self) -> u64 {
         unsafe { *self.lladdr.get() }
     }
 
-    fn set_lladdr(&self, addr: u32) {
+    fn set_lladdr(&self, addr: u64) {
         unsafe { *self.lladdr.get() = addr; }
     }
 
@@ -4753,7 +4845,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Drop for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> Drop for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     fn drop(&mut self) {
         self.ic.stop.store(true, Ordering::Relaxed);
     }
@@ -4765,7 +4857,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> Resettable for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> Resettable for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     fn power_on(&self) {
         self.ic.tags_mut().fill(L1ITag::default());
         self.dc.tags_mut().fill(L1DTag::default());
@@ -4796,7 +4888,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
-    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL> {
+    const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8, const TC: bool> CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL, TC> {
     fn save_tags_as_u32<TAG: Copy + Into<u32>>(tags: &[TAG]) -> Vec<u32> {
         tags.iter().map(|&t| t.into()).collect()
     }
@@ -4824,7 +4916,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         t.insert("l2_tags".into(),  u32_slice_to_toml(&l2_tags));
         t.insert("l2_data".into(),  u64_slice_to_toml(&l2_data));
         t.insert("llbit".into(),    toml::Value::Boolean(llbit));
-        t.insert("lladdr".into(),   hex_u32(lladdr));
+        t.insert("lladdr".into(),   hex_u64(lladdr));
         // 2-way only: LRU as packed u32 words, 1 bit per set (unchanged on-disk format).
         // ic_instrs / ic_raw not saved — load_cache_state rebuilds them (rebuild_l1i_words).
         if Self::IS_R5K {
@@ -4917,7 +5009,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             if let Some(b) = toml_bool(f) { unsafe { *self.llbit.get() = b; } }
         }
         if let Some(f) = get_field(v, "lladdr") {
-            if let Some(a) = toml_u32(f) { unsafe { *self.lladdr.get() = a; } }
+            if let Some(a) = toml_u64(f) { unsafe { *self.lladdr.get() = a; } }
         }
         self.rebuild_l1i_words();
         Ok(())
@@ -5128,7 +5220,7 @@ mod tests {
         }
         for (i, &want) in shadow.iter().enumerate() {
             if want == 0 { continue; }
-            let phys = (i * 4) as u32;
+            let phys = (i * 4) as u64;
             let got = mem.read32(phys).data;
             assert_eq!(got, want, "post-flush mismatch phys={:#010x}: got={:#010x} want={:#010x}", phys, got, want);
         }
@@ -5147,7 +5239,7 @@ mod tests {
         let mut words = vec![0u32; MEM_BYTES / 4];
         for (i, w) in words.iter_mut().enumerate() {
             *w = rng.next_u32();
-            mem.write32((i * 4) as u32, *w);
+            mem.write32((i * 4) as u64, *w);
         }
 
         let cache: C = make_cache_of(mem.clone());
@@ -5201,8 +5293,8 @@ mod tests {
     }
 
     // Write a word into backing memory, bypassing the cache entirely.
-    fn mem_write(mem: &Memory, phys: u32, val: u32) { mem.write32(phys, val); }
-    fn mem_read(mem: &Memory, phys: u32) -> u32 { mem.read32(phys).data }
+    fn mem_write(mem: &Memory, phys: u32, val: u32) { mem.write32(phys as u64, val); }
+    fn mem_read(mem: &Memory, phys: u32) -> u32 { mem.read32(phys as u64).data }
 
     /// The geometry handed to codegen must describe the *sets*, not the total
     /// line count, or the 2-way inline path's `set | way << num_lines_shift`
@@ -5262,6 +5354,107 @@ mod tests {
 
     // Flush a single L2 set to memory.  `phys` is any address within the L2 line.
     // Only valid when L2 is present (r4k or r5k+r5ksc).
+    /// A whole-cache flush the way an R10000 kernel does it -- every index of
+    /// one way, then of the other, bit 0 picking the way -- reaches every line,
+    /// including those this direct-mapped model keeps in its upper half.
+    #[test]
+    fn r10000_index_flush_reaches_both_ways() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache: R10000Cache = make_cache_of(mem.clone());
+        // Upper half of the L1D (VA bit 14) and of the 1 MB L2 (PA bit 19).
+        let cases = [(0x9800_0000_0000_6040u64, 0x2040u32), (0x9800_0000_0008_2080, 0x8_2080)];
+        for (i, &(va, pa)) in cases.iter().enumerate() {
+            let _ = cache.write::<4>(va, pa as u64, 0xa5a5_0000 + i as u64);
+        }
+        for va in (0..16 * 1024u64).step_by(32) {
+            for way in 0..2 {
+                cache.cache_op(C_IWBINV | CACH_PD, 0x8000_0000 | va | way, 0);
+            }
+        }
+        for va in (0..512 * 1024u64).step_by(128) {
+            for way in 0..2 {
+                let a = 0x8000_0000 | va | way;
+                cache.cache_op(C_IWBINV | CACH_SD, a, a);
+            }
+        }
+        for (i, &(_, pa)) in cases.iter().enumerate() {
+            assert_eq!(mem_read(&mem, pa), 0xa5a5_0000 + i as u32, "line at {pa:#x} not flushed");
+        }
+    }
+
+    /// One physical line used under two virtual colours (index bits 12-13
+    /// differ): the R4400 raises a virtual coherency exception on the
+    /// secondary hit; the R10000 resolves it itself, and a store under one
+    /// colour is what a load under the other sees.
+    #[test]
+    fn the_r10000_resolves_a_colour_mismatch_where_the_r4400_raises_vce() {
+        let pa = 0x8040u64;
+        let (va1, va2) = (0x0010_0040u64, 0x0010_3040u64);
+
+        let mem = Arc::new(Memory::new(MEM_MB));
+        mem_write(&mem, pa as u32, 0x1111_2222);
+        let r4k: R4400Cache = make_cache_of(mem.clone());
+        assert_eq!(r4k.read::<4>(va1, pa).status, BUS_OK);
+        assert_eq!(r4k.read::<4>(va2, pa).status, BUS_VCE, "the R4400 raises VCE");
+
+        let mem = Arc::new(Memory::new(MEM_MB));
+        mem_write(&mem, pa as u32, 0x1111_2222);
+        let r10k: R10000Cache = make_cache_of(mem.clone());
+        assert_eq!(r10k.read::<4>(va1, pa).data, 0x1111_2222);
+        let r = r10k.read::<4>(va2, pa);
+        assert_eq!((r.status, r.data), (BUS_OK, 0x1111_2222), "the R10000 carries on");
+        assert_eq!(r10k.write::<4>(va2, pa, 0x3333_4444), BUS_OK);
+        assert_eq!(r10k.read::<4>(va1, pa).data, 0x3333_4444, "the old colour's copy was dropped");
+    }
+
+    /// The R10000 implements 44 virtual address bits; XContext's fields are
+    /// laid out around them, so the full model must say so too.
+    #[test]
+    fn the_r10000_full_model_has_44_va_bits() {
+        assert_eq!(<R10000Cache as CpuModel>::VA_BITS, 44);
+        assert_eq!(<crate::cpu::mips_cache_shadow::R10000ShadowCache as CpuModel>::VA_BITS, 44);
+        assert_eq!(<R4400Cache as CpuModel>::VA_BITS, 40);
+        assert_eq!(<R5000Cache as CpuModel>::VA_BITS, 40);
+    }
+
+    /// A cache with `TC = false` holds its data in a `tcache` build too: a
+    /// line written through it survives an uncached write behind it (the O2
+    /// PROM keeps its stack that way while it tests RAM). `writeback_all`
+    /// then puts it in RAM.
+    #[test]
+    fn a_cache_with_tc_off_holds_data_until_written_back() {
+        type HoldingR4400 = CpuCache<16384, 16, 1, 1024, 16384, 16, 1, 1024, 2048,
+            1048576, 128, 8192, 131072, 262144, true,
+            false, 0x0000_0440, 0x0000_0500, 48, { model::R4400 }, false>;
+        type HoldingR5000 = CpuCache<32768, 32, 2, 1024, 32768, 32, 2, 1024, 4096,
+            128, 128, 1, 16, 0, false,
+            true, 0x0000_2321, 0x0000_2300, 48, { model::R5000 }, false>;
+        type HoldingR10000 = CpuCache<32768, 64, 1, 512, 32768, 32, 1, 1024, 4096,
+            1048576, 128, 8192, 131072, 262144, true,
+            true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }, false>;
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let check = |name: &str, writeback: &dyn Fn(), write: &dyn Fn(u64, u32), read: &dyn Fn(u64, u32) -> u32| {
+            let pa = 0x4040u32;
+            write(kseg0(pa), 0x1234_5678);
+            mem_write(&mem, pa, 0xdead_beef);
+            assert_eq!(read(kseg0(pa), pa), 0x1234_5678, "{name}: the cache lost its line");
+            writeback();
+            assert_eq!(mem_read(&mem, pa), 0x1234_5678, "{name}: writeback_all left it in the cache");
+        };
+        let r10k: HoldingR10000 = make_cache_of(mem.clone());
+        check("R10000", &|| r10k.writeback_all(),
+            &|va, v| { let _ = r10k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
+            &|va, pa| r10k.read::<4>(va, pa as u64).data as u32);
+        let r5k: HoldingR5000 = make_cache_of(mem.clone());
+        check("R5000", &|| r5k.writeback_all(),
+            &|va, v| { let _ = r5k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
+            &|va, pa| r5k.read::<4>(va, pa as u64).data as u32);
+        let r4k: HoldingR4400 = make_cache_of(mem.clone());
+        check("R4400", &|| r4k.writeback_all(),
+            &|va, v| { let _ = r4k.write::<4>(va, va & 0x0FFF_FFFF, v as u64); },
+            &|va, pa| r4k.read::<4>(va, pa as u64).data as u32);
+    }
+
     fn flush_l2_to_mem(cache: &R4400Cache, phys: u32) {
         let l2_set = (phys as usize >> R4400Cache::L2_LINE_SHIFT as usize) & (R4400Cache::L2_SIZE / R4400Cache::L2_LINE - 1);
         let lp = (l2_set * R4400Cache::L2_LINE) as u64;
@@ -6032,7 +6225,7 @@ mod tests {
                     cache.cache_op(C_IINV | CACH_PI, ic_v0, ic_v0 & 0x1FFF_FFFF);
                     cache.cache_op(C_IINV | CACH_PI, ic_v1, ic_v1 & 0x1FFF_FFFF);
                     // Verify flush landed in memory.
-                    let mem_now = mem.read32(phys).data;
+                    let mem_now = mem.read32(phys as u64).data;
                     assert_eq!(mem_now, val,
                         "post-flush mem wrong at phys={:#010x} op={}: mem={:#010x} want={:#010x}",
                         phys, op, mem_now, val);
@@ -6286,8 +6479,8 @@ mod tcache_tests {
         let mut seed = Rng(0x1234_5678_9ABC_DEF0);
         for i in 0..4096u32 {
             let v = seed.next() as u32;
-            bank_a.write32(i * 4, v);
-            bank_b.write32(i * 4, v);
+            bank_a.write32(i as u64 * 4, v);
+            bank_b.write32(i as u64 * 4, v);
         }
 
         let mut rng = Rng(0xDEAD_BEEF_CAFE_0001);
@@ -6339,8 +6532,8 @@ mod tcache_tests {
         real.writeback(None, BASE, 1024 * 1024);
         tc.writeback(None, BASE, 1024 * 1024);
         for i in 0..(256 * 1024u32) {
-            let a = bank_a.read32(i * 4).data;
-            let b = bank_b.read32(i * 4).data;
+            let a = bank_a.read32(i as u64 * 4).data;
+            let b = bank_b.read32(i as u64 * 4).data;
             assert_eq!(a, b, "RAM diverged at bank offset {:#x}", i * 4);
         }
     }
@@ -6369,8 +6562,8 @@ mod tcache_tests {
         let mut seed = Rng(0x0F1E_2D3C_4B5A_6978);
         for i in 0..4096u32 {
             let v = seed.next() as u32;
-            bank_a.write32(i * 4, v);
-            bank_b.write32(i * 4, v);
+            bank_a.write32(i as u64 * 4, v);
+            bank_b.write32(i as u64 * 4, v);
         }
 
         let mut rng = Rng(0xFEED_FACE_1234_5678);
@@ -6409,8 +6602,8 @@ mod tcache_tests {
         tc.writeback(None, BASE, 1024 * 1024);
         for i in 0..(256 * 1024u32) {
             assert_eq!(
-                bank_a.read32(i * 4).data,
-                bank_b.read32(i * 4).data,
+                bank_a.read32(i as u64 * 4).data,
+                bank_b.read32(i as u64 * 4).data,
                 "r5k RAM diverged at bank offset {:#x}",
                 i * 4
             );

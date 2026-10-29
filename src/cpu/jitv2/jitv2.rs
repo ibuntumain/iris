@@ -1,6 +1,6 @@
 //! JIT v2 core data structures.
 //!
-//! See `rules/jitv2/jit-v2-design.md` for the full design. This module holds the
+//! See `clanker/jitv2/jit-v2-design.md` for the full design. This module holds the
 //! per-page metadata the rest of the engine builds on (§2.4):
 //!
 //! - [`PhysicalCodePage`]: the mips executor's view of "what's compiled here" for
@@ -62,10 +62,18 @@ unsafe impl Send for CompileRequest {}
 // See each constant's doc comment for the reasoning behind its specific value.
 // ============================================================================
 
-/// Number of 4 KiB physical frames in the 32-bit physical address space the
-/// guest can address (`phys_addr: u32` everywhere on the fetch path) — the
-/// exact entry count of `PfnMap` below.
+/// Number of 4 KiB physical frames in the 32-bit physical address space —
+/// the exact entry count of `PfnMap` below. Translation yields up to 40 bits;
+/// [`pfn_of`] keeps frames above this out of the JIT.
 pub const PFN_MAP_ENTRIES: usize = (u32::MAX as usize / PAGE_SIZE as usize) + 1;
+
+/// The JIT frame for a physical address, or `None` above the 32-bit space
+/// `PfnMap` covers. Code up there is not compiled; it runs in the interpreter.
+#[inline(always)]
+pub fn pfn_of(phys_addr: u64) -> Option<Pfn> {
+    let pfn = phys_addr / PAGE_SIZE as u64;
+    (pfn < PFN_MAP_ENTRIES as u64).then_some(pfn as Pfn)
+}
 
 /// Direct-mapped `pfn -> PageSlot` lookup, replacing the `HashMap<Pfn,
 /// PageSlot>` both page pools used to carry.
@@ -797,7 +805,7 @@ pub struct PhysicalCodePage {
     /// Cost of keeping them always-on: 8 bytes per pooled page (two u32),
     /// i.e. 32 KiB at the default 4096-page capacity, written once per
     /// successful `publish`. Nothing reads them on any hot path. See
-    /// `rules/jitv2/block-fragmentation-blocks-cse.md`'s "measure without
+    /// `clanker/jitv2/block-fragmentation-blocks-cse.md`'s "measure without
     /// `developer`" rule, which this makes possible to actually follow.
     pub instr_count: std::sync::atomic::AtomicU32,
     pub code_size: std::sync::atomic::AtomicU32,
@@ -2401,7 +2409,7 @@ impl Jitv2 {
         }
         let slot = self.free_head;
         self.free_head = self.pages[slot as usize].next;
-        let gen = bus.gen_ptr(phys_addr);
+        let gen = bus.gen_ptr(phys_addr as u64);
         self.pages[slot as usize].claim(pfn, gen, fr1);
         self.pages[slot as usize].next = NO_SLOT;
         self.pfn_to_slot.insert(pfn, slot);
@@ -2471,7 +2479,7 @@ impl Jitv2 {
     /// from added that: `j2 status` is read on `lightning` builds, and
     /// gating a statistic to `developer` is how `last_code_size` came to
     /// report 0 bytes in the only build worth measuring (see
-    /// rules/build/the-three-builds-we-actually-use.md).
+    /// clanker/build/the-three-builds-we-actually-use.md).
     pub fn code_bytes_used(&self) -> u64 {
         self.pages.iter()
             .filter(|page| !page.func().is_null())
@@ -5046,15 +5054,23 @@ mod tests {
     /// standing in for a real RAM/ROM device in these pool-only tests.
     struct FakeDevice(AtomicU64);
     impl BusDevice for FakeDevice {
-        fn read8(&self, _addr: u32) -> BusRead8 { BusRead8::err() }
-        fn write8(&self, _addr: u32, _val: u8) -> u32 { crate::traits::BUS_ERR }
-        fn read16(&self, _addr: u32) -> BusRead16 { BusRead16::err() }
-        fn write16(&self, _addr: u32, _val: u16) -> u32 { crate::traits::BUS_ERR }
-        fn read32(&self, _addr: u32) -> BusRead32 { BusRead32::err() }
-        fn write32(&self, _addr: u32, _val: u32) -> u32 { crate::traits::BUS_ERR }
-        fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::err() }
-        fn write64(&self, _addr: u32, _val: u64) -> u32 { crate::traits::BUS_ERR }
-        fn gen_ptr(&self, _addr: u32) -> *const AtomicU64 { &self.0 as *const AtomicU64 }
+        fn read8(&self, _addr: u64) -> BusRead8 { BusRead8::err() }
+        fn write8(&self, _addr: u64, _val: u8) -> u32 { crate::traits::BUS_ERR }
+        fn read16(&self, _addr: u64) -> BusRead16 { BusRead16::err() }
+        fn write16(&self, _addr: u64, _val: u16) -> u32 { crate::traits::BUS_ERR }
+        fn read32(&self, _addr: u64) -> BusRead32 { BusRead32::err() }
+        fn write32(&self, _addr: u64, _val: u32) -> u32 { crate::traits::BUS_ERR }
+        fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
+        fn write64(&self, _addr: u64, _val: u64) -> u32 { crate::traits::BUS_ERR }
+        fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { &self.0 as *const AtomicU64 }
+    }
+
+    #[test]
+    fn pfn_of_stops_at_the_pfn_map() {
+        assert_eq!(pfn_of(0x1fc0_0004), Some(0x1fc00));
+        assert_eq!(pfn_of(0xFFFF_F000), Some(0xFFFFF));
+        assert_eq!(pfn_of(0x1_0000_0000), None);
+        assert_eq!(pfn_of(0xFF_FFFF_F000), None);
     }
 
     #[test]
@@ -5216,22 +5232,22 @@ mod tests {
     /// compile-pool work.
     struct AddiuDevice(AtomicU64);
     impl BusDevice for AddiuDevice {
-        fn read8(&self, _addr: u32) -> BusRead8 { BusRead8::err() }
-        fn write8(&self, _addr: u32, _val: u8) -> u32 { crate::traits::BUS_ERR }
-        fn read16(&self, _addr: u32) -> BusRead16 { BusRead16::err() }
-        fn write16(&self, _addr: u32, _val: u16) -> u32 { crate::traits::BUS_ERR }
-        fn read32(&self, addr: u32) -> BusRead32 {
-            let offset_word = (addr % PAGE_SIZE) / 4;
+        fn read8(&self, _addr: u64) -> BusRead8 { BusRead8::err() }
+        fn write8(&self, _addr: u64, _val: u8) -> u32 { crate::traits::BUS_ERR }
+        fn read16(&self, _addr: u64) -> BusRead16 { BusRead16::err() }
+        fn write16(&self, _addr: u64, _val: u16) -> u32 { crate::traits::BUS_ERR }
+        fn read32(&self, addr: u64) -> BusRead32 {
+            let offset_word = (addr % PAGE_SIZE as u64) / 4;
             if offset_word < 2 {
                 BusRead32::ok((crate::cpu::mips_isa::OP_ADDIU << 26) | (1 << 16) | 1)
             } else {
                 BusRead32::ok(crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL)
             }
         }
-        fn write32(&self, _addr: u32, _val: u32) -> u32 { crate::traits::BUS_ERR }
-        fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::err() }
-        fn write64(&self, _addr: u32, _val: u64) -> u32 { crate::traits::BUS_ERR }
-        fn gen_ptr(&self, _addr: u32) -> *const AtomicU64 { &self.0 as *const AtomicU64 }
+        fn write32(&self, _addr: u64, _val: u32) -> u32 { crate::traits::BUS_ERR }
+        fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
+        fn write64(&self, _addr: u64, _val: u64) -> u32 { crate::traits::BUS_ERR }
+        fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { &self.0 as *const AtomicU64 }
     }
 
     #[test]

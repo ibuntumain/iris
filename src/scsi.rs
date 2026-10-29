@@ -1,7 +1,6 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 
-use crate::cow_disk::CowDisk;
+use crate::block_node::{BlockNode, ChdCdNode, ChdNode, CowNode, RawNode};
 
 /// Get the standard CDB length based on the opcode's group code
 pub fn get_cdb_length(opcode: u8) -> usize {
@@ -22,6 +21,8 @@ pub mod scsi_cmd {
     pub const WRITE_6: u8 = 0x0a;
     pub const INQUIRY: u8 = 0x12;
     pub const MODE_SELECT_6: u8 = 0x15;
+    pub const RESERVE_6: u8 = 0x16;
+    pub const RELEASE_6: u8 = 0x17;
     pub const MODE_SENSE_6: u8 = 0x1a;
     pub const START_STOP_UNIT: u8 = 0x1b;
     pub const RECEIVE_DIAGNOSTIC_RESULTS: u8 = 0x1c;
@@ -32,7 +33,9 @@ pub mod scsi_cmd {
     pub const WRITE_10: u8 = 0x2a;
     pub const VERIFY_10: u8 = 0x2f;
     pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
+    pub const MODE_SELECT_10: u8 = 0x55;
     pub const MODE_SENSE_10: u8 = 0x5a;
+    pub const SET_CD_SPEED: u8 = 0xbb;
     pub const WRITE_BUFFER: u8 = 0x3b;
     pub const READ_BUFFER: u8 = 0x3c;
     pub const READ_SUB_CHANNEL: u8 = 0x42;
@@ -62,67 +65,17 @@ pub struct ScsiResponse {
     pub data: Vec<u8>,   // Response data
 }
 
-/// Disk I/O backend: either direct file access or copy-on-write overlay.
-pub enum DiskBackend {
-    /// Direct read-write access to a single file (current default behavior).
-    Direct(File),
-    /// Copy-on-write: base image is read-only, writes go to overlay file.
-    Cow(CowDisk),
-    /// Hard-disk CHD. Writable; compressed parents get an uncompressed
-    /// `.diff.chd` sidecar (MAME-style), so the parent stays untouched.
-    ChdHd(crate::chd_disk::ChdHd),
-    /// CD CHD (single-track MODE1) exposed as a 2048-byte/sector read-only
-    /// stream. Writes return an error.
-    ChdCd(crate::chd_disk::ChdCd),
+/// The allocation length of a 10-byte CDB (bytes 7-8): the most the
+/// initiator has room for. A command answering more overruns its buffer,
+/// so every data-in reply is cut to it.
+fn alloc_len_10(cdb: &[u8]) -> usize {
+    ((cdb[7] as usize) << 8) | cdb[8] as usize
 }
 
-impl DiskBackend {
-    /// Read `count` blocks at `lba`, where each block is `block_size` bytes.
-    /// Translates directly to a byte offset: `lba * block_size`.
-    /// COW always uses 512-byte sectors (HDD only, never CD-ROM).
-    fn read_blocks(&mut self, lba: u64, count: usize, block_size: u64) -> io::Result<Vec<u8>> {
-        let byte_offset = lba * block_size;
-        let byte_count = count as u64 * block_size;
-        match self {
-            DiskBackend::Direct(file) => {
-                file.seek(SeekFrom::Start(byte_offset))?;
-                let mut buf = vec![0u8; byte_count as usize];
-                file.read_exact(&mut buf)?;
-                Ok(buf)
-            }
-            DiskBackend::Cow(cow) => {
-                cow.read_sectors(lba, count)
-            }
-            DiskBackend::ChdHd(hd) => hd.read_blocks(lba, count, block_size),
-            DiskBackend::ChdCd(cd) => cd.read_blocks(lba, count, block_size),
-        }
-    }
-
-    fn write_sectors(&mut self, lba: u64, data: &[u8]) -> io::Result<()> {
-        match self {
-            DiskBackend::Direct(file) => {
-                let offset = lba * 512;
-                file.seek(SeekFrom::Start(offset))?;
-                file.write_all(data)?;
-                Ok(())
-            }
-            DiskBackend::Cow(cow) => cow.write_sectors(lba, data),
-            DiskBackend::ChdHd(hd) => hd.write_sectors(lba, data),
-            DiskBackend::ChdCd(_) => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "CD CHD is read-only",
-            )),
-        }
-    }
-
-    fn size(&self) -> u64 {
-        match self {
-            DiskBackend::Direct(file) => file.metadata().map(|m| m.len()).unwrap_or(0),
-            DiskBackend::Cow(cow) => cow.size(),
-            DiskBackend::ChdHd(hd) => hd.size(),
-            DiskBackend::ChdCd(cd) => cd.size(),
-        }
-    }
+/// The allocation length of a REQUEST SENSE CDB (byte 4). SCSI-2 keeps
+/// SCSI-1's rule that 0 asks for 4 bytes of sense data.
+pub fn request_sense_alloc_len(cdb: &[u8]) -> usize {
+    if cdb[4] == 0 { 4 } else { cdb[4] as usize }
 }
 
 /// What kind of target sits at this SCSI id.
@@ -138,11 +91,29 @@ pub enum DeviceKind {
     DaynaPort(Box<crate::dev::daynaport::DaynaPort>),
 }
 
+/// What a target reports of itself in INQUIRY: vendor, product and
+/// revision. The command set is the same on every machine; who a machine
+/// says its drives are is its own (the Indy's Sony CD-ROM is in
+/// `wd33c93a`, the O2's identity in `aic7880`), so each controller passes
+/// its identity when it attaches a device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScsiIdentity {
+    pub vendor: [u8; 8],
+    pub product: [u8; 16],
+    pub revision: [u8; 4],
+}
+
+impl ScsiIdentity {
+    pub const fn new(vendor: &[u8; 8], product: &[u8; 16], revision: &[u8; 4]) -> Self {
+        Self { vendor: *vendor, product: *product, revision: *revision }
+    }
+}
+
 pub struct ScsiDevice {
     /// None = no media loaded (CD-ROM drive present but tray is empty), or a
     /// device with no storage behind it at all (DaynaPort).
     /// HDDs are never None in practice.
-    backend: Option<DiskBackend>,
+    backend: Option<Box<dyn BlockNode>>,
     /// Capacity in bytes of the loaded media. 0 when `backend` is None.
     size: u64,
     kind: DeviceKind,
@@ -161,12 +132,21 @@ pub struct ScsiDevice {
     /// Logical block size: LBA→byte offset = lba * logical_block_size.
     /// Defaults to 512. IRIX switches via MODE SELECT (512↔2048). Persists across disc changes.
     logical_block_size: u64,
+    /// What INQUIRY reports (the attaching controller's choice).
+    identity: ScsiIdentity,
 }
 
 const SCSI_BUFFER_SIZE: usize = 0x4000; // 16KB (16384 bytes)
 
 impl ScsiDevice {
-    pub fn new(backend: DiskBackend, size: u64, is_cdrom: bool, filename: String, discs: Vec<String>) -> Self {
+    pub fn new(
+        backend: Box<dyn BlockNode>,
+        size: u64,
+        is_cdrom: bool,
+        filename: String,
+        discs: Vec<String>,
+        identity: ScsiIdentity,
+    ) -> Self {
         Self {
             backend: Some(backend),
             size,
@@ -180,13 +160,77 @@ impl ScsiDevice {
             // CD-ROM drives default to 2048-byte logical blocks (Sony CDU-76S behaviour).
             // HDD defaults to 512. dksc switches CD-ROM to 512 for EFS, back to 2048 for ISO.
             logical_block_size: if is_cdrom { 2048 } else { 512 },
+            identity,
         }
+    }
+
+    /// Open a disk or CD-ROM image as a target: a CHD (hard disk or CD),
+    /// a copy-on-write overlay over `path` when `overlay` (hard disks), or
+    /// the file itself; an empty `path` is a CD-ROM drive with no disc. A
+    /// CD-ROM changer's discs are `discs`. Any controller attaches its
+    /// targets this way, with its own `identity`.
+    ///
+    /// Each image becomes a [`BlockNode`]: the node owns the backend-specific
+    /// arithmetic, so the storage commands above never see a backend kind.
+    pub fn open(
+        path: &str,
+        is_cdrom: bool,
+        discs: Vec<String>,
+        overlay: bool,
+        overlay_path_override: Option<&str>,
+        identity: ScsiIdentity,
+    ) -> std::io::Result<Self> {
+        // Empty CD-ROM (drive present, tray empty). Stored backend=None so
+        // TEST UNIT READY / READ CAPACITY / READ return MEDIUM NOT PRESENT,
+        // while INQUIRY still advertises the drive. Use insert_disc() to
+        // mount media later.
+        if is_cdrom && path.is_empty() {
+            return Ok(Self::new_empty_cdrom(identity));
+        }
+        let is_chd_path = crate::chd_disk::is_chd(path);
+
+        let (backend, size): (Box<dyn BlockNode>, u64) = if is_chd_path {
+            if is_cdrom {
+                let cd = ChdCdNode::open(path)?;
+                let sz = cd.size();
+                (Box::new(cd), sz)
+            } else {
+                // HD CHD. The `overlay` flag is the per-disk copy-on-write
+                // toggle: COW on → always overlay (even an uncompressed base
+                // gets a diff) and never auto-fold on exit (commit/roll back
+                // manually); COW off → write in place (uncompressed) or a diff
+                // that auto-folds on a clean exit (compressed).
+                let hd = ChdNode::open(path, overlay)?;
+                let sz = hd.size();
+                (Box::new(hd), sz)
+            }
+        } else if overlay && !is_cdrom {
+            let overlay_path = overlay_path_override
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}.overlay", path));
+            let backing = RawNode::open_readonly(std::path::Path::new(path))?;
+            let sz = backing.size();
+            let cow = CowNode::new(Some(Box::new(backing)), &overlay_path, sz)?
+                .with_base_path(path);
+            (Box::new(cow), sz)
+        } else {
+            let node = if is_cdrom {
+                RawNode::open_readonly(std::path::Path::new(path))?
+            } else {
+                RawNode::open(std::path::Path::new(path))?
+            };
+            let sz = node.size();
+            (Box::new(node), sz)
+        };
+
+        let disc_list = if is_cdrom { discs } else { vec![] };
+        Ok(Self::new(backend, size, is_cdrom, path.to_string(), disc_list, identity))
     }
 
     /// Construct an empty CD-ROM drive — drive present, no media inserted.
     /// IRIX will see the drive in `hinv` but `TEST UNIT READY` reports
     /// MEDIUM NOT PRESENT.
-    pub fn new_empty_cdrom() -> Self {
+    pub fn new_empty_cdrom(identity: ScsiIdentity) -> Self {
         Self {
             backend: None,
             size: 0,
@@ -198,6 +242,7 @@ impl ScsiDevice {
             unit_attention: false,
             phys_block_size: 2048,
             logical_block_size: 2048,
+            identity,
         }
     }
 
@@ -215,6 +260,8 @@ impl ScsiDevice {
             unit_attention: false,
             phys_block_size: 512,
             logical_block_size: 512,
+            // Never reported: a DaynaPort answers INQUIRY itself.
+            identity: ScsiIdentity::new(b"        ", b"                ", b"    "),
         }
     }
 
@@ -248,9 +295,9 @@ impl ScsiDevice {
     /// Mount media on a previously-empty CD-ROM, or swap the disc on a
     /// loaded one. Sets `unit_attention` so the guest re-reads capacity.
     pub fn insert_media(&mut self, path: &str) -> io::Result<()> {
-        let f = OpenOptions::new().read(true).open(path)?;
-        let size = f.metadata()?.len();
-        self.backend = Some(DiskBackend::Direct(f));
+        let node = RawNode::open_readonly(std::path::Path::new(path))?;
+        let size = node.size();
+        self.backend = Some(Box::new(node));
         self.size = size;
         self.filename = path.to_string();
         self.unit_attention = true;
@@ -265,109 +312,65 @@ impl ScsiDevice {
         self.unit_attention = true;
     }
 
-    /// Commit the COW overlay into the base image ("apply the changes"). For a
-    /// raw overlay this copies the dirty sectors in place; for a CHD it rebuilds
-    /// the base from the diff (recompressing) and reopens a fresh overlay. No-op
-    /// if not overlaid. Returns a coarse count of what was committed.
+    /// Commit the divergence layer into the base image ("apply the changes").
+    /// Raw: copies the dirty sectors in place; CHD: rebuilds the base from the
+    /// diff (recompressing) and reopens a fresh overlay. No-op if not overlaid.
+    /// Returns a coarse count of what was committed. The concrete behaviour is
+    /// [`BlockNode::commit`] — including the CHD handle close/reopen.
     pub fn cow_commit(&mut self) -> io::Result<usize> {
-        if let Some(DiskBackend::Cow(cow)) = &mut self.backend {
-            return cow.commit();
+        match self.backend.as_mut() {
+            Some(node) => node.commit(),
+            None => Ok(0),
         }
-        {
-            // CHD: rebuild needs the file closed first, so extract the paths,
-            // drop the backend, flatten, then reopen with the same COW mode.
-            let info = match &self.backend {
-                Some(DiskBackend::ChdHd(hd)) if hd.diff_dirty() => {
-                    hd.overlay_paths().map(|(b, d)| (b, d, hd.is_cow()))
-                }
-                _ => None,
-            };
-            if let Some((base, diff, cow)) = info {
-                self.backend = None;
-                crate::chd_disk::flatten_diff(&base, &diff, &mut |_| {}, &|| false)?;
-                let base_str = base.to_str()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
-                let reopened = crate::chd_disk::ChdHd::open(base_str, cow)?;
-                self.backend = Some(DiskBackend::ChdHd(reopened));
-                return Ok(1);
-            }
-        }
-        Ok(0)
     }
 
-    /// Reset the COW overlay — discard all uncommitted writes ("roll back"). For
-    /// a raw overlay this truncates it; for a CHD it deletes the `.diff.chd` and
+    /// Reset the divergence layer — discard all uncommitted writes ("roll
+    /// back"). Raw: truncates the overlay; CHD: deletes the `.diff.chd` and
     /// reopens a fresh overlay over the untouched base. No-op if not overlaid.
+    /// The concrete behaviour is [`BlockNode::rollback`].
     pub fn cow_reset(&mut self) -> io::Result<()> {
-        if let Some(DiskBackend::Cow(cow)) = &mut self.backend {
-            return cow.reset_overlay();
+        match self.backend.as_mut() {
+            Some(node) => node.rollback(),
+            None => Ok(()),
         }
-        {
-            let info = match &self.backend {
-                Some(DiskBackend::ChdHd(hd)) => hd.overlay_paths().map(|(b, d)| (b, d, hd.is_cow())),
-                _ => None,
-            };
-            if let Some((base, diff, cow)) = info {
-                self.backend = None;
-                let _ = std::fs::remove_file(&diff); // discard every overlay write
-                let base_str = base.to_str()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
-                let reopened = crate::chd_disk::ChdHd::open(base_str, cow)?;
-                self.backend = Some(DiskBackend::ChdHd(reopened));
-            }
-        }
-        Ok(())
     }
 
     /// Copy the COW overlay into `dest` and return its dirty sector set.
     /// Direct-mode / no-media devices return an empty list and create no file.
     pub fn cow_export(&mut self, dest: &std::path::Path) -> io::Result<Vec<u64>> {
-        match &mut self.backend {
-            Some(DiskBackend::Cow(cow)) => cow.export_overlay(dest),
-            _ => Ok(Vec::new()),
+        match self.backend.as_mut() {
+            Some(node) => node.export_overlay(dest),
+            None => Ok(Vec::new()),
         }
     }
 
     /// Replace the COW overlay with the contents of `source` and adopt
     /// `dirty` as the dirty sector set. No-op on non-COW / no-media devices.
     pub fn cow_import(&mut self, source: &std::path::Path, dirty: Vec<u64>) -> io::Result<()> {
-        match &mut self.backend {
-            Some(DiskBackend::Cow(cow)) => cow.import_overlay(source, dirty),
-            _ => Ok(()),
+        match self.backend.as_mut() {
+            Some(node) => node.import_overlay(source, dirty),
+            None => Ok(()),
         }
     }
 
-    /// Number of dirty sectors in the COW overlay (raw), or for a CHD a coarse
-    /// 1/0 "has uncommitted changes" (we don't track per-sector dirt there).
-    /// 0 if direct / no media.
+    /// Size of the device's uncommitted divergence, via [`BlockNode::dirty_count`]:
+    /// exact dirty sectors for a raw overlay, a coarse 1/0 for a CHD diff. 0 if
+    /// direct / no media.
     pub fn cow_dirty_count(&self) -> usize {
-        match &self.backend {
-            Some(DiskBackend::Cow(cow)) => cow.dirty_count(),
-            Some(DiskBackend::ChdHd(hd)) => usize::from(hd.diff_dirty()),
-            _ => 0,
-        }
+        self.backend.as_ref().map_or(0, |node| node.dirty_count())
     }
 
-    /// Whether this device has a copy-on-write overlay (a raw `.overlay` or a CHD
+    /// Whether this device has a divergence layer (a raw `.overlay` or a CHD
     /// `.diff.chd`) that `cow commit` / `cow reset` can act on.
     pub fn is_cow(&self) -> bool {
-        match &self.backend {
-            Some(DiskBackend::Cow(_)) => true,
-            Some(DiskBackend::ChdHd(hd)) => hd.overlay_paths().is_some(),
-            _ => false,
-        }
+        self.backend.as_ref().is_some_and(|node| node.is_cow())
     }
 
     /// `(base, diff)` paths if this device is a CHD writing to a `.diff.chd`
     /// sidecar that holds changes worth folding back into the base on a clean
     /// shutdown. `None` for in-place / non-CHD / no-media devices.
     pub fn pending_chd_sync(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        {
-            if let Some(DiskBackend::ChdHd(hd)) = &self.backend {
-                return hd.pending_sync();
-            }
-        }
-        None
+        self.backend.as_ref().and_then(|node| node.pending_sync())
     }
 
     /// Take the pending-sync paths AND release the disk backend, closing the CHD
@@ -405,10 +408,10 @@ impl ScsiDevice {
         self.discs.push(current);
         let next_path = self.discs[0].clone();
 
-        match OpenOptions::new().read(true).open(&next_path) {
-            Ok(f) => {
-                let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-                self.backend = Some(DiskBackend::Direct(f));
+        match RawNode::open_readonly(std::path::Path::new(&next_path)) {
+            Ok(node) => {
+                let size = node.size();
+                self.backend = Some(Box::new(node));
                 self.size = size;
                 // phys_block_size never changes — CD-ROM physical sectors are always 2048.
                 // Do NOT reset logical_block_size — MODE SELECT is a controller setting
@@ -456,10 +459,10 @@ impl ScsiDevice {
         if !self.is_cdrom() {
             return Err("Not a CD-ROM device".to_string());
         }
-        let f = OpenOptions::new().read(true).open(&path)
+        let node = RawNode::open_readonly(std::path::Path::new(&path))
             .map_err(|e| format!("could not open {}: {}", path, e))?;
-        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-        self.backend = Some(DiskBackend::Direct(f));
+        let size = node.size();
+        self.backend = Some(Box::new(node));
         self.size = size;
         self.filename = path.clone();
         self.unit_attention = true;
@@ -537,6 +540,24 @@ impl ScsiDevice {
     }
 
     /// (physical_block_size, logical_block_size)
+    /// Capacity of the loaded medium, in bytes (0 with none).
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Set the logical block size, as a controller does for its own
+    /// convention after a bus reset (the O2's: an SGI CD-ROM in 512-byte
+    /// blocks).
+    pub fn set_logical_block_size(&mut self, n: u64) {
+        self.logical_block_size = n;
+    }
+
+    /// The logical block size a device powers up with: 2048 for a CD-ROM,
+    /// 512 for a disk.
+    pub fn power_on_block_size(&mut self) {
+        self.logical_block_size = if self.is_cdrom() { 2048 } else { 512 };
+    }
+
     pub fn block_sizes(&self) -> (u64, u64) {
         (self.phys_block_size, self.logical_block_size)
     }
@@ -608,6 +629,13 @@ impl ScsiDevice {
             // No write-back cache to flush — our backend writes are already synchronous.
             scsi_cmd::SYNCHRONIZE_CACHE_10 => ScsiResponse { status: 0x00, data: vec![] },
             scsi_cmd::MODE_SELECT_6 => self.exec_mode_select_6(&req.cdb, req.data_in.as_ref())?,
+            scsi_cmd::MODE_SELECT_10 => self.exec_mode_select_10(&req.cdb, req.data_in.as_ref())?,
+            // Nothing to do: one initiator, no medium to check, no speed to
+            // set. PROMs send RESERVE, RELEASE and VERIFY while probing, and
+            // a CD driver SET CD SPEED on open.
+            scsi_cmd::RESERVE_6 | scsi_cmd::RELEASE_6 | scsi_cmd::VERIFY_10 | scsi_cmd::SET_CD_SPEED => {
+                ScsiResponse { status: 0x00, data: vec![] }
+            }
             scsi_cmd::READ_TOC_PMA_ATIP => self.exec_read_toc_pma_atip(&req.cdb)?,
             scsi_cmd::GET_CONFIGURATION => self.exec_get_configuration(&req.cdb)?,
             scsi_cmd::SGI_EJECT => self.exec_sgi_eject(&req.cdb)?,
@@ -645,12 +673,12 @@ impl ScsiDevice {
     }
 
     fn exec_request_sense(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
-        let alloc_len = cdb[4] as usize;
+        let alloc_len = request_sense_alloc_len(cdb);
         // Return stored sense data and clear it
         let sense = self.pending_sense;
         self.pending_sense = [0u8; 18];
         self.pending_sense[0] = 0x70; // Leave valid response code for next time
-        let data = sense[..sense.len().min(alloc_len.max(18))].to_vec();
+        let data = sense[..alloc_len.min(sense.len())].to_vec();
         Ok(ScsiResponse { status: 0x00, data })
     }
 
@@ -665,17 +693,9 @@ impl ScsiDevice {
             data[2] = 0x02; // ANSI SCSI-2
             data[3] = 0x02; // SCSI-2 response format
             data[4] = 31;   // Additional length (36 - 5)
-            if self.is_cdrom() {
-                // Match Sony CDU-76S — SGI Indy shipped with this drive and IRIX mediad
-                // uses the vendor/product strings for feature detection (volume control, eject).
-                data[8..16].copy_from_slice(b"Sony    ");
-                data[16..32].copy_from_slice(b"CDU-76S         ");
-            } else {
-                data[8..16].copy_from_slice(b"SGI     ");
-                data[16..32].copy_from_slice(b"IRIS EMUL DISK  ");
-            }
-            let rev = b"1.0 ";
-            data[32..36].copy_from_slice(rev);
+            data[8..16].copy_from_slice(&self.identity.vendor);
+            data[16..32].copy_from_slice(&self.identity.product);
+            data[32..36].copy_from_slice(&self.identity.revision);
 
             /*println!("SCSI: INQUIRY LUN={} AllcLen={} Type={:02x} Vendor={} Product={} Rev={}",
                 lun, alloc_len, data[0],
@@ -739,7 +759,8 @@ impl ScsiDevice {
         if count > 0 && (lba >= last_lba || lba + count as u64 > last_lba) {
             return Ok(self.check_condition(0x05, 0x21, 0x00)); // Illegal Request: LBA Out of Range
         }
-        let data = backend.read_blocks(lba, count, self.logical_block_size)?;
+        let mut data = vec![0u8; count * self.logical_block_size as usize];
+        backend.read(lba * self.logical_block_size, &mut data)?;
         let expected = count as u64 * self.logical_block_size;
         if data.len() as u64 != expected {
             eprintln!(
@@ -766,11 +787,14 @@ impl ScsiDevice {
     }
 
     fn perform_write(&mut self, lba: u64, count: usize, data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+        // A failed write says why, so the REQUEST SENSE after it does not
+        // report "no sense".
         if self.is_cdrom() {
-            return Ok(ScsiResponse {
-                status: 0x02, // Check Condition
-                data: vec![],
-            });
+            return Ok(self.check_condition(0x07, 0x27, 0x00)); // DATA PROTECT: write protected
+        }
+        // Past the end is an error, not a bigger disk.
+        if (lba + count as u64) * self.logical_block_size > self.size {
+            return Ok(self.check_condition(0x05, 0x21, 0x00)); // ILLEGAL REQUEST: LBA out of range
         }
 
         let Some(data) = data_in else {
@@ -792,7 +816,9 @@ impl ScsiDevice {
         let Some(backend) = self.backend.as_mut() else {
             return Ok(self.check_condition(0x02, 0x3A, 0x00));
         };
-        backend.write_sectors(lba, data)?;
+        if backend.write(lba * 512, data).is_err() {
+            return Ok(self.check_condition(0x03, 0x0c, 0x00)); // MEDIUM ERROR: write error
+        }
 
         Ok(ScsiResponse {
             status: 0x00,
@@ -1032,21 +1058,35 @@ impl ScsiDevice {
         }
 
         // Header: byte 0 = mode data length (ignored on SELECT), byte 3 = block descriptor length
-        let bd_len = data[3] as usize;
-        if bd_len >= 8 && data.len() >= 4 + bd_len {
-            // 8-byte block descriptor layout (starts at data[4]):
+        self.select_block_descriptor(data, 4, data[3] as usize);
+        Ok(ScsiResponse { status: 0x00, data: vec![] })
+    }
+
+    /// MODE SELECT(10): the same, after an 8-byte header whose bytes 6..7
+    /// give the block descriptor length.
+    fn exec_mode_select_10(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+        let param_len = ((cdb[7] as usize) << 8) | cdb[8] as usize;
+        if let Some(data) = data_in.filter(|d| d.len() >= param_len && param_len >= 8) {
+            self.select_block_descriptor(data, 8, ((data[6] as usize) << 8) | data[7] as usize);
+        }
+        Ok(ScsiResponse { status: 0x00, data: vec![] })
+    }
+
+    /// A MODE SELECT block descriptor at `at`, `len` bytes: its block length
+    /// becomes the logical block size, if it is one a CD-ROM takes.
+    fn select_block_descriptor(&mut self, data: &[u8], at: usize, len: usize) {
+        if len >= 8 && data.len() >= at + len {
+            // 8-byte block descriptor layout:
             //   [0]    density code
             //   [1..3] number of blocks (0 = whole medium)
             //   [4]    reserved
             //   [5..7] block length (24-bit big-endian)
-            let desc = &data[4..4 + bd_len];
+            let desc = &data[at..at + len];
             let new_lbs = ((desc[5] as u64) << 16) | ((desc[6] as u64) << 8) | (desc[7] as u64);
-            if new_lbs == 512 || new_lbs == 2048 {
+            if matches!(new_lbs, 512 | 1024 | 2048) {
                 self.logical_block_size = new_lbs;
             }
         }
-
-        Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
 
     fn exec_write_buffer(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
@@ -1192,6 +1232,7 @@ impl ScsiDevice {
         }
         let msf    = (cdb[1] & 0x02) != 0;
         let format = cdb[2] & 0x0F;
+        let alloc_len = alloc_len_10(cdb);
 
         // TOC LBAs are always in physical CD sectors (2048 bytes each).
         let total_lba = (self.size / self.phys_block_size) as u32;
@@ -1232,6 +1273,10 @@ impl ScsiDevice {
                     data.extend_from_slice(&total_lba.to_be_bytes());
                 }
 
+                // NetBSD asks for 12 bytes (header + track 1): the lead-out
+                // past that is not wanted, and a controller that does not
+                // drop it puts it in someone else's memory.
+                data.truncate(alloc_len);
                 Ok(ScsiResponse { status: 0x00, data })
             }
             1 => {
@@ -1246,6 +1291,7 @@ impl ScsiDevice {
                 data[6] = 0x01; // Track 1
                 data[7] = 0x00;
                 data[8..12].copy_from_slice(&0u32.to_be_bytes()); // LBA 0
+                data.truncate(alloc_len);
                 Ok(ScsiResponse { status: 0x00, data })
             }
             _ => Ok(self.check_condition(0x05, 0x24, 0x00)), // Invalid Field in CDB
@@ -1273,7 +1319,7 @@ impl ScsiDevice {
         Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
 
-    fn exec_get_configuration(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+    fn exec_get_configuration(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
         if !self.is_cdrom() {
             return Ok(self.check_condition(0x05, 0x20, 0x00)); // Invalid Command
         }
@@ -1292,6 +1338,166 @@ impl ScsiDevice {
         // Fill in Data Length (total - 4 header bytes)
         let dlen = (data.len() as u32) - 4;
         data[0..4].copy_from_slice(&dlen.to_be_bytes());
+        data.truncate(alloc_len_10(cdb));
         Ok(ScsiResponse { status: 0x00, data })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn tmp(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "iris-scsi-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn request(cdb: &[u8], data_in: Option<Vec<u8>>) -> ScsiRequest {
+        ScsiRequest {
+            cdb: cdb.to_vec(),
+            data_len: ScsiDataLength::Unlimited,
+            data_in,
+        }
+    }
+
+    /// The direct backend's read/write call sites now go through `BlockNode`.
+    #[test]
+    fn direct_backend_reads_and_writes_through_the_node() {
+        let path = tmp("direct");
+        std::fs::write(&path, vec![0u8; 4 * 512]).unwrap();
+        let node = crate::block_node::RawNode::open(&path).unwrap();
+        let mut dev = ScsiDevice::new(
+            Box::new(node),
+            4 * 512,
+            false,
+            path.display().to_string(),
+            vec![],
+            ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 "),
+        );
+
+        // WRITE(6) one block of 0xAB at LBA 1.
+        let resp = dev
+            .request(&request(&[0x0a, 0x00, 0x00, 0x01, 0x01, 0x00], Some(vec![0xABu8; 512])))
+            .unwrap();
+        assert_eq!(resp.status, 0x00);
+
+        // READ(6) it back through the node.
+        let resp = dev
+            .request(&request(&[0x08, 0x00, 0x00, 0x01, 0x01, 0x00], None))
+            .unwrap();
+        assert_eq!(resp.status, 0x00);
+        assert_eq!(resp.data, vec![0xABu8; 512]);
+
+        // And it reached the file.
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(&on_disk[512..1024], &[0xABu8; 512]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The COW overlay's commit/reset/export/import call sites still behave as
+    /// before the migration onto `CowNode`.
+    #[test]
+    fn cow_backend_manages_its_overlay_through_the_node() {
+        let base = tmp("cow-base");
+        let overlay = tmp("cow-overlay");
+        let export = tmp("cow-export");
+        std::fs::write(&base, vec![0xAAu8; 2 * 512]).unwrap();
+        let backing = crate::block_node::RawNode::open_readonly(&base).unwrap();
+        let node = crate::block_node::CowNode::new(Some(Box::new(backing)), &overlay, 2 * 512)
+            .unwrap()
+            .with_base_path(&base);
+        let mut dev = ScsiDevice::new(
+            Box::new(node),
+            2 * 512,
+            false,
+            base.display().to_string(),
+            vec![],
+            ScsiIdentity::new(b"TEST    ", b"DISK            ", b"1.0 "),
+        );
+
+        assert!(dev.is_cow());
+        assert_eq!(dev.cow_dirty_count(), 0);
+
+        // WRITE(6) LBA 0 marks the overlay dirty.
+        let resp = dev
+            .request(&request(&[0x0a, 0x00, 0x00, 0x00, 0x01, 0x00], Some(vec![0x55u8; 512])))
+            .unwrap();
+        assert_eq!(resp.status, 0x00);
+        assert_eq!(dev.cow_dirty_count(), 1);
+
+        // Export the overlay, roll back, then re-import it.
+        let dirty = dev.cow_export(&export).unwrap();
+        assert_eq!(dirty, vec![0u64]);
+        dev.cow_reset().unwrap();
+        assert_eq!(dev.cow_dirty_count(), 0);
+        dev.cow_import(&export, dirty).unwrap();
+        assert_eq!(dev.cow_dirty_count(), 1);
+
+        // Commit folds the overlay into the base and leaves nothing dirty.
+        assert_eq!(dev.cow_commit().unwrap(), 1);
+        assert_eq!(dev.cow_dirty_count(), 0);
+        let on_disk = std::fs::read(&base).unwrap();
+        assert_eq!(&on_disk[..512], &[0x55u8; 512]);
+
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_file(&overlay);
+        let _ = std::fs::remove_file(&export);
+        let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(&overlay));
+    }
+
+    /// A CD-ROM target on a 100-sector image, past its power-on unit
+    /// attention.
+    fn cdrom() -> ScsiDevice {
+        let path = std::env::temp_dir().join(format!("iris-scsi-alloc-{}.iso", std::process::id()));
+        std::fs::write(&path, vec![0u8; 100 * 2048]).expect("test image");
+        let node = RawNode::open(&path).expect("open");
+        let identity = ScsiIdentity::new(b"TEST    ", b"CD-ROM          ", b"1.0 ");
+        let mut dev = ScsiDevice::new(Box::new(node), 100 * 2048, true, path.display().to_string(), Vec::new(), identity);
+        let _ = run(&mut dev, &[0x00, 0, 0, 0, 0, 0]);
+        let _ = run(&mut dev, &[0x03, 0, 0, 0, 18, 0]);
+        dev
+    }
+
+    fn run(dev: &mut ScsiDevice, cdb: &[u8]) -> ScsiResponse {
+        dev.request(&ScsiRequest { cdb: cdb.to_vec(), data_len: ScsiDataLength::Unlimited, data_in: None }).expect("request")
+    }
+
+    /// NetBSD's cd driver reads the TOC asking for 12 bytes: header and
+    /// track 1. The lead-out descriptor after them must not be sent, or a
+    /// controller passing it on overruns the driver's buffer.
+    #[test]
+    fn read_toc_answers_no_more_than_the_allocation_length() {
+        let mut dev = cdrom();
+        let r = run(&mut dev, &[0x43, 0, 0, 0, 0, 0, 0, 0, 12, 0x40]);
+        assert_eq!(r.status, 0);
+        assert_eq!(r.data.len(), 12);
+        assert_eq!(&r.data[4..8], &[0x00, 0x14, 0x01, 0x00], "track 1's descriptor");
+        let r = run(&mut dev, &[0x43, 0, 0, 0, 0, 0, 0, 0, 20, 0]);
+        assert_eq!(r.data.len(), 20, "the whole TOC when there is room");
+        assert_eq!(&r.data[12..16], &[0x00, 0x14, 0xaa, 0x00], "lead-out");
+        let r = run(&mut dev, &[0x43, 0, 1, 0, 0, 0, 0, 0, 4, 0]);
+        assert_eq!(r.data.len(), 4, "session info is cut too");
+    }
+
+    #[test]
+    fn get_configuration_answers_no_more_than_the_allocation_length() {
+        let mut dev = cdrom();
+        let r = run(&mut dev, &[0x46, 0, 0, 0, 0, 0, 0, 0, 8, 0]);
+        assert_eq!(r.data.len(), 8);
+    }
+
+    #[test]
+    fn request_sense_honours_a_short_allocation_length() {
+        let mut dev = cdrom();
+        assert_eq!(run(&mut dev, &[0x03, 0, 0, 0, 8, 0]).data.len(), 8);
+        assert_eq!(run(&mut dev, &[0x03, 0, 0, 0, 0, 0]).data.len(), 4, "SCSI-2: 0 means 4 bytes");
     }
 }

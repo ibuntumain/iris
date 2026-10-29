@@ -7,15 +7,15 @@ use std::sync::{
 
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device};
 
-const PROM_BASE: u32 = 0x1FC00000;
-const PROM_SIZE: u32 = 1024 * 1024; // 1MB
+const PROM_BASE: u64 = 0x1FC00000;
+const PROM_SIZE: u64 = 1024 * 1024; // 1MB
 const PROM_FILENAME: &str = "070-9101-011.bin";
 
 struct PromInner {
     data: Vec<u32>,
     clock: AtomicU64,
     running: AtomicBool,
-    /// JIT v2 (rules/jitv2/jit-v2-design.md §2.4): "rom device points all generation
+    /// JIT v2 (clanker/jitv2/jit-v2-design.md §2.4): "rom device points all generation
     /// pointers to single u64 initialized to 0" — ROM content never mutates, so every
     /// page shares this one counter and it is never bumped. A compiled artifact's gen
     /// check against it therefore never fails due to ROM-side invalidation.
@@ -147,7 +147,7 @@ impl Device for Prom {
 }
 
 impl BusDevice for PromPort {
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn read8(&self, addr: u64) -> BusRead8 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
 
         if addr < PROM_BASE || addr >= PROM_BASE + PROM_SIZE {
@@ -167,12 +167,12 @@ impl BusDevice for PromPort {
         }
     }
 
-    fn write8(&self, _addr: u32, _val: u8) -> u32 {
+    fn write8(&self, _addr: u64, _val: u8) -> u32 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
         BUS_OK
     }
 
-    fn read16(&self, addr: u32) -> BusRead16 {
+    fn read16(&self, addr: u64) -> BusRead16 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
 
         if addr < PROM_BASE || addr >= PROM_BASE + PROM_SIZE {
@@ -192,12 +192,12 @@ impl BusDevice for PromPort {
         }
     }
 
-    fn write16(&self, _addr: u32, _val: u16) -> u32 {
+    fn write16(&self, _addr: u64, _val: u16) -> u32 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
         BUS_OK
     }
 
-    fn read32(&self, addr: u32) -> BusRead32 {
+    fn read32(&self, addr: u64) -> BusRead32 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
 
         if addr < PROM_BASE || addr >= PROM_BASE + PROM_SIZE {
@@ -214,12 +214,12 @@ impl BusDevice for PromPort {
         }
     }
 
-    fn write32(&self, _addr: u32, _val: u32) -> u32 {
+    fn write32(&self, _addr: u64, _val: u32) -> u32 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
         BUS_OK
     }
 
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn read64(&self, addr: u64) -> BusRead64 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
 
         // Read two consecutive 32-bit words
@@ -229,13 +229,13 @@ impl BusDevice for PromPort {
         BusRead64::ok((high << 32) | low)
     }
 
-    fn write64(&self, _addr: u32, _val: u64) -> u32 {
+    fn write64(&self, _addr: u64, _val: u64) -> u32 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
         BUS_OK
     }
 
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, _addr: u32) -> *const AtomicU64 {
+    fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 {
         &self.inner.gen as *const AtomicU64
     }
 }
@@ -264,11 +264,11 @@ mod tests {
         for path in [configured.to_str().unwrap(), ""] {
             let port = load(path);
             for (i, word) in embedded.chunks_exact(4).enumerate() {
-                let read = port.read32(PROM_BASE + (i * 4) as u32);
+                let read = port.read32(PROM_BASE + (i * 4) as u64);
                 assert!(read.is_ok());
                 assert_eq!(read.data, u32::from_be_bytes(word.try_into().unwrap()));
             }
-            assert_eq!(port.read32(PROM_BASE + embedded.len() as u32).data, u32::MAX);
+            assert_eq!(port.read32(PROM_BASE + embedded.len() as u64).data, u32::MAX);
         }
 
         // A default file wins over the embedded image, including when the
@@ -327,7 +327,7 @@ mod tests {
 
         // PROM is at physical address 0x1FC00000
         // But CPU starts at 0xBFC00000 (KSEG1 uncached mapping)
-        const KSEG1_OFFSET: u32 = 0xA0000000;
+        const KSEG1_OFFSET: u64 = 0xA0000000;
 
         for i in 0..256 {
             let phys_addr = PROM_BASE + (i * 4);
@@ -335,7 +335,7 @@ mod tests {
 
             let r = port.read32(phys_addr);
             if r.is_ok() {
-                let disasm = mips_dis::disassemble(r.data, kseg1_addr as u64, None);
+                let disasm = mips_dis::disassemble(r.data, kseg1_addr, None);
                 println!("0x{:08x}: 0x{:08x}: {}", kseg1_addr, r.data, disasm);
             } else {
                 println!("0x{:08x}: ERROR reading", kseg1_addr);

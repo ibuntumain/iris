@@ -128,7 +128,6 @@ menu-memory-stop-first-tip = Stop the machine to change memory.
 toast-ram-set = Memory set to { $ram } { $banks }.
 menu-memory-banks = Memory banks
 menu-memory-bank = Bank { $bank }: { $mb } MB
-menu-memory-ip28-only-tip = 256 MB and 512 MB banks need the Indigo2 R10000 (IP28) profile.
 
 ## SCSI menu
 
@@ -394,7 +393,7 @@ help-ultra64-cmd-reset = Reset the N64
 help-ultra64-cmd-load = Load a file straight into RAMROM
 help-ultra64-cmd-dump = Show RAMROM contents in hex
 help-ultra64-cmd-disasm = Disassemble RAMROM
-help-ultra64-footer = This is a developer feature for N64 homebrew and research. IRIS doesn't include any ROMs. Hardware notes are in docs/ultra64.md.
+help-ultra64-footer = This is a developer feature for N64 homebrew and research. IRIS doesn't include any ROMs. Hardware notes are in docs/Indy/ultra64.md.
 
 ## Disk sync and discard dialogs
 
@@ -502,3 +501,4 @@ modal-grant-tcc = macOS is blocking access to these folders. Allow IRIS in Syste
 modal-grant-open-privacy = Open Privacy & Security…
 modal-grant-recheck = Check again
 modal-grant-start-anyway = Start without merging
+toast-nvram-reset-octane = NVRAM cleared; the Octane starts with a blank one. The old file is kept as a .bak.

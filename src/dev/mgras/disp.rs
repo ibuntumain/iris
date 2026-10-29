@@ -8,7 +8,7 @@ use std::sync::Arc;
 use super::dcb::Dcb;
 use super::rss::{self, Rss};
 use super::frame::{self, Frame};
-use super::{plain, Line, Mgras};
+use super::{microcode, plain, Line, Mgras};
 
 /// The window ID a frame for the window at (`x`, `y`), `w` x `h` (screen
 /// coordinates, top-down) should be painted through: the commonest ID
@@ -220,6 +220,12 @@ impl Mgras {
         let mut shown = (0usize, 0usize);
         let mut idle_frames = 0u32;
         let mut shots = 0u32;
+        // Microcode fingerprints: checked every two seconds, logged once
+        // the same value is seen twice in a row and differs from the last
+        // one logged.
+        let mut microcode_seen = microcode::Fingerprints::default();
+        let mut microcode_logged = microcode::Fingerprints::default();
+        let mut frames = 0u32;
         let mut last_rec_flush = std::time::Instant::now();
         let mut snap = plain::boxed_zeroed::<Frame>();
         const PERSISTENT: u64 = crate::dev::ng1::rex3::Rex3::HB_LED_RED | crate::dev::ng1::rex3::Rex3::HB_LED_GREEN;
@@ -247,16 +253,14 @@ impl Mgras {
                 last_rec_flush = std::time::Instant::now();
             }
             self.trace_flush(false);
-            self.begin_frame();
-            // Video timing chip display control bit 0: retrace interrupts.
-            let retrace = self.front_view().dcb.vc3.regs[0x1E] & 1 != 0;
-            // Vertical retrace: a pulse per frame. The handler acknowledges
-            // nothing on the board, so the line must drop again by itself.
-            if retrace {
-                crate::pf_instant!(crate::perfetto::events::MGRAS_RETRACE);
-                self.set_line(Line::Retrace, true);
-                std::thread::sleep(std::time::Duration::from_micros(500));
-                self.set_line(Line::Retrace, false);
+            frames = frames.wrapping_add(1);
+            if frames % 120 == 0 {
+                let fp = self.microcode_fingerprints();
+                if fp.hq != 0 && fp == microcode_seen && fp != microcode_logged {
+                    eprintln!("impact: microcode {fp}");
+                    microcode_logged = fp;
+                }
+                microcode_seen = fp;
             }
             let dirty = self.dirty.swap(false, Ordering::AcqRel);
             let shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
@@ -266,13 +270,16 @@ impl Mgras {
                 let mut screen = self.screen.lock();
                 if dirty || shot {
                     let screen = &mut *screen;
-                    // The snapshot follows the retrace pulse, so the guest's
-                    // retrace-time updates (window-ID tables, swaps) are in.
+                    // The snapshot comes before this frame's retrace pulse:
+                    // the last retrace's updates (window-ID tables, swaps)
+                    // are in, and nothing draws into the front buffer now.
                     // SAFETY: a read-only view of the framebuffer; tearing
                     // tolerated.
                     let rss = unsafe { &*self.rss.get() };
+                    crate::pf_begin!(crate::perfetto::events::MGRAS_CAPTURE, self.rss_fifo.len());
                     snap.snapshot(rss, &self.front_view().dcb);
                     snap.compose(&mut screen.fb_rgb);
+                    crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
                     // The frame is already final RGB, so keep `rgba` (what CI
                     // screenshots read) current without a renderer readback,
                     // as GR2 does. This also makes screenshots work headless.
@@ -281,6 +288,7 @@ impl Mgras {
                         let row = y * 2048;
                         screen.rgba[row..row + w].copy_from_slice(&screen.fb_rgb[row..row + w]);
                     }
+                    screen.frame_seq = screen.frame_seq.wrapping_add(1);
                     screen.width = w;
                     screen.height = h;
                     screen.status_bar_only = false;
@@ -292,7 +300,9 @@ impl Mgras {
                         shown = (screen.width, screen.height);
                         r.resize(shown.0, shown.1);
                     }
+                    crate::pf_begin!(crate::perfetto::events::MGRAS_PRESENT);
                     r.present(&mut screen, &mut overlay, &mut status_bar, &mut sbtex, &stats, shot, None, None);
+                    crate::pf_end!(crate::perfetto::events::MGRAS_PRESENT);
                 }
                 // The screenshot hotkey (Right Ctrl + Print Screen), as REX3
                 // and GR2 do: the frame just composed, written off-thread.
@@ -305,6 +315,25 @@ impl Mgras {
                         Err(e) => println!("iris: screenshot failed: {e}"),
                     });
                 }
+            }
+            // Vertical retrace, after the frame is taken: scanout reads the
+            // front buffer during the frame, and the kernel's retrace
+            // handler flips buffers (XMAP buffer select) during the blank.
+            // Taken after the pulse, the snapshot raced the flip: the
+            // handler flips and the client starts its next frame in the
+            // buffer just shown, while the snapshot was still copying it
+            // (octahedra tore). Now a flip at this retrace shows from the
+            // next frame, as on the board.
+            self.begin_frame();
+            // Video timing chip display control bit 0: retrace interrupts.
+            let retrace = self.front_view().dcb.vc3.regs[0x1E] & 1 != 0;
+            // A pulse per frame. The handler acknowledges nothing on the
+            // board, so the line must drop again by itself.
+            if retrace {
+                crate::pf_instant!(crate::perfetto::events::MGRAS_RETRACE);
+                self.set_line(Line::Retrace, true);
+                std::thread::sleep(std::time::Duration::from_micros(500));
+                self.set_line(Line::Retrace, false);
             }
             if let Some(rest) = frame.checked_sub(start.elapsed()) {
                 std::thread::sleep(rest);

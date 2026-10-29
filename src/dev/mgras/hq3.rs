@@ -302,7 +302,7 @@ fn fetch_dl_segment(mem: &dyn BusDevice, table: u32, offset: u32, words: u32) ->
         let frame = match cached {
             Some((p, f)) if p == page => f,
             _ => {
-                let r = mem.read32(table.wrapping_add(4 * page));
+                let r = mem.read32(table.wrapping_add(4 * page) as u64);
                 if !r.is_ok() {
                     return None;
                 }
@@ -310,7 +310,7 @@ fn fetch_dl_segment(mem: &dyn BusDevice, table: u32, offset: u32, words: u32) ->
                 r.data << 12
             }
         };
-        let w = mem.read32(frame | (l & 0xFFF));
+        let w = mem.read32((frame | (l & 0xFFF)) as u64);
         out.push(if w.is_ok() { w.data } else { 0 });
     }
     Some(out)
@@ -320,6 +320,23 @@ fn fetch_dl_segment(mem: &dyn BusDevice, table: u32, offset: u32, words: u32) ->
 /// starts a board-to-host transfer.
 const RSS_XFRCONTROL: u32 = 0x102;
 const XFRCONTROL_READ_START: u32 = 9;
+const XFRCONTROL_READ: u32 = 8;
+
+/// What a board other than the Indigo2's changes in the engine's command
+/// handling.
+pub trait Hq3Board: Send + Sync {
+    /// The GE state word a readback at `addr` answers.
+    fn ge_state(&self, gl: &mut super::gl::Gl, addr: u32) -> Option<u32>;
+    /// Whether the raster command `cmd` is dropped instead of executed; the
+    /// reason is reported.
+    fn drop_raster_write(&self, cmd: u32) -> Option<String>;
+    /// A pixel-state address (PIXEL_STATE, INIT_PIXEL_STATE_ERAM, and the
+    /// module state addresses in the pipeline program) in the Indigo2
+    /// microcode's layout, which the pixel HLE is written for.
+    fn pixel_state_address(&self, addr: u32) -> u32 {
+        addr
+    }
+}
 
 /// CPU-side HQ3 registers (the flags are atomic, in `Mgras`). Plain data,
 /// valid zeroed.
@@ -328,6 +345,8 @@ pub struct Hq3Regs {
     /// Registers not modelled otherwise, read back as written.
     pub regs: RegMap<256>,
     pub ucode: [u32; ((host::UCODE_END - host::UCODE) / 4) as usize],
+    /// The microcode's fingerprint, kept as it is written.
+    pub ucode_hash: super::microcode::Running,
     pub flag_enable: u32,
     pub interrupt_enable: u32,
     pub ge_readback: [u32; 2],
@@ -356,6 +375,8 @@ pub trait Hq3Sink {
     /// A GL batch starts (true) or ends: the RSS saves / restores the raster
     /// registers the batch loads.
     fn gl_bracket(&mut self, _enter: bool) {}
+    /// Wait until the raster engines have drawn everything queued so far.
+    fn finish_raster(&mut self) {}
     /// System memory for DMA, if connected.
     fn sys_mem(&mut self) -> Option<Arc<dyn BusDevice>>;
     /// Something not modelled yet (reported once).
@@ -512,6 +533,17 @@ pub struct Hq3Engine {
     /// A board-to-host DMA started on the host side, waiting for the raster
     /// engine to be started (xfrcontrol = 9).
     dma_read_pending: Option<u32>,
+    /// A board-to-host start runs at once when the raster engine already
+    /// has a read armed, and an XFRCONTROL with the read bit starts a
+    /// waiting one: the Octane's HQ4 order, where the X server arms the
+    /// read with XFRCONTROL 8 and kicks the DMA last. The Indigo2's order
+    /// is the host side first, then XFRCONTROL 9. The armed read stays
+    /// armed until the next block or XFRCONTROL 0, so a later read kick
+    /// meant for something else (a kernel GE context read-out) would take
+    /// those pixels instead; nothing captured shows that order yet.
+    pub kick_starts_read: bool,
+    /// Hooks for a board outside the Indigo2.
+    pub board: Option<Box<dyn Hq3Board>>,
     /// DMA transfers logged so far (bring-up).
     dma_logged: u32,
     /// The GE11s' OpenGL state (HLE) for the current context, the context
@@ -576,6 +608,8 @@ impl Hq3Engine {
             raster_if_regs: [0; 0x10],
             formatter: 0,
             dma_read_pending: None,
+            kick_starts_read: false,
+            board: None,
             dma_logged: 0,
             ge_return: None,
             last_token: None,
@@ -848,7 +882,10 @@ impl Hq3Engine {
                 let p = std::mem::take(&mut self.payload);
                 match t {
                     0x089 => self.lut.load_table(&p),
-                    _ => self.gl.pixel_state_block(&p),
+                    _ => {
+                        let p = self.canonical_pixel_state(&p);
+                        self.gl.pixel_state_block(&p)
+                    }
                 }
                 return;
             }
@@ -919,7 +956,11 @@ impl Hq3Engine {
             0x089 => Some(cmd),
             _ => None,
         };
-        if cmd >= cmd::RASTER_BASE {
+        let dropped = if cmd >= cmd::RASTER_BASE { self.board.as_ref().and_then(|b| b.drop_raster_write(cmd)) } else { None };
+        if let Some(why) = dropped {
+            self.stats.raster_writes += 1;
+            sink.note(why);
+        } else if cmd >= cmd::RASTER_BASE {
             let r = cmd & 0x3FF;
             let exec = cmd & cmd::RASTER_EXECUTE != 0;
             self.stats.raster_writes += 1;
@@ -932,8 +973,11 @@ impl Hq3Engine {
                     sink.rss_write(r + 1, *lo, exec);
                 }
             }
-            if r == RSS_XFRCONTROL && data.first() == Some(&XFRCONTROL_READ_START) {
+            let xfr = data.first().copied().filter(|_| r == RSS_XFRCONTROL);
+            if xfr == Some(XFRCONTROL_READ_START) {
                 self.start_read_dma(sink);
+            } else if self.kick_starts_read && xfr.is_some_and(|v| v & XFRCONTROL_READ != 0) {
+                self.start_armed_read(sink);
             }
         } else if cmd == cmd::SET_DONE_FLAG {
             self.stats.set_done += 1;
@@ -979,9 +1023,18 @@ impl Hq3Engine {
                 }
             }
         } else if cmd == cmd::CP_SCHEDULE_SWAP {
-            // No retrace wait: the swap is reported done at once. The GE's
-            // front and back trade places for the drawing that follows.
+            // No retrace wait: the swap is reported as soon as the frame
+            // before it is drawn. The GE's front and back trade places for
+            // the drawing that follows.
             self.gl.swap_buffers(sink);
+            // The Octane kernel flips at the next retrace once this flag is
+            // up, without checking that the board is idle (it flips on a
+            // STATUS of HQ idle, board busy): behind the HQ the board's
+            // pipe is shallow. Our raster queue is deep, so the frame must
+            // be finished first or the flip shows it half drawn. The
+            // Indigo2 kernel drains the FIFO before the swap, so this
+            // costs it nothing.
+            sink.finish_raster();
             self.stats.swaps += 1;
             self.stats.cp_tokens[cmd as usize] += 1;
             sink.set_flags(host::FLAG_CP0);
@@ -1002,7 +1055,7 @@ impl Hq3Engine {
             self.stats.cp_tokens[cmd as usize] += 1;
             self.gl.end_raster(sink);
             let addr = data.first().copied().unwrap_or(0);
-            let v = sink.readback_probe(addr).or_else(|| self.gl.state_word(addr)).unwrap_or(addr);
+            let v = sink.readback_probe(addr).or_else(|| self.ge_state(addr)).unwrap_or(addr);
             self.ge_return = Some([0, v]);
             sink.set_flags(host::FLAG_GE_DATA);
         } else if cmd == cmd::CP_RETURN_MODE {
@@ -1010,7 +1063,9 @@ impl Hq3Engine {
             // Addresses the GE HLE knows answer from its state; others read
             // 0 and are reported once each, so the layout can be mapped.
             let addr = data.first().copied().unwrap_or(0);
-            let v = sink.readback_probe(addr).or_else(|| self.gl.state_word(addr)).unwrap_or_else(|| {
+            let select = data.get(1) == Some(&0xFFFF_FFFF);
+            let v = if select { Some(self.gl.select_word(addr)) } else { sink.readback_probe(addr) };
+            let v = v.or_else(|| self.ge_state(addr)).unwrap_or_else(|| {
                 sink.note(format!("GE state readback at {addr:#x} ({:x?}) answered 0", data.get(1..).unwrap_or(&[])));
                 0
             });
@@ -1025,6 +1080,9 @@ impl Hq3Engine {
                     sink.trace(format!("  converted ({conv:#x}): {:?}", floats.iter().map(|w| f32::from_bits(*w)).collect::<Vec<_>>()));
                 }
                 self.gl.token(cmd, &floats, sink)
+            } else if matches!(cmd, super::gl::tok::PIXEL_STATE | super::gl::tok::INIT_PIXEL_STATE_ERAM) {
+                let data = self.canonical_pixel_state(data);
+                self.gl.token(cmd, &data, sink)
             } else {
                 self.gl.token(cmd, data, sink)
             }
@@ -1044,15 +1102,53 @@ impl Hq3Engine {
         }
     }
 
+    /// A pixel-state block (`Gl::pixel_state_block`'s words: 3 the
+    /// address, 6 the count, then the values) with its address, and the
+    /// module state addresses of a pipeline program, in the Indigo2 layout.
+    fn canonical_pixel_state<'a>(&self, d: &'a [u32]) -> std::borrow::Cow<'a, [u32]> {
+        let Some(b) = self.board.as_ref() else { return d.into() };
+        if d.len() < 7 {
+            return d.into();
+        }
+        let mut d = d.to_vec();
+        let addr = d[3];
+        d[3] = b.pixel_state_address(addr);
+        // The program's pairs are (entry, state address); the first pair's
+        // state is 0.
+        if addr <= super::pixpipe::PROGRAM {
+            let first = (super::pixpipe::PROGRAM - addr) as usize;
+            let n = (d[6] as usize).min(d.len() - 7);
+            for k in (first + 1..n).step_by(2) {
+                if d[7 + k] != 0 {
+                    d[7 + k] = b.pixel_state_address(d[7 + k]);
+                }
+            }
+        }
+        d.into()
+    }
+
+    /// The GE state word a readback at `addr` answers, in the layout of the
+    /// board's microcode.
+    fn ge_state(&mut self, addr: u32) -> Option<u32> {
+        match &self.board {
+            Some(b) => b.ge_state(&mut self.gl, addr),
+            None => self.gl.state_word(addr),
+        }
+    }
+
     /// The host DMA engine's start word. Host to board runs now: the raster
-    /// engine was armed by commands queued ahead. Board to host waits for
-    /// the raster engine.
+    /// engine was armed by commands queued ahead. Board to host is held
+    /// until the raster engine arms the transfer, or, with
+    /// `kick_starts_read`, until the start word itself starts it.
     fn dma_start(&mut self, word: u32, sink: &mut dyn Hq3Sink) {
         if word & 1 == 0 {
             return;
         }
         if word & 8 != 0 {
             self.dma_read_pending = Some(word);
+            if self.kick_starts_read {
+                self.start_armed_read(sink);
+            }
             return;
         }
         if self.eram_in.is_some() {
@@ -1124,6 +1220,14 @@ impl Hq3Engine {
                 let words: Vec<u32> = self.eram.words[ge][addr..addr + n].to_vec();
                 self.dma(word, DmaPeer::EramOut(&words, 0), sink);
             }
+        }
+    }
+
+    /// The HQ4 order: a waiting host side starts once the raster engine
+    /// has a read armed; until then both wait.
+    fn start_armed_read(&mut self, sink: &mut dyn Hq3Sink) {
+        if self.dma_read_pending.is_some() && matches!(sink.transfer(), Some((true, _))) {
+            self.start_read_dma(sink);
         }
     }
 
@@ -1278,7 +1382,7 @@ impl Hq3Engine {
         }
         let frame_of = |page: u32| -> Option<u32> {
             let page = if list.is_empty() { page } else { *list.get(page as usize)? };
-            let r = mem.read32(table.wrapping_add(4 * page));
+            let r = mem.read32(table.wrapping_add(4 * page) as u64);
             r.is_ok().then_some(r.data << 12)
         };
         let mut cached: Option<(u32, u32)> = None;
@@ -1326,7 +1430,7 @@ impl Hq3Engine {
                 format_pixels(self.formatter, &mut bytes);
                 for (k, b) in bytes.iter().take(len as usize).enumerate() {
                     let Some(pa) = phys(a + k as u32) else { return };
-                    mem.write8(pa, *b);
+                    mem.write8(pa as u64, *b);
                 }
             } else {
                 let mut bytes = vec![0u8; len as usize];
@@ -1359,10 +1463,10 @@ impl Hq3Engine {
 /// time, 0 where a read fails.
 fn read_host(mem: &dyn BusDevice, pa: u32, out: &mut [u8]) {
     let base = pa & !7;
-    if mem.mem_ptr(base).is_some() {
+    if mem.mem_ptr(base as u64).is_some() {
         let skip = (pa - base) as usize;
         let mut buf = vec![0u64; (skip + out.len()).div_ceil(8)];
-        if mem.read_block(base, &mut buf) == crate::traits::BUS_OK {
+        if mem.read_block(base as u64, &mut buf) == crate::traits::BUS_OK {
             for (i, b) in out.iter_mut().enumerate() {
                 let at = skip + i;
                 *b = (buf[at / 8] >> (56 - 8 * (at % 8))) as u8;
@@ -1371,7 +1475,7 @@ fn read_host(mem: &dyn BusDevice, pa: u32, out: &mut [u8]) {
         }
     }
     for (i, b) in out.iter_mut().enumerate() {
-        let r = mem.read8(pa + i as u32);
+        let r = mem.read8((pa + i as u32) as u64);
         *b = if r.is_ok() { r.data } else { 0 };
     }
 }
@@ -1697,13 +1801,13 @@ mod tests {
     struct Ram(Vec<u8>);
 
     impl BusDevice for Ram {
-        fn read8(&self, addr: u32) -> BusRead8 {
+        fn read8(&self, addr: u64) -> BusRead8 {
             BusRead8::ok(self.0[addr as usize])
         }
-        fn mem_ptr(&self, addr: u32) -> Option<*const u64> {
+        fn mem_ptr(&self, addr: u64) -> Option<*const u64> {
             Some(self.0[addr as usize..].as_ptr() as *const u64)
         }
-        fn read_block(&self, addr: u32, buf: &mut [u64]) -> u32 {
+        fn read_block(&self, addr: u64, buf: &mut [u64]) -> u32 {
             for (i, w) in buf.iter_mut().enumerate() {
                 let at = addr as usize + 8 * i;
                 *w = u64::from_be_bytes(self.0[at..at + 8].try_into().unwrap());
@@ -1721,7 +1825,7 @@ mod tests {
             for len in [0usize, 1, 5, 7, 8, 9, 16, 23, 64, 0x100] {
                 let mut fast = vec![0u8; len];
                 read_host(&ram, pa, &mut fast);
-                let slow: Vec<u8> = (0..len as u32).map(|i| ram.read8(pa + i).data).collect();
+                let slow: Vec<u8> = (0..len as u32).map(|i| ram.read8((pa + i) as u64).data).collect();
                 assert_eq!(fast, slow, "pa {pa:#x} len {len}");
             }
         }

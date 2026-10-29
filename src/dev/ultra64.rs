@@ -22,7 +22,7 @@
 mod imp {
 
 use crate::devlog::{devlog, devlog_is_active, LogModule};
-use crate::dev::ioc::{Ioc, IocInterrupt};
+use crate::irq::IrqLine;
 use crate::traits::{BusDevice, BusRead32, BusRead64, BusRead16, BusRead8, BUS_OK, Device};
 use crate::ultra_proto::{h2n, n2h, rdb_type, rdb_bytes, IpcRing, ShmHeader,
     SHM_MAGIC, SHM_VERSION, EVENT_AREA_SIZE, SHM_HEADER_OFFSET, SHM_RAMROM_OFFSET,
@@ -78,7 +78,8 @@ struct Ultra64State {
 
 pub struct Ultra64 {
     state:    Arc<Mutex<Ultra64State>>,
-    ioc:      Ioc,
+    /// The board's interrupt: GIO expansion slot 0 on an Indy.
+    irq:      IrqLine,
     shmem:    shared_memory::Shmem,
     // raw pointers into shmem, valid for its lifetime
     hdr_ptr:    *mut ShmHeader,
@@ -95,7 +96,7 @@ unsafe impl Send for Ultra64 {}
 unsafe impl Sync for Ultra64 {}
 
 impl Ultra64 {
-    pub fn new(ioc: Ioc) -> Result<Self, String> {
+    pub fn new(irq: IrqLine) -> Result<Self, String> {
         // Unlink any stale shm left by a previous crash before creating fresh.
         // This is safe: the mapping only matters while iris is running, and if
         // gopher64 is already attached it will notice iris restarted via magic check.
@@ -143,7 +144,7 @@ impl Ultra64 {
         }));
 
         Ok(Ultra64 {
-            state, ioc, shmem, hdr_ptr, ramrom_ptr, evt_h2n, evt_n2h,
+            state, irq, shmem, hdr_ptr, ramrom_ptr, evt_h2n, evt_n2h,
             running: Arc::new(AtomicBool::new(false)),
             threads: Mutex::new(Vec::new()),
         })
@@ -168,7 +169,7 @@ impl Device for Ultra64 {
         }
 
         let state    = Arc::clone(&self.state);
-        let ioc      = self.ioc.clone();
+        let irq      = self.irq.clone();
         let evt_n2h  = Arc::clone(&self.evt_n2h);
         let running  = Arc::clone(&self.running);
         let hdr_ptr  = self.hdr_ptr as usize;
@@ -192,7 +193,7 @@ impl Device for Ultra64 {
                                         st.gio_int_pending = true;
                                         st.gio_int_payload = payload & 0x3F;
                                         drop(st);
-                                        ioc.set_interrupt(IocInterrupt::GioExp0, true);
+                                        irq.set(true);
                                     }
                                     n2h::GIO_SYNC => {
                                         dlog!(LogModule::Ultra, "GIO_SYNC from N64: val={:#04x}", payload);
@@ -204,7 +205,7 @@ impl Device for Ultra64 {
                                         // so u64_giointr()'s bit-30 path calls send_write_buffer().
                                         dlog!(LogModule::Ultra, "RDB_READ ACK from N64 → set rdb_r_int, assert GioExp0");
                                         state.lock().rdb_r_int = true;
-                                        ioc.set_interrupt(IocInterrupt::GioExp0, true);
+                                        irq.set(true);
                                     }
                                     n2h::RDB_WRITE => {
                                         // N64 wrote a packet to GIO_RDB_BASE_REG.
@@ -220,7 +221,7 @@ impl Device for Ultra64 {
                                         st.rdb_n2h   = payload;
                                         st.rdb_w_int = true;
                                         drop(st);
-                                        ioc.set_interrupt(IocInterrupt::GioExp0, true);
+                                        irq.set(true);
                                     }
                                     _ => {
                                         dlog!(LogModule::Ultra, "n2h unknown kind={} payload={:#010x}", kind, payload);
@@ -411,7 +412,8 @@ impl Drop for Ultra64 {
 // ---------------------------------------------------------------------------
 
 impl BusDevice for Ultra64 {
-    fn read32(&self, addr: u32) -> BusRead32 {
+    fn read32(&self, addr: u64) -> BusRead32 {
+        let addr = addr as u32; // GIO slot 0, below 4 GB
         // RDB port (0x1F480000–0x1F48000F)
         if addr >= RDB_BASE && addr < RDB_BASE + 0x10 {
             let offset = addr - RDB_BASE;
@@ -483,7 +485,7 @@ impl BusDevice for Ultra64 {
                 let payload = st.gio_int_payload & 0x3F;
                 st.gio_int_pending = false;
                 drop(st);
-                self.ioc.set_interrupt(IocInterrupt::GioExp0, false);
+                self.irq.set(false);
                 dlog!(LogModule::Ultra, "rd GIO_INT_ACK @+0xC00 → {:#04x}", payload);
                 BusRead32::ok(payload)
             }
@@ -499,7 +501,8 @@ impl BusDevice for Ultra64 {
         }
     }
 
-    fn write32(&self, addr: u32, val: u32) -> u32 {
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        let addr = addr as u32; // GIO slot 0, below 4 GB
         // RDB port (0x1F480000–0x1F48000F)
         if addr >= RDB_BASE && addr < RDB_BASE + 0x10 {
             let offset = addr - RDB_BASE;
@@ -517,7 +520,7 @@ impl BusDevice for Ultra64 {
                     // and lowers the GIO interrupt. Driver writes this before reading the packet.
                     dlog!(LogModule::Ultra, "wr GIO_RDB_WRITE_INTR_REG (clear rdb_w_int, lower GioExp0)");
                     self.state.lock().rdb_w_int = false;
-                    self.ioc.set_interrupt(IocInterrupt::GioExp0, false);
+                    self.irq.set(false);
                 }
                 0xC => {
                     // GIO_RDB_READ_INTR_REG: W0C — driver writes 0 to clear product_id bit 30
@@ -529,7 +532,7 @@ impl BusDevice for Ultra64 {
                     let new_ack   = st.rdb_n2h_ack.wrapping_add(1);
                     st.rdb_n2h_ack = new_ack;
                     drop(st);
-                    self.ioc.set_interrupt(IocInterrupt::GioExp0, false);
+                    self.irq.set(false);
                     self.hdr_mut().h2n_ring.push(h2n::RDB_ACK, new_ack);
                     let _ = self.evt_h2n.set(EventState::Signaled);
                 }
@@ -604,30 +607,30 @@ impl BusDevice for Ultra64 {
         BUS_OK
     }
 
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn read8(&self, addr: u64) -> BusRead8 {
         let r = self.read32(addr & !3);
         BusRead8::ok((r.data >> (8 * (3 - (addr & 3)))) as u8)
     }
-    fn write8(&self, addr: u32, val: u8) -> u32 {
+    fn write8(&self, addr: u64, val: u8) -> u32 {
         let shift = 8 * (3 - (addr & 3));
         let cur = self.read32(addr & !3).data;
         self.write32(addr & !3, (cur & !(0xFF << shift)) | ((val as u32) << shift))
     }
-    fn read16(&self, addr: u32) -> BusRead16 {
+    fn read16(&self, addr: u64) -> BusRead16 {
         let r = self.read32(addr & !3);
         BusRead16::ok((r.data >> (8 * (2 - (addr & 2)))) as u16)
     }
-    fn write16(&self, addr: u32, val: u16) -> u32 {
+    fn write16(&self, addr: u64, val: u16) -> u32 {
         let shift = 8 * (2 - (addr & 2));
         let cur = self.read32(addr & !3).data;
         self.write32(addr & !3, (cur & !(0xFFFF << shift)) | ((val as u32) << shift))
     }
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn read64(&self, addr: u64) -> BusRead64 {
         let hi = self.read32(addr).data as u64;
         let lo = self.read32(addr + 4).data as u64;
         BusRead64::ok((hi << 32) | lo)
     }
-    fn write64(&self, addr: u32, val: u64) -> u32 {
+    fn write64(&self, addr: u64, val: u64) -> u32 {
         self.write32(addr, (val >> 32) as u32);
         self.write32(addr + 4, val as u32)
     }

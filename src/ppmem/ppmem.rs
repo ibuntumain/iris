@@ -47,6 +47,15 @@ pub const WINDOW_SIZE: u64 = 1 << 32;
 /// Granularity of [`MappedMemory::mapped_bitmap`]: 4GB / 64 bits = 64MB/bit.
 pub const BITMAP_SHIFT: u32 = 26;
 
+/// Does `bitmap` (a [`MappedMemory::mapped_bitmap`]) say `phys` is in the
+/// window? False above 4GB, where a plain `1 << (phys >> BITMAP_SHIFT)`
+/// would overflow the shift.
+#[inline(always)]
+pub fn bitmap_maps(bitmap: u64, phys: u64) -> bool {
+    let region = phys >> BITMAP_SHIFT;
+    region < 64 && bitmap & (1u64 << region) != 0
+}
+
 /// Bytes of RAM per generation counter: one `AtomicU64` per 4KB page.
 ///
 /// `4096 / 8 == 512`, so a region's gen block is always its data size >> 9 and
@@ -113,7 +122,7 @@ pub trait MappedMemory {
     ///
     /// A CPU fast path can then decide RAM-vs-bus in one shift and test:
     /// ```text
-    /// if mask & (1u64 << (phys >> BITMAP_SHIFT)) != 0 { direct } else { bus }
+    /// if bitmap_maps(mask, phys) { direct } else { bus }
     /// ```
     ///
     /// A bit is set only when the *entire* 64MB is mapped RAM, so partial
@@ -257,6 +266,23 @@ impl PpMemory {
         self.size_bytes
     }
 
+    /// The bank's own mapping: byte `o` of the bank (guest byte order) is at
+    /// `host_ptr() + (o ^ 3)`, as `read8` reads it. For devices that address
+    /// a bank by byte offset rather than through `BusDevice`.
+    #[inline(always)]
+    pub fn host_ptr(&self) -> *mut u8 {
+        self.base
+    }
+
+    /// Bump the generation of the page holding bank byte offset `off`, for a
+    /// write made through [`Self::host_ptr`] rather than `BusDevice`.
+    #[cfg(feature = "jitv2")]
+    #[inline]
+    pub fn bump_gen_off(&self, off: usize) {
+        let page = (off & self.mask()) / JITV2_PAGE_SIZE;
+        unsafe { (*self.gen_base.add(page)).fetch_add(1, Ordering::Relaxed) };
+    }
+
     /// The shared object behind this bank, for mapping it into a window.
     pub fn shared(&self) -> &Arc<SharedMem> {
         &self.mem
@@ -269,7 +295,7 @@ impl PpMemory {
 
     /// Byte offset for `addr`, wrapped into the bank exactly as `Memory` does.
     #[inline(always)]
-    fn off(&self, addr: u32) -> usize {
+    fn off(&self, addr: u64) -> usize {
         (addr as usize) & self.mask()
     }
 
@@ -297,7 +323,7 @@ impl PpMemory {
     /// JIT v2: bump the generation counter for the page containing `addr`.
     #[cfg(feature = "jitv2")]
     #[inline(always)]
-    fn bump_gen(&self, addr: u32) {
+    fn bump_gen(&self, addr: u64) {
         let page = self.off(addr) / JITV2_PAGE_SIZE;
         // Relaxed for the same reason `Memory::bump_gen` is: the publish-side
         // re-check provides the ordering (jit-v2-design.md §6.5).
@@ -313,7 +339,7 @@ impl PpMemory {
     /// in lockstep.
     #[cfg(feature = "jitv2")]
     #[inline]
-    pub fn gen_ptr(&self, addr: u32) -> *const AtomicU64 {
+    pub fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
         let page = self.off(addr) / JITV2_PAGE_SIZE;
         unsafe { self.gen_base.add(page) as *const AtomicU64 }
     }
@@ -398,12 +424,12 @@ impl Resettable for PpMemory {
 
 impl BusDevice for PpMemory {
     #[inline(always)]
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn read8(&self, addr: u64) -> BusRead8 {
         unsafe { BusRead8::ok(*self.base.add(self.off(addr) ^ 3)) }
     }
 
     #[inline(always)]
-    fn write8(&self, addr: u32, val: u8) -> u32 {
+    fn write8(&self, addr: u64, val: u8) -> u32 {
         unsafe { *self.base.add(self.off(addr) ^ 3) = val };
         #[cfg(feature = "jitv2")]
         self.bump_gen(addr);
@@ -411,7 +437,7 @@ impl BusDevice for PpMemory {
     }
 
     #[inline(always)]
-    fn read16(&self, addr: u32) -> BusRead16 {
+    fn read16(&self, addr: u64) -> BusRead16 {
         unsafe {
             let p = self.base as *const u16;
             BusRead16::ok(*p.add((self.off(addr) >> 1) ^ 1))
@@ -419,7 +445,7 @@ impl BusDevice for PpMemory {
     }
 
     #[inline(always)]
-    fn write16(&self, addr: u32, val: u16) -> u32 {
+    fn write16(&self, addr: u64, val: u16) -> u32 {
         unsafe {
             let p = self.base as *mut u16;
             *p.add((self.off(addr) >> 1) ^ 1) = val;
@@ -430,7 +456,7 @@ impl BusDevice for PpMemory {
     }
 
     #[inline(always)]
-    fn read32(&self, addr: u32) -> BusRead32 {
+    fn read32(&self, addr: u64) -> BusRead32 {
         unsafe {
             let p = self.base as *const u32;
             BusRead32::ok(*p.add(self.off(addr) >> 2))
@@ -438,7 +464,7 @@ impl BusDevice for PpMemory {
     }
 
     #[inline(always)]
-    fn write32(&self, addr: u32, val: u32) -> u32 {
+    fn write32(&self, addr: u64, val: u32) -> u32 {
         unsafe {
             let p = self.base as *mut u32;
             *p.add(self.off(addr) >> 2) = val;
@@ -449,7 +475,7 @@ impl BusDevice for PpMemory {
     }
 
     #[inline(always)]
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn read64(&self, addr: u64) -> BusRead64 {
         unsafe {
             let p = self.base as *const u64;
             BusRead64::ok((*p.add(self.off(addr) >> 3)).rotate_left(32))
@@ -457,7 +483,7 @@ impl BusDevice for PpMemory {
     }
 
     #[inline(always)]
-    fn write64(&self, addr: u32, val: u64) -> u32 {
+    fn write64(&self, addr: u64, val: u64) -> u32 {
         unsafe {
             let p = self.base as *mut u64;
             *p.add(self.off(addr) >> 3) = val.rotate_left(32);
@@ -468,7 +494,7 @@ impl BusDevice for PpMemory {
     }
 
     #[inline]
-    fn mem_ptr(&self, addr: u32) -> Option<*const u64> {
+    fn mem_ptr(&self, addr: u64) -> Option<*const u64> {
         unsafe {
             let p = self.base as *const u64;
             Some(p.add(self.off(addr) >> 3))
@@ -476,7 +502,7 @@ impl BusDevice for PpMemory {
     }
 
     #[inline]
-    fn read_block(&self, addr: u32, buf: &mut [u64]) -> u32 {
+    fn read_block(&self, addr: u64, buf: &mut [u64]) -> u32 {
         unsafe {
             let p = self.base as *const u64;
             let off = self.off(addr) >> 3;
@@ -488,7 +514,7 @@ impl BusDevice for PpMemory {
     }
 
     #[inline]
-    fn write_block(&self, addr: u32, buf: &[u64]) -> u32 {
+    fn write_block(&self, addr: u64, buf: &[u64]) -> u32 {
         unsafe {
             let p = self.base as *mut u64;
             let off = self.off(addr) >> 3;
@@ -501,7 +527,7 @@ impl BusDevice for PpMemory {
         #[cfg(feature = "jitv2")]
         {
             let start = self.off(addr) / JITV2_PAGE_SIZE;
-            let last = addr.wrapping_add(((buf.len().max(1) - 1) as u32) * 8);
+            let last = addr.wrapping_add((buf.len().max(1) - 1) as u64 * 8);
             let end = self.off(last) / JITV2_PAGE_SIZE;
             let bump = |page: usize| unsafe {
                 (*self.gen_base.add(page)).fetch_add(1, Ordering::Relaxed);
@@ -524,7 +550,7 @@ impl BusDevice for PpMemory {
     }
 
     #[inline(always)]
-    fn write64_masked(&self, addr: u32, val: u64, mask: u64) -> u32 {
+    fn write64_masked(&self, addr: u64, val: u64, mask: u64) -> u32 {
         unsafe {
             let p = (self.base as *mut u64).add(self.off(addr) >> 3);
             // Storage keeps qwords rotate_left(32); rotate val/mask to match.
@@ -540,7 +566,7 @@ impl BusDevice for PpMemory {
 
     #[cfg(feature = "jitv2")]
     #[inline]
-    fn gen_ptr(&self, addr: u32) -> *const AtomicU64 {
+    fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
         PpMemory::gen_ptr(self, addr)
     }
 }
@@ -548,34 +574,34 @@ impl BusDevice for PpMemory {
 // Mirrors `impl BusDevice for Arc<Memory>` so Arc-wrapped banks work directly.
 impl BusDevice for Arc<PpMemory> {
     #[inline(always)]
-    fn read8(&self, addr: u32) -> BusRead8 { (**self).read8(addr) }
+    fn read8(&self, addr: u64) -> BusRead8 { (**self).read8(addr) }
     #[inline(always)]
-    fn write8(&self, addr: u32, val: u8) -> u32 { (**self).write8(addr, val) }
+    fn write8(&self, addr: u64, val: u8) -> u32 { (**self).write8(addr, val) }
     #[inline(always)]
-    fn read16(&self, addr: u32) -> BusRead16 { (**self).read16(addr) }
+    fn read16(&self, addr: u64) -> BusRead16 { (**self).read16(addr) }
     #[inline(always)]
-    fn write16(&self, addr: u32, val: u16) -> u32 { (**self).write16(addr, val) }
+    fn write16(&self, addr: u64, val: u16) -> u32 { (**self).write16(addr, val) }
     #[inline(always)]
-    fn read32(&self, addr: u32) -> BusRead32 { (**self).read32(addr) }
+    fn read32(&self, addr: u64) -> BusRead32 { (**self).read32(addr) }
     #[inline(always)]
-    fn write32(&self, addr: u32, val: u32) -> u32 { (**self).write32(addr, val) }
+    fn write32(&self, addr: u64, val: u32) -> u32 { (**self).write32(addr, val) }
     #[inline(always)]
-    fn read64(&self, addr: u32) -> BusRead64 { (**self).read64(addr) }
+    fn read64(&self, addr: u64) -> BusRead64 { (**self).read64(addr) }
     #[inline(always)]
-    fn write64(&self, addr: u32, val: u64) -> u32 { (**self).write64(addr, val) }
+    fn write64(&self, addr: u64, val: u64) -> u32 { (**self).write64(addr, val) }
     #[inline(always)]
-    fn write64_masked(&self, addr: u32, val: u64, mask: u64) -> u32 {
+    fn write64_masked(&self, addr: u64, val: u64, mask: u64) -> u32 {
         (**self).write64_masked(addr, val, mask)
     }
     #[inline]
-    fn mem_ptr(&self, addr: u32) -> Option<*const u64> { (**self).mem_ptr(addr) }
+    fn mem_ptr(&self, addr: u64) -> Option<*const u64> { (**self).mem_ptr(addr) }
     #[inline]
-    fn read_block(&self, addr: u32, buf: &mut [u64]) -> u32 { (**self).read_block(addr, buf) }
+    fn read_block(&self, addr: u64, buf: &mut [u64]) -> u32 { (**self).read_block(addr, buf) }
     #[inline]
-    fn write_block(&self, addr: u32, buf: &[u64]) -> u32 { (**self).write_block(addr, buf) }
+    fn write_block(&self, addr: u64, buf: &[u64]) -> u32 { (**self).write_block(addr, buf) }
     #[cfg(feature = "jitv2")]
     #[inline]
-    fn gen_ptr(&self, addr: u32) -> *const AtomicU64 { (**self).gen_ptr(addr) }
+    fn gen_ptr(&self, addr: u64) -> *const AtomicU64 { (**self).gen_ptr(addr) }
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +737,34 @@ impl PpMemSpace {
 
     pub fn bank_count(&self) -> usize {
         self.banks.len()
+    }
+
+    /// Map `size` bytes of `bank`, from object offset `src`, at window
+    /// `offset`, without repeating, with the generation counters in lockstep.
+    /// The O2 maps its memory this way: one 32 MB slot of the window at a
+    /// time from wherever the slot's bank lies in one packed object.
+    pub fn map_range(&self, bank: usize, src: u64, offset: u64, size: u64) -> io::Result<()> {
+        let b = &self.banks[bank];
+        assert!(src + size <= b.len() as u64, "ppmem: range [{src:#x}, +{size:#x}) escapes bank {bank}");
+        assert!(offset + size <= WINDOW_SIZE, "ppmem: [{offset:#x}, +{size:#x}) escapes the 4GB window");
+        unsafe {
+            self.space.map(offset as usize, size as usize, b, src, Prot::ReadWrite)?;
+        }
+        #[cfg(feature = "jitv2")]
+        {
+            let (gen_off, gen_len, gen_src) = (offset / GEN_RATIO, size / GEN_RATIO, src / GEN_RATIO);
+            let gran = super::map::granularity() as u64;
+            if gen_len >= gran && gen_off % gran == 0 && gen_len % gran == 0 && gen_src % gran == 0 {
+                unsafe {
+                    self.gen_space.map(gen_off as usize, gen_len as usize, &self.gen_banks[bank], gen_src, Prot::ReadWrite)?;
+                }
+            } else {
+                debug_assert!(false, "ppmem: range gen [{gen_off:#x}, +{gen_len:#x}) not mappable at granularity {gran:#x}");
+            }
+        }
+        let st = unsafe { &mut *self.state.get() };
+        Self::record(st, offset, size);
+        Ok(())
     }
 
     /// Recompute the 64MB-granularity bitmap from the live mapping list.
@@ -952,6 +1006,18 @@ mod tests {
 
     const MB: usize = 1024 * 1024;
 
+    /// Above 4GB the region index is 64 or more; a raw `1 << region` would
+    /// wrap onto region 0 in release and panic in debug.
+    #[test]
+    fn bitmap_maps_is_false_above_the_window() {
+        let all = u64::MAX;
+        assert!(bitmap_maps(all, 0));
+        assert!(bitmap_maps(all, WINDOW_SIZE - 1));
+        assert!(!bitmap_maps(all, WINDOW_SIZE));
+        assert!(!bitmap_maps(all, 0xFF_FFFF_FFFF));
+        assert!(!bitmap_maps(1, WINDOW_SIZE), "region 64 must not alias region 0");
+    }
+
     /// Every `BusDevice` access width must produce byte-identical results to
     /// `Memory`. This is the substitutability contract — if this passes,
     /// `PpMemory` can stand in for `Memory` anywhere.
@@ -964,7 +1030,7 @@ mod tests {
         // Interleave every width, including unaligned-in-word sub-accesses and
         // the byte/halfword XOR-swizzle paths.
         for i in 0..512u32 {
-            let addr = i * 8;
+            let addr = i as u64 * 8;
             a.write64(addr, 0x0123_4567_89AB_CDEF ^ (i as u64));
             b.write64(addr, 0x0123_4567_89AB_CDEF ^ (i as u64));
             a.write32(addr + 4, 0xDEAD_0000 | i);
@@ -975,7 +1041,7 @@ mod tests {
             b.write8(addr + 1, i as u8);
         }
         for i in 0..512u32 {
-            let addr = i * 8;
+            let addr = i as u64 * 8;
             assert_eq!(a.read64(addr).data, b.read64(addr).data, "read64 @{addr:#x}");
             assert_eq!(a.read32(addr).data, b.read32(addr).data, "read32 @{addr:#x}");
             assert_eq!(a.read32(addr + 4).data, b.read32(addr + 4).data);
@@ -987,7 +1053,7 @@ mod tests {
                     addr + k
                 );
             }
-            for k in [0u32, 2, 4, 6] {
+            for k in [0u64, 2, 4, 6] {
                 assert_eq!(
                     a.read16(addr + k).data,
                     b.read16(addr + k).data,
@@ -1034,15 +1100,15 @@ mod tests {
     fn snapshot_restore_roundtrip() {
         let m = PpMemory::new(8);
         for i in 0..32u32 {
-            m.write32(i * 4, 0xDEAD_0000 + i);
+            m.write32(i as u64 * 4, 0xDEAD_0000 + i);
         }
         let snap = m.snapshot_words();
         for i in 0..32u32 {
-            m.write32(i * 4, 0xCAFEBABE);
+            m.write32(i as u64 * 4, 0xCAFEBABE);
         }
         m.restore_words(&snap);
         for i in 0..32u32 {
-            assert_eq!(m.read32(i * 4).data, 0xDEAD_0000 + i, "word {i}");
+            assert_eq!(m.read32(i as u64 * 4).data, 0xDEAD_0000 + i, "word {i}");
         }
     }
 
@@ -1064,14 +1130,14 @@ mod tests {
 
         let a = PpMemory::new(8);
         for i in 0..64u32 {
-            a.write32(i * 4, 0x1234_0000 + i);
+            a.write32(i as u64 * 4, 0x1234_0000 + i);
         }
         a.save_bin(&path).unwrap();
 
         let b = PpMemory::new(8);
         b.load_bin(&path).unwrap();
         for i in 0..64u32 {
-            assert_eq!(b.read32(i * 4).data, 0x1234_0000 + i, "word {i}");
+            assert_eq!(b.read32(i as u64 * 4).data, 0x1234_0000 + i, "word {i}");
         }
         // Format must be interchangeable with Memory's.
         let c = crate::dev::mem::Memory::new(8);
@@ -1404,11 +1470,11 @@ mod tests {
     fn write_bumps_only_the_touched_page_gen() {
         let m = PpMemory::new(8);
         let g0 = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
-        let g1 = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u32)).load(Ordering::Relaxed) };
+        let g1 = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) };
         m.write32(0, 0x1234);
         assert_eq!(unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) }, g0 + 1);
         assert_eq!(
-            unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u32)).load(Ordering::Relaxed) },
+            unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) },
             g1,
             "untouched page must not bump"
         );
@@ -1427,13 +1493,13 @@ mod tests {
     #[test]
     fn write_block_bumps_every_page_it_spans() {
         let m = PpMemory::new(8);
-        let start = (JITV2_PAGE_SIZE - 8) as u32;
+        let start = (JITV2_PAGE_SIZE - 8) as u64;
         let g0 = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
-        let g1 = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u32)).load(Ordering::Relaxed) };
+        let g1 = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) };
         m.write_block(start, &[0u64, 0u64]);
         assert_eq!(unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) }, g0 + 1);
         assert_eq!(
-            unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u32)).load(Ordering::Relaxed) },
+            unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) },
             g1 + 1
         );
     }

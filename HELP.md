@@ -1,7 +1,7 @@
 # IRIS — SGI Indy and Indigo2 emulator
 
 The complete core/GUI feature and configuration inventory is in
-[FEATURES.md](FEATURES.md). This guide explains everyday use and monitor commands.
+[FEATURES.md](FEATURES.md). This guide explains everyday use; the monitor's full command reference is in [debug.md](debug.md).
 
 ## Quick start
 
@@ -11,7 +11,7 @@ scsi1.raw        # Hard disk image (raw or .chd)
 cargo run --release
 ```
 
-No disk image yet? [rules/irix/irix-install.md](rules/irix/irix-install.md)
+No disk image yet? [clanker/irix/irix-install.md](clanker/irix/irix-install.md)
 walks through installing IRIX 5.3 or 6.5.22 from the original CDs. Prefer
 windows and menus? `cargo run -p iris-gui --release` (see
 [iris-gui-README.md](iris-gui-README.md)).
@@ -48,7 +48,10 @@ The status bar **Hz** value counts the guest kernel's fast clock: CP0 Compare
 (IP7) matches, or IOC 8254 timer 1 interrupts, depending on the kernel's timer
 source. IRIX on Indigo2 and IP28 keeps time with the 8254: timer 0 is the
 100 Hz system clock and timer 1 the 1000 Hz fast clock (parked when nothing
-needs it), so the figure reads 1000 while the fast clock runs.
+needs it), so the figure reads 1000 while the fast clock runs. IRIX on the
+Octane runs both clocks on CP0 Compare, which fires for whichever is due
+next, so there the figure reads about 1100: every Compare match is one
+interrupt, and the two clocks cannot be told apart from outside the guest.
 
 For a repeatable speed number, use the benchmark: `iris-bench run`, or the
 Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).
@@ -59,8 +62,12 @@ Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).
 
 On IP22/IP24, each bank is at most 128 MB. IP28 also supports 256 MB and
 512 MB banks. For 1 GB on IP28, use `[512, 512, 0, 0]`; see
-[IP28 512 MB banks](rules/irix/ip28-512mb-banks.md). The table below describes
+[IP28 512 MB banks](clanker/devices/ip28-512mb-banks.md). The table below describes
 the IP22/IP24 extended layouts.
+
+`banks` has room for eight entries; every machine today uses four, and the
+rest must be 0. On the O2 each entry is the kit in a DIMM pair (32, 64, 128 or
+256 MB), largest first: `[256, 256, 256, 256]` is 1 GB.
 
 `banks` in `iris.toml` / iris-gui is applied only when you **Start** the VM.
 Changing RAM while IRIX is running updates the config but not the live guest —
@@ -74,7 +81,7 @@ Changing RAM while IRIX is running updates the config but not the live guest —
 
 If extended himem banks are configured but IRIX still reports 256 MB, check
 monitor `mc regs` for MEMCFG on banks 2–3. IRIS synthesizes himem MEMCFG when
-the PROM skips them (see `rules/irix/extended-ram-memcfg.md`).
+the PROM skips them (see `clanker/devices/extended-ram-memcfg.md`).
 
 ---
 
@@ -191,6 +198,55 @@ the PROM can boot from it:
 To reach the Command Monitor on a machine that autoboots, press Esc while
 the PROM says "Starting up the system" (from the monitor console:
 `ps2 esc`). `test/tftp/` has a guest-side client and a test script.
+
+To see what the PROM or a client actually does, start iris with
+`IRIS_TFTP_TRACE=1`. It writes to stderr, in any build: what BOOTP was asked to
+boot, each read request and whether the file was found, and how each transfer
+ended (bytes, blocks, retransmits, duplicate ACKs, the slowest ACK, total
+time), plus any ACK slower than 500 ms as it happens. A read request sent to
+the host's port 69 instead (no `tftp_dir`, or a server address other than the
+gateway) is reported too, so silence means no request arrived at all.
+
+### rsh (files from the host)
+
+`rsh_dir = "DIR"` under `[network]` (or `--rsh-dir DIR`) starts a small rsh
+server at the gateway (`192.168.0.1`, TCP 514). It is not a shell and runs
+nothing on the host: it understands a few built-in commands, read-only, on DIR. `dd` is the one
+IRIX's `inst` uses to read a remote distribution (it restarts it with `iseek`
+after a long forward seek); its "records in/out" report goes only to the stderr
+connection, never into the data.
+
+```
+rsh 192.168.0.1 ls /            # one name per line; -a, -l (type, mode, size)
+rsh 192.168.0.1 cat /dist/file  # any number of files, streamed
+rsh 192.168.0.1 dd if=/dist/file bs=10k iseek=3 count=2   # bs/ibs, count, iseek|skip; b k w suffixes
+rsh 192.168.0.1 echo hello
+rsh 192.168.0.1 pwd             # always /
+```
+
+Names are relative to DIR even when they start with `/`, and nothing outside
+DIR (`..`, symlinks out) is reachable, as with TFTP. Pipes, redirects,
+wildcards and `$` are refused rather than guessed at, and an unknown command
+says `Command not found.` The rsh protocol has no exit status, so a failing
+command shows only in its error text. There is no login check (the user names
+are logged, not tested): like TFTP and NFS here, the service exists only on the
+guest side of the NAT.
+
+IRIX's `rsh` asks for a second connection for stderr; the gateway opens it back
+to the guest from a reserved port, which `rcmd` insists on. With `rsh_dir` set,
+guest connections to gateway port 514 are answered here instead of being
+relayed to a host `rshd`. NAT mode only.
+
+To see what a client (IRIX `inst`, say) asks for, start iris with
+`IRIS_RSH_TRACE=1`. Each request is written to stderr when it arrives and again
+when it ends, with the bytes moved, the time taken, and whether it completed,
+was cut short by the guest, or never sent a whole request. This works in any
+build; the `net debug` logging needs a `developer` build.
+At startup iris prints `iris: rsh server ... serving DIR` when `rsh_dir` is on.
+Every guest connection to port 514 is also reported with where it went, so a
+trace with no requests means the guest never reached the built-in server (the
+`rsh_dir` is unset, or `inst` is pointed at an address other than the gateway). Run `rsh -n` if the command should not
+read the terminal.
 
 ### NAT
 
@@ -438,6 +494,55 @@ standalone `iris` window if you need them.
 
 The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used. `lock_aspect_ratio = false` in `iris.toml` allows free resizing with letterboxing. When the guest changes video mode (PROM, then IRIX during boot) the window snaps to the new resolution times the configured `scale` / `--2x`.
 
+## VNC
+
+iris has a built-in VNC server. Any VNC viewer (TigerVNC, RealVNC, Remmina,
+noVNC, macOS Screen Sharing) then shows the guest's screen and types and
+clicks into it:
+
+```sh
+iris --vnc                    # 127.0.0.1:5900
+iris --ci --vnc               # no window at all: VNC is the screen
+iris --vnc 0.0.0.0:5901       # reachable from other machines (no password!)
+vncviewer localhost:5900
+```
+
+or in `iris.toml`:
+
+```toml
+[vnc]
+listen  = "127.0.0.1:5900"   # absent: no VNC server
+max_fps = 30                 # most updates a second per viewer
+```
+
+It works on every machine and graphics board (Newport, XZ/Extreme, IMPACT,
+the O2), with the normal window open or under `--ci` with no window. Not with
+`--headless`, which has no screen to serve. The window, the monitor and any
+number of viewers can type and click at the same time. iris-gui has no VNC
+server.
+
+What you see is the guest's screen, without the window's status bar. Only
+the parts of the screen that change are sent, so an idle desktop costs next
+to nothing. With Newport, the window uses the software compositor while a
+viewer is connected (`disp compositor gl` is refused) and switches back when
+the last one leaves.
+
+**The mouse.** The guest's mouse sends movements, not positions, and IRIX
+accelerates fast ones. iris steers the guest pointer onto the spot you point
+at by watching where the board draws the cursor, so a click lands where you
+clicked. The first time you point, the guest pointer jumps to the top-left
+corner and back: that teaches iris where the tip of the cursor is. The
+viewer's own cursor (a dot or an arrow) runs a little ahead of the guest's;
+it catches up within a fraction of a second.
+
+**The keyboard.** Viewers that send key positions (TigerVNC, noVNC, QEMU's
+extension) work with any host layout. Others send characters, which iris
+types on a US layout.
+
+**Security.** There is no password. Leave the server on `127.0.0.1` and use
+an SSH tunnel (`ssh -L 5900:localhost:5900 host`) to reach it from
+elsewhere.
+
 ---
 
 ## Configuration file (`iris.toml`)
@@ -451,15 +556,16 @@ ignored. The checked-in `iris.toml` is a commented example of everything in this
 ```toml
 # ── Top-level scalars (must come before any [section]) ───────────────────────
 
-prom     = "prom.bin"       # PROM image; the embedded one is used if missing
-nvram    = "nvram.bin"      # DS1386 NVRAM/RTC file (Indy). Use one per install.
+prom     = "prom.bin"       # PROM image; the embedded one is used if missing (the O2 has none: its 4.18 image)
+nvram    = "nvram.bin"      # DS1386 NVRAM/RTC file (Indy); the PROM's flash (O2). Use one per install.
 nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 
 # RAM bank sizes in MB: 0 (absent), 8, 16, 32, 64, 128; IP28 also 256/512.
+# O2: the kit in each DIMM pair (32/64/128/256), largest first. Up to eight entries.
 banks = [128, 128, 0, 0]
 
 scale = 1                   # window scale, kept across guest mode changes; --2x overrides
-headless = false            # no window, no REX3 (audio unaffected)
+headless = false            # no window, no graphics; the O2 boots on its serial console (audio unaffected)
 no_audio = false            # no HAL2 / cpal (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing
 mouse_scroll_pixels_per_line = 40
@@ -486,11 +592,11 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # ── Machine ──────────────────────────────────────────────────────────────────
 
 [machine]
-profile = "indy_ip24"       # "indigo2_ip22" (--ip22) or "indigo2_ip28"
+profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md)
 cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
 
 [graphics]
-board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max")
+board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact) or "none"
 heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
@@ -504,12 +610,15 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
 # ── SCSI ─────────────────────────────────────────────────────────────────────
 
-# Valid IDs: 1–7. For a hard disk, set cdrom = false.
+# Valid IDs: 1–7. For a hard disk, set cdrom = false. On a machine with two
+# controllers (Indigo2, O2) [scsi.N] is id N on controller 0 and [scsi.16+N]
+# is id N on controller 1, so one id can be used on both; `controller = 1`
+# in a [scsi.N] table does the same for that one device.
 [scsi.1]
 path    = "scsi1.raw"       # raw or .chd image
 cdrom   = false
 overlay = false             # true = copy-on-write overlay in scsi1.raw.overlay
-# controller = 0            # Indigo2 only: 0 or 1
+# controller = 0            # Indigo2 and O2 have two: 0 or 1 (the O2's 1 is its external bus); or write [scsi.17]
 
 # A CD-ROM. path may be empty to start with an empty tray.
 [scsi.4]
@@ -538,6 +647,7 @@ mode = "nat"                # or "pcap" (--features pcap)
 # nfs_pcap_ip = "192.168.1.250"   # PCAP only: LAN IP the NFS server answers on
 # mac = "08:00:69:12:34:56" # ec0 MAC, injected into blank NVRAM before boot
 # tftp_dir = "tftpboot"     # serve read-only over TFTP at the gateway
+# rsh_dir = "shared"        # `rsh <gateway> cat|ls|echo|pwd` on this dir, read-only
 
 # [nfs]
 # shared_dir = "./shared"
@@ -600,7 +710,11 @@ kernel step on each other's block size setting.
 | 6  | Additional disk or tape |
 | 7  | Additional disk |
 
-The controller itself is ID 0.
+The controller itself is ID 0. On the Indigo2 and the O2, which have two
+controllers, `[scsi.N]` keys 1–7 are ids on controller 0 and keys 17–23 are
+ids 1–7 on controller 1 (16 slots per controller); `controller = 1` in a low
+key's table is the older spelling and still works. The monitor's `scsi1`
+addresses the second controller.
 
 ---
 
@@ -642,13 +756,16 @@ Networking
   --list-net-interfaces       Print bridgeable interfaces and exit
   --nfs-dir <DIR>             Export DIR over the in-process NFS server
   --tftp-dir <DIR>            Serve DIR read-only over TFTP at the gateway
+  --rsh-dir <DIR>             Built-in read-only rsh server on DIR at the gateway (cat, ls, echo, pwd)
 
 Automation and debugging
   --ci                        Enable the CI socket; hide the window unless --ci-display
   --ci-socket <PATH>          Socket path (default /tmp/iris.sock)
   --ci-display                With --ci, keep the window
   --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
+  --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
   --monitor-port <PORT>       Monitor TCP port (default 8888)
+  --vnc [ADDR]                VNC server on ADDR (host:port or port; default 127.0.0.1:5900)
   --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
   --serial-port-b <PORT>      Serial channel B TCP port (default 8881)
   --gdb-port <PORT>           Start the GDB stub
@@ -693,263 +810,32 @@ iris --tftp-dir ./tftpboot
 
 ## Monitor console
 
-Connect on **localhost:8888** with any TCP client:
+The monitor is IRIS's built-in debugger and control console. It runs in the
+terminal iris was started from and on **127.0.0.1:8888** (`monitor_port`,
+`--monitor-port`):
 
 ```
 telnet 127.0.0.1 8888
 nc 127.0.0.1 8888
 ```
 
-`help` lists every command the running machine registered, with a one-line
-usage string. The following tables list the same set, grouped.
-
-> **`[DEV]`** marks commands or features that require a developer build
-> (`cargo build --features developer`, optionally with `--profile developer`).
-> Selecting the profile alone does not enable developer instrumentation.
-> The command is accepted in all builds but produces no output / has no effect
-> without the feature enabled.
->
-> Developer builds also start with the **CPU paused** at the monitor prompt,
-> and show extended performance counters in the status bar
-> (D:% decode rate, I$:% L1I hit rate, UC:% uncached fetches, cs: step count).
-
-### Machine
+`help` lists every command the running build registered. Commands you are
+likely to need while just using IRIS:
 
 | Command | Description |
 |---------|-------------|
-| `machine-start` / `machine-stop` | Start / stop the CPU and all peripherals |
+| `start` / `stop` / `status` | Start, pause, or query the CPU |
 | `reset` | Reset all hardware to power-on state |
 | `save <name>` / `load <name>` | Save / load a snapshot under `saves/<name>/` |
-| `locks` | Show the state of all registered locks |
-| `perf snapshot` | Performance counters snapshot |
-| `testdev` | Bare-metal test device status |
+| `rtc save` / `nveeprom save` | Write the Indy NVRAM / Indigo2 EEPROM to disk now |
+| `scsi status` / `scsi eject <id>` / `scsi add <id> <path>` | Show disks and CD queues, change CDs |
+| `ps2 type <text>` / `ps2 enter` / `ps2 esc` | Type on the guest keyboard (Esc stops PROM autoboot) |
+| `net status` | NAT connections |
+| `mc regs` | Memory configuration, including MEMCFG |
 
-### CPU / execution
-
-Every command works the same way against a running CPU: `start`, `stop`,
-`status`, `wait` and `help` never touch the core; run control (`run`, `step`,
-`next`, `finish`) needs a stopped CPU and says so; everything else pauses a
-running CPU for the duration of the command and resumes it afterwards. So
-`bp add`, `regs`, `mem` and friends work at any time and never hang.
-
-| Command | Description |
-|---------|-------------|
-| `start` | Start CPU execution |
-| `stop` | Stop (pause) CPU execution |
-| `status` | Running or stopped, the PC, why it last stopped (which breakpoint, its condition and hit count), and the CP0 Count rate. Never blocks |
-| `wait [ms]` | Block until the CPU stops (breakpoint, exception catch) or `ms` pass (default 10000), then say where and why |
-| `run [addr]` / `c` / `cont` | Run until breakpoint or exception (or until `addr`) |
-| `step [n\|addr]` / `s` | Step n instructions (default 1), or until `addr` |
-| `si` | Step without taking interrupts **[DEV]** |
-| `next [n]` / `n` | Step over function calls |
-| `finish` / `fin` | Run until function return (`jr ra`) |
-| `regs` / `r` | Dump general-purpose registers |
-| `cop0` | Dump CP0 (system) registers |
-| `cop1` | Dump CP1 (FPU) registers |
-| `jump <addr>` | Set PC |
-| `setreg <reg> <val>` | Set a register value |
-| `ip7` | Make the CP0 Compare (IP7) interrupt pending, for stepping through timer delivery |
-| `debug <on\|off\|file <path>>` | Per-instruction trace **[DEV]** |
-| `trace start <path>` / `trace stop` / `trace status` | Record a per-instruction execution trace **[DEV]** |
-| `exception <class\|code\|all> <on\|off>` / `ex` | Break on exceptions. Classes: `int tlb addr bus sys ri arith watch vce` |
-| `idleprof <on\|off\|report [n]>` | Find idle/spin loops by PC sampling (`--features idle-pause`) |
-| `instrstats [report\|clear\|dump]` | Per-instruction counters (`--features instr_stats`) **[DEV]** |
-| `jitcheck <n> [skip]` | Run n instructions interpreter-only vs JIT and stop at the first divergence **[DEV]** |
-
-### Memory and loading
-
-| Command | Description |
-|---------|-------------|
-| `mem <addr> [n] [b\|h\|w\|d]` / `m` | Dump virtual memory in bytes, halves, words (default) or doublewords |
-| `mw <addr> <val> [b\|h\|w\|d]` | Write virtual memory |
-| `stack [addr] [n]` | Dump stack |
-| `ms <addr> [max]` | Read string from virtual memory |
-| `dis [addr] [n]` / `d` | Disassemble |
-| `translate <addr>` / `t` | Translate virtual → physical address |
-| `loadelf <file>` | Load a static ELF32 MSB binary and set PC to its entry |
-| `loadbin <file> <addr>` | Load raw bytes at a virtual address |
-
-### Symbols and IRIX introspection
-
-| Command | Description |
-|---------|-------------|
-| `sym <addr>` | Look up nearest symbol |
-| `sym <name>` | Every copy of a name, with the map file it came from |
-| `loadsym <file>` | Load symbol map from file |
-| `proc info` | IRIX kernel utsname and friends (needs `loadsym` first) |
-| `eframe <addr> [o32\|64]` / `ef` | Decode an IRIX exception frame (the `ep` of a panic): registers, cause, sr, EPC, then a backtrace of the interrupted context |
-| `putbuf [size]` / `dmesg` | The IRIX kernel console log, i.e. what a panic printed (needs the kernel's map) |
-
-A name defined in more than one loaded map (the PROM and the kernel both have
-`bcopy`) is ambiguous in expressions: the error lists the copies, and
-`bcopy:1` picks one. Internal lookups (`proc`, `putbuf`) use the copy from the
-map loaded last.
-
-### Breakpoints
-
-| Command | Description |
-|---------|-------------|
-| `bp add <addr> [type] [if <expr>]` / `b` | Add breakpoint. Types: `pc` (default), `r`, `w`, `f` (virtual read/write/fetch), `pr`, `pw`, `pf` (physical). The condition may use registers (`a0`, `c0_badvaddr`, ...) and symbols; a name that is neither is refused |
-| `bp list` / `bl` | List breakpoints with type, symbol, condition and hit count |
-| `bp del <id>` / `bb` | Delete breakpoint |
-| `bp enable <id>` / `be` | Enable breakpoint |
-| `bp disable <id>` / `bd` | Disable breakpoint |
-| `bp ignore <id> <n>` | Let the next n hits pass without stopping |
-| `bp clear` | Delete all breakpoints |
-| `bp save <file>` / `bp load <file>` | Write the breakpoints as `bp add` lines / read them back (survives a restart) |
-
-A breakpoint hit while the CPU runs freely is reported by `status` and
-`wait`, not printed (the terminal is a monitor console too).
-
-### Undo / traceback
-
-| Command | Description |
-|---------|-------------|
-| `undo [n]` / `u` | Undo n instructions **[DEV]** |
-| `undo <on\|off\|clear\|resize <n>>` | Control undo buffer **[DEV]** |
-| `bt [n]` | Print call backtrace |
-| `dt [n]` / `dt file <path> [n]` | Disassemble traceback buffer (the history holds 1,048,576 instructions; asking for more says so) |
-
-### TLB / cache
-
-| Command | Description |
-|---------|-------------|
-| `tlb dump` | Dump the TLB entries this CPU has (48 on R4400/R5000, 64 on R10000) |
-| `tlb trans <vaddr> [asid]` | Translate via TLB |
-| `tlb debug <on\|off>` | TLB trace logging **[DEV]** |
-| `l1i <check\|dump> <addr\|index>` | L1 instruction cache |
-| `l1d <check\|dump> <addr\|index>` | L1 data cache |
-| `l1d wb <vaddr> <size>` / `l1d pwb <paddr> <size>` | Write L1D contents back to RAM (virtual / physical range) |
-| `l2 <check\|dump> <addr\|index>` | L2 unified cache (R4400) |
-| `ll` / `ll stats` / `ll clear` | LL/SC state; the histogram needs `--features llstats` |
-
-### JIT v2 (`--features jitv2`)
-
-`j2` covers compile/dispatch toggles, per-category switches and page
-introspection. See HACKING.md §7 for the full table.
-
-### SCSI / CD-ROM / disks
-
-| Command | Description |
-|---------|-------------|
-| `scsi status` | Show attached devices, disc lists, and queue positions |
-| `scsi regs` | WD33C93A register dump |
-| `scsi eject <id>` | Cycle to next disc on CD-ROM `id` |
-| `scsi add <id> <path>` | Add disc image to queue (inserted as next after current) |
-| `scsi list <id>` | List all discs in queue with ordinal numbers |
-| `scsi del <id> <ord>` | Remove disc at ordinal `ord` from queue (does not eject active disc) |
-| `scsi next <id> <ord>` | Move disc at ordinal `ord` to next position (position 1) |
-| `scsi defer <on\|off>` | Deferred SCSI status interrupts (see `scsi_deferred_int`) |
-| `scsi dayna` | DaynaPort MAC, addresses and counters |
-| `scsi wdt [N]` / `scsi wdt file <path>` | Dump the WD33C93A transaction ring (last N / all to a file) **[DEV]** |
-| `scsi debug <on\|off>` | Per-command SCSI trace logging **[DEV]** |
-| `scsi0 …` / `scsi1 …` | Same, for controller 0 / controller 1 (Indigo2) |
-| `cow status` / `cow commit [id]` / `cow reset [id]` | Copy-on-write overlay |
-
-Queue positions: `[0]` = active (currently mounted), `[1]` = next on eject, higher = queued.
-`scsi add` verifies the file exists before inserting.
-Disc change signals IRIX via SCSI Unit Attention (sense 06/28/00 "Medium
-Changed") on the next `TEST UNIT READY` poll — no restart required.
-
-### Graphics (REX3 / Newport)
-
-| Command | Description |
-|---------|-------------|
-| `rex status` | Dump all REX3 drawing registers |
-| `rex jit <on\|off\|status\|list>` | REX3 shader JIT control (`--features rex-jit`) |
-| `rex jit <disable\|enable> <dm0> <dm1>` | Disable/enable one compiled draw mode |
-| `rex fbdump [DIR]` | Dump the framebuffers to files in DIR (default `.`) |
-| `rex debug <on\|off>` | REX3 register trace **[DEV]** |
-| `rex buslog <on\|off>` | Log all GIO bus accesses to `rex3.log` **[DEV]** |
-| `rex cmap <on\|off>` | CMAP access trace |
-| `vc2 status` | Dump VC2 (video timing) state |
-| `vc2 ramdump` | Dump VC2 RAM |
-| `vc2 debug <on\|off>` | VC2 trace **[DEV]** |
-| `xmap status` | Dump XMAP9 state |
-| `xmap debug <on\|off>` | XMAP9 trace **[DEV]** |
-| `cmap status` | Dump CMAP state |
-| `cmap debug <on\|off>` | CMAP trace **[DEV]** |
-| `dcb debug <on\|off>` | DCB (display control bus) trace **[DEV]** |
-| `block debug <on\|off>` | Block/span draw logging to `block.log` **[DEV]** |
-| `draw debug <on\|off>` | Draw debug overlay on framebuffer **[DEV]** |
-| `disp status` / `disp debug <on\|off>` | Display timing / framebuffer state |
-| `disp compositor <gl\|sw>` | Switch between the GL and software compositor |
-| `bt445 status` | BT445 RAMDAC state |
-| `bt445 identity` | Reset RAMDAC palette to linear identity ramp |
-| `bt445 debug <on\|off>` | BT445 trace **[DEV]** |
-| `gr2 [status]` / `gr2 trace <file> [hq,re3,cpu\|all]` | GR2 XZ/Extreme state and command trace (trace: `gputrace` builds) |
-| `gr2 fbdump [DIR]` | GR2 framebuffer dump, including composed screen |
-| `re3 ...` | GR2 raster register inspection (see monitor `help`) |
-| `mgras [status]` | IMPACT state and inventory summary |
-| `mgras trace <file> [hq,rss,cpu,tex\|all]` | IMPACT command / raster / CPU / texture trace (`gputrace` builds) |
-| `mgras fbdump [DIR]` / `mgras shot <path>` | IMPACT framebuffer dump / screenshot |
-| `mgras rec <file>` / `mgras rec off` | Record / stop recording board accesses |
-| `rss ...` | IMPACT raster inspection (see monitor `help`) |
-
-### Hardware devices
-
-| Command | Description |
-|---------|-------------|
-| `mc regs` | Memory Controller registers (incl. MEMCFG) |
-| `mc dma` | MC GIO DMA (VDMA) state |
-| `mc dma xlate [vaddr] [w]` | Walk the VDMA address translation (µTLB, PTE) for `vaddr` (default MEMADR) without side effects; `w` = transfer writes memory |
-| `mc vdma <on\|off>` | VDMA trace to `vdma.log` |
-| `eeprom <on\|off\|dump\|r <word>\|w <word> <val>>` | CPU/MC boot-config EEPROM (93C56) |
-| `nveeprom <on\|off\|dump\|r\|w\|save [file]>` | Indigo2 NVRAM EEPROM (93CS56: env vars + MAC) |
-| `hpc3 status` | HPC3 peripheral controller state |
-| `pdma status` | PBUS DMA channel state |
-| `pdma dump <on\|off\|hal\|scsi\|enet\|MASK>` | PDMA trace **[DEV]** |
-| `pdma chain <addr>` | Decode DMA descriptor chain at physical address |
-| `ioc status` | IOC interrupt controller state |
-| `ioc ticks` | 8254 timer service since the last call: ticks fired, acknowledged and merged, fire-to-acknowledge waits |
-| `rtc status` / `rtc dump` | Real-time clock registers (and any `[rtc_offset]`) / NVRAM dump |
-| `rtc save [file]` | Save RTC NVRAM to file |
-| `rtc r <offset>` / `rtc w <offset> <val>` | Read / write NVRAM bytes |
-| `rtc debug <on\|off>` | RTC trace **[DEV]** |
-| `pit status` | PIT 8254 timer state |
-| `pit debug <on\|off>` | PIT trace **[DEV]** |
-| `hal2 status` | HAL2 audio controller state |
-| `ps2 status` | PS/2 controller state |
-| `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (stops PROM autoboot) on the guest keyboard |
-| `ps2 mouse <dx> <dy> [buttons]` | Inject relative mouse motion and optional button mask |
-| `ps2 debug <on\|off>` | PS/2 keyboard/mouse trace |
-| `serial status` | SCC channel A/B registers and FIFO state |
-| `vino status` | VINO video-in registers, channel state, descriptor cache |
-| `vino debug <on\|off>` | VINO register/I2C trace |
-
-### Networking
-
-| Command | Description |
-|---------|-------------|
-| `seeq status` | SEEQ 8003 Ethernet MAC state |
-| `net status [tcp\|udp\|icmp\|all]` | NAT connection table |
-| `net interfaces` | Host interfaces available for PCAP |
-| `net debug <tcp\|udp\|icmp> <on\|off>` | Per-packet trace **[DEV]** |
-
-### Physical bus / memory
-
-| Command | Description |
-|---------|-------------|
-| `phys mem <addr> [n]` / `mm` | Physical memory dump |
-| `phys dis <addr> [n]` / `md` | Physical memory disassemble |
-| `phys trace` / `trace <on\|off>` | Bus access trace |
-| `phys error <on\|off>` | Break on bus errors |
-| `phys hole <on\|off>` | Break on unmapped access |
-| `phys bench` / `bench` | Memory bandwidth benchmark |
-
-### Logging
-
-All `log` commands require a developer build to produce output. **[DEV]**
-
-| Command | Description |
-|---------|-------------|
-| `log status` | Show per-module log state |
-| `log <module\|all> <on\|off>` | Enable/disable module logging |
-| `log <module> mask <cat\|hex>` | Set log category mask |
-| `log <module> file <path\|off>` | Redirect module log to file |
-
-`log status` lists the modules. PDMA mask categories: `hal enet scsi on/all off/none <hex>`.
-MIPS mask categories: `insn tlb mem on/all off/none <hex>`.
+The complete command reference (execution control, breakpoints, memory, TLB
+and caches, JIT, graphics, devices, logging), the GDB stub and the MCP server
+are documented in [debug.md](debug.md).
 
 ---
 
@@ -1028,6 +914,6 @@ and HTTP `push`/`pull`; iris-gui has Save/Restore under the Machine menu. The
 on-disk format is schema version 3 — a `snapshot.toml` manifest, postcard-encoded
 device state, and RAM stored as content-addressed chunks under `saves/.cas/`.
 A snapshot refuses to load onto a different CPU model or host architecture. See
-[snapshot coverage](STORAGE.md#snapshots-and-rollback) and `rules/snapshot/`.
+[snapshot coverage](STORAGE.md#snapshots-and-rollback) and `clanker/snapshot/`.
 GR2 currently omits VRAM/full drawing state; IMPACT saves no board state yet.
-See [TODO.md](TODO.md) for device/checkpoint completion work.
+See [TODO.md](clanker/TODO.md) for device/checkpoint completion work.

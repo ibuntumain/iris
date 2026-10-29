@@ -188,14 +188,14 @@ pub(super) fn live_gr2(variant: Gr2Variant) -> crate::test_board::TestBoard<Gr2>
 
 /// Store, retrying on bus back-pressure like the CPU does.
 pub(super) fn w32(g: &Gr2, off: u32, val: u32) {
-    while g.write32(GR2_BASE + off, val) == BUS_BUSY {
+    while g.write32(GR2_BASE + off as u64, val) == BUS_BUSY {
         std::hint::spin_loop();
     }
 }
 
 pub(super) fn r32(g: &Gr2, off: u32) -> u32 {
     loop {
-        let r = g.read32(GR2_BASE + off);
+        let r = g.read32(GR2_BASE + off as u64);
         if r.status != BUS_BUSY {
             return r.data;
         }

@@ -425,15 +425,15 @@ impl Device for Ds1x86 {
  so it will have to do it themselves.
 */
 impl BusDevice for Ds1x86 {
-    fn read8(&self, addr: u32) -> BusRead8 {
-        Ds1x86::read(self, addr)
+    fn read8(&self, addr: u64) -> BusRead8 {
+        Ds1x86::read(self, addr as u32)
     }
 
-    fn write8(&self, addr: u32, val: u8) -> u32 {
-        Ds1x86::write(self, addr, val)
+    fn write8(&self, addr: u64, val: u8) -> u32 {
+        Ds1x86::write(self, addr as u32, val)
     }
 
-    fn read32(&self, addr: u32) -> BusRead32 {
+    fn read32(&self, addr: u64) -> BusRead32 {
         // RTC is byte-addressable, 32-bit reads should read 4 consecutive bytes
         // in big-endian order
         let mut word = 0u32;
@@ -445,7 +445,7 @@ impl BusDevice for Ds1x86 {
         BusRead32::ok(word)
     }
 
-    fn write32(&self, addr: u32, val: u32) -> u32 {
+    fn write32(&self, addr: u64, val: u32) -> u32 {
         // RTC is byte-addressable, 32-bit writes should write 4 consecutive bytes
         // in big-endian order
         for i in 0..4 {

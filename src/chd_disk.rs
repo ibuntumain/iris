@@ -105,6 +105,11 @@ impl ChdHd {
         self.total_bytes
     }
 
+    /// The CHD's sector size in bytes (512 for a hard-disk image).
+    pub fn sector_size(&self) -> u32 {
+        self.sector_size
+    }
+
     pub fn read_blocks(&mut self, lba: u64, count: usize, block_size: u64) -> io::Result<Vec<u8>> {
         let ss = u64::from(self.sector_size);
         if block_size != ss {
@@ -309,10 +314,16 @@ impl ChdCd {
     pub fn read_blocks(&mut self, lba: u64, count: usize, block_size: u64) -> io::Result<Vec<u8>> {
         let byte_offset = lba * block_size;
         let byte_count = (count as u64) * block_size;
-        self.reader.seek(SeekFrom::Start(byte_offset))?;
         let mut buf = vec![0u8; byte_count as usize];
-        self.reader.read_exact(&mut buf)?;
+        self.read_at(byte_offset, &mut buf)?;
         Ok(buf)
+    }
+
+    /// Read exactly `buf.len()` bytes starting at byte `offset`. The cooked
+    /// reader is a plain byte stream, so no sector alignment is required.
+    pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.read_exact(buf)
     }
 }
 

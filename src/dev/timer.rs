@@ -74,23 +74,23 @@ impl Device for Timer {
 }
 
 impl BusDevice for TimerPort {
-    fn read8(&self, _addr: u32) -> BusRead8 {
+    fn read8(&self, _addr: u64) -> BusRead8 {
         BusRead8::err()
     }
 
-    fn write8(&self, _addr: u32, _val: u8) -> u32 {
+    fn write8(&self, _addr: u64, _val: u8) -> u32 {
         BUS_ERR
     }
 
-    fn read16(&self, _addr: u32) -> BusRead16 {
+    fn read16(&self, _addr: u64) -> BusRead16 {
         BusRead16::err()
     }
 
-    fn write16(&self, _addr: u32, _val: u16) -> u32 {
+    fn write16(&self, _addr: u64, _val: u16) -> u32 {
         BUS_ERR
     }
 
-    fn read32(&self, addr: u32) -> BusRead32 {
+    fn read32(&self, addr: u64) -> BusRead32 {
         let inner = self.inner.lock();
         match addr {
             0x00 => BusRead32::ok(inner.counter),
@@ -99,7 +99,7 @@ impl BusDevice for TimerPort {
         }
     }
 
-    fn write32(&self, addr: u32, val: u32) -> u32 {
+    fn write32(&self, addr: u64, val: u32) -> u32 {
         let mut inner = self.inner.lock();
         match addr {
             0x00 => inner.counter = val,
@@ -109,7 +109,7 @@ impl BusDevice for TimerPort {
         BUS_OK
     }
 
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn read64(&self, addr: u64) -> BusRead64 {
         // Read two consecutive 32-bit words
         let r_hi = self.read32(addr);
         if !r_hi.is_ok() { return BusRead64 { status: r_hi.status, data: 0 }; }
@@ -118,7 +118,7 @@ impl BusDevice for TimerPort {
         BusRead64::ok(((r_hi.data as u64) << 32) | r_lo.data as u64)
     }
 
-    fn write64(&self, addr: u32, val: u64) -> u32 {
+    fn write64(&self, addr: u64, val: u64) -> u32 {
         let high = (val >> 32) as u32;
         let low = val as u32;
 

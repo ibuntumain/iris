@@ -13,6 +13,492 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### VNC, and screen and pointer commands
+
+- **Built-in VNC server.** `--vnc [ADDR]` or `[vnc] listen` serves the
+  guest's screen, keyboard and mouse to any VNC viewer (RFB 3.8, Raw and
+  ZRLE, desktop resizing, QEMU's key-position extension; no password, so it
+  stays on loopback by default). It serves every machine and board the same
+  way, with the window open or under `--ci` with no window. It reads the
+  frame the board composed and finds what changed by comparing frames in
+  64x64 tiles; drawing code is untouched. Standalone `iris` only. See
+  [HELP.md](HELP.md#vnc). (`src/vnc/`)
+- **Clicks land where you point.** The guest mouse is relative and X
+  accelerates it; iris now steers the guest pointer onto an absolute
+  position by reading back the board's hardware cursor (VC2, VC1, VC3, GBE),
+  learning the cursor's hotspot from the screen corner. VNC uses it, and so
+  do new monitor commands for scripts and assistants: `screen
+  info|shot|pix|wait|cursor`, `ptr move|click|drag|down|up|rel|calibrate`,
+  `key <chord>|type|names`, on every machine
+  ([debug.md](debug.md#graphics)). The MCP server wraps them as
+  `screenshot` (returns the image), `click`, `drag`, `move_pointer`,
+  `type_text`, `press_key`, `wait_screen`, `screen_info`, `screen_pixel`.
+  (`src/hostinput.rs`, `src/keysym.rs`, `clanker/iris_mcp.py`)
+- `GfxDisplay` gained `request_frame`, `set_capture`, `hw_cursor` and a
+  frame sequence number, so a consumer can follow the composed frame on any
+  board. The CI socket's `screenshot` uses it and no longer also writes a
+  `screenshot_NNNN.png` into the working directory on Newport. While a VNC
+  viewer is connected, Newport's window composes in software, and goes back
+  to GL when the last one leaves. (`src/gfx_display.rs`,
+  `src/dev/ng1/rex3.rs`, `src/ci.rs`)
+- **Empty GIO slots answer reads with a bus error** (Indy, Indigo2), as the
+  MC does once the PROM has enabled GIO time-outs. They returned all ones,
+  so the PROM's probe took an absent board for a Newport and polled its
+  status 200 000 times on every headless boot (one log line each) before
+  giving up. Headless Indy and Indigo2 now reach the IRIX serial login
+  without the flood. (`src/ip22_bus.rs`, `src/dev/mc.rs`)
+- **The O2's cursor no longer vanishes at the top and left edges.** GBE's
+  cursor position fields are 12-bit signed; they were read as unsigned, so a
+  cursor partly off the edge was drawn 4000 pixels away. (`src/dev/o2gfx.rs`)
+
+### Host efficiency on small machines
+
+- **Threads that have nothing to do now sleep in milliseconds, not
+  microseconds.** On hosts with few cores (2-core/4-thread laptops, small
+  boards) the constant wake-up rate of idle device threads was a measurable
+  tax, and it prevented deep host C-states on machines that were otherwise
+  doing nothing. The wake paths were already event-driven — these timeouts
+  were only safety nets — so lengthening them changes idle behaviour and no
+  throughput path. Idle wake-up rates: the SEEQ ethernet pump 1000/s to
+  ~20/s; the GR2, IMPACT and O2 engine threads ~500/s each to ~20/s; the O2
+  service thread 10 000/s to ~500/s; the Octane service thread 10 000/s to
+  1000/s. (`src/dev/seeq8003.rs`, `src/dev/gr2/mod.rs`, `src/dev/mgras/mod.rs`,
+  `src/dev/o2gfx.rs`, `src/ip32_machine.rs`, `src/ip30_machine.rs`)
+- The ethernet pump backs off adaptively: any frame moved, interrupt raised or
+  wake signal (a TX kick from HPC3, an RX frame from NAT) returns it to its
+  1 ms poll, so bursts and re-armed descriptor chains still drain at speed,
+  and the O2 service poll likewise stays at 100 µs whenever CRIME is
+  interrupting, i.e. whenever the machine is doing anything.
+- **The WD33C93A no longer spin-yields waiting for the DMA channel to be
+  armed.** A disk command whose DMA channel the driver had not armed yet made
+  the SCSI thread retry the channel in a tight `yield_now()` loop for up to
+  100 ms — pinning its own core and taking the channel lock on every retry,
+  the same lock the CPU thread needed to arm it. It now sleeps 100 µs between
+  attempts, which is still far below the timescales a disk command runs at.
+  (`src/dev/wd33c93a.rs`)
+
+### Idle parking
+
+- **IRIX 6.5's idle loop is recognised and parked.** With `--features
+  idle-pause`, a settled 6.5 IP22 getty now uses ~1-2 % host CPU instead of
+  ~100 %. The previous detector hashed PC and registers and required an exact
+  repeat; 6.5's idle path is a ~470-byte scheduler loop whose registers
+  evolve every iteration, so it never fired, while the same hash matched
+  short device-poll loops that must keep running. The replacement samples the
+  PC every 32 sample calls (about 320 instructions in the batch loop), groups
+  the samples into PC-space clusters, and parks when one long kernel cluster
+  dominates the ring; short countdown/device-poll loops and user-mode code
+  are never parked. Parking waits 60 s after CPU start
+  (`IRIS_IDLE_WARMUP_SECS` overrides) so boot is not slowed.
+- **New monitor commands.** `idle on|off|status` switches parking at runtime
+  and reports park/sleep/wake counters; `idleprof stats` prints the park
+  counters.
+- The `ci_clock` unit tests that materialise Count now advance it by retired
+  cycles, so `--features ci_clock,idle-pause` passes.
+
+### JIT v2
+
+- **Pages above 4 GB keep their nutlb entries.** The inline memory path's
+  window test now bounds the region number itself, so translations of
+  physical addresses past the 4 GB window are cached for the interpreter
+  like any other; compiled code still sends those accesses to the bus.
+- **FPU integer conversions are compiled inline.** `CVT.W/L.S/D`,
+  `ROUND/TRUNC/CEIL/FLOOR.W/L.S/D` and the reverse `CVT.S/D.W/L` each emitted
+  a `call_indirect` into the interpreter's own conversion helper, so a guest
+  conversion cost 17-19 ns against 3.1 ns for the already-inline `cvt.d.s`
+  widening (and 8.9 ns for `cvt.s.d`, which still calls out). The common
+  case now compiles to a rounding step, the saturation cast and one Cause
+  store: RN-even rounding for the two dynamic-rounding instructions is an
+  add/subtract of a format-sized power of two in the source's sign direction
+  (only under `FCSR.RM == 0`, which is the only case where host MXCSR is
+  known to hold nearest-even), the fixed-mode instructions keep the existing
+  mode-independent bit manipulation. NaN, infinities, out-of-range values,
+  every other rounding mode and every Invalid/Inexact trap still branch to
+  the unchanged callout, so the exception model is the interpreter's own.
+  Per compiled instruction on an R4400 with `--cache shadow`: `cvt.w.s`
+  17.5 -> 6.4 ns, `cvt.l.d` 18.5 -> 6.7, `cvt.w.d` 18.6 -> 7.0,
+  `cvt.l.s` 18.6 -> 6.1, `trunc.w.s` 17.1 -> 8.9, `cvt.s.w` 8.6 -> 5.0,
+  `cvt.d.w` 7.2 -> 4.7, `cvt.s.l` 8.2 -> 5.1, `cvt.d.l` 7.7 -> 4.9;
+  the untouched `cvt.s.d` control is unchanged at 8.7-8.9. The equivalence
+  suite pins the whole core snapshot, `fpu_fcsr` included, across the range
+  edges, all four rounding modes, both FR modes and the enable-bit/trap
+  paths. (`src/cpu/jitv2/codegen.rs`) (Motivation and the A/B kernel method:
+  ranked recommendation 5 of
+  [Jupiter Belic's irix7/iris performance study](https://github.com/irix7/iris/blob/510adc5/clanker/perf/mem-and-fpu-hot-paths.md).)
+- **FP arithmetic skips the exception model for ordinary operands.** A guest
+  `fadd.s` in a jitv2 build emitted about 106 x86 instructions for the model
+  around one `vaddss`. Two ordinary finite operands — a biased exponent that
+  is neither zero nor all ones — cannot be denormal or NaN, cannot be a
+  signalling NaN and cannot make DIV divide by zero, so the instruction
+  provably raises no flag: the two operand checks, the by-value flags and the
+  per-instruction Cause store are skipped, and Cause is still cleared
+  whenever it is set. Every special operand (zero, denormal, infinity, NaN,
+  and a negative square root) runs the previous code unchanged, out of line;
+  the interpreter is untouched. Isolated kernels on an R4400 with
+  `--cache shadow`: `fadd.s` 8.2 -> 4.3 ns/op, `fmul.s` 8.2 -> 4.4,
+  `fdiv.s` 8.5 -> 4.2, `fsqrt.d` 6.1 -> 3.5; conversion kernels, which this
+  change does not touch, are unchanged. (`src/cpu/jitv2/codegen.rs`)
+
+### CI and automation
+
+- **`iris-ci screenshot` produces the guest screen in `--ci`.** A `--ci`
+  instance installs no front-end renderer, so nothing filled the readback
+  buffer and every screenshot came out black. The command now waits for the
+  frame it requested instead of sampling whatever was current, and composites
+  the guest screen from the display caches when no renderer is present. With
+  a GUI renderer attached it still returns the readback that renderer
+  produced. (`src/ci.rs`, `src/gfx_display.rs`)
+### SGI Octane (IP30)
+
+- **IMPACT on the Octane passes the GL pixel and state suites.** On IRIX
+  6.5.22 pixtest went from 52 to 366 passing cases (the two left fail on the
+  Indigo2 too) and glstate from 393 to 394. The Octane's microcode keeps the
+  pixel pipeline's state blocks 0x8C words higher than the Indigo2's, so
+  glDrawPixels drew RGB images as RGBA; the colour matrix reads back where
+  the Indigo2's does. Both boards: RGBA 12,12,12 has no alpha planes, and
+  glReadPixels now returns alpha 1 from it instead of colour bits.
+- **No more "hq idle wait timeout" killing the X server.** The kernel waits
+  for an idle board by counting polls of a status register, and a context
+  switch behind long drawing ran out of polls. A status poll of a busy board
+  now gives it up to 100 µs first, so the wait is counted in work done.
+- **Double-buffered GL on the Octane's IMPACT no longer shows half-drawn
+  frames** (the octahedra / `bongo` saver flickered and tore). The Octane
+  kernel flips buffers at the retrace after the swap is reported, without
+  waiting for the board to go idle; the swap was reported when the command
+  processor reached it, while the raster engine was still drawing the
+  frame. It is now reported once the frame is drawn. The Indigo2 kernel
+  drains the board before each swap, so it never showed this. The display
+  also takes its frame just before the retrace now, as scanout does, so a
+  flip shows from the next frame.
+- **The Octane's board is `[graphics] board`, as on every other machine**,
+  and `--graphics` works on it. `[octane] graphics` is retired: a config
+  that still sets it is refused with a message naming the new key. Unset,
+  the Octane gets the SI; Newport, XZ and Extreme are refused there, and
+  `board = "none"` (Octane only) leaves the port empty.
+- **Perfetto traces on the Octane and the O2** (`--features perfetto`):
+  the `perfetto` monitor command was registered only on the Indy and
+  Indigo2. IMPACT traces now show frame capture and present, STATUS reads,
+  flags, window-ID modes and VC3 tables, the draw bank, the interrupt lines
+  and, on the Octane, the HEART packets and acknowledgements
+  (docs/perfetto.md).
+- **The Octane takes the textured IMPACT boards.** `[graphics] board =
+  "highimpact"` is the SI with texture option and `"maximpact"` the MXI
+  (two GEs, two REs), with the board version bytes the IP30 kernel decodes;
+  hinv and gfxinfo name them as on the real machine. glstate, pixtest and
+  blendtest pass on both as on the Indigo2's High and Maximum IMPACT;
+  iris-gui offers them too.
+- **OpenGL selection works on IMPACT** (both machines): glRenderMode
+  (GL_SELECT) keeps the name stack in the GE and records hits, so picking
+  with glSelectBuffer returns the objects under the cursor instead of
+  nothing. glstate now passes all 398 cases on IRIX 6.5.22, and
+  `test/gltest/seltest` checks hit records against GL's rules.
+- **GR2 takes its display frame before the retrace too**, for the same
+  reason as IMPACT.
+- **`mgras status` and the log name the microcode the kernel loaded**: a
+  fingerprint of the HQ microcode and of each GE11 program, kept as they are
+  written, and the IRIX release when it is a known one.
+
+- **User programs run from the caches, two to four times faster.** The
+  Octane's IRIX maps user pages with cache attribute 4 (cacheable coherent
+  exclusive), which the TLB read as uncached, so every user fetch, load and
+  store went over the bus and skipped the decode cache, the memory window
+  and the JIT's inline path. The TLB and xkphys now decode the attribute
+  with the CPU model's own table. With jitv2 on a quiet guest, Dhrystone
+  went from 111k to 317k per second, Whetstone from 210 to 500 MIPS, and a
+  memory-bound benchmark from 12.2 s to 4.1 s.
+- **A new machine: the SGI Octane.** `[machine] profile = "octane_ip30"` with
+  an `[octane]` section ([guide](docs/octane-ip30.md)): a 195 MHz R10000 on
+  HEART, the Crossbow, the onboard Bridge with two QLogic ISP1040 SCSI
+  controllers, IOC3 (serial ports, PS/2, the DS1685 clock and NVRAM,
+  Ethernet on the NAT gateway) and RAD audio, the boot flash, and Solid
+  IMPACT graphics on widget 11. The stock IP30 PROM boots IRIX 6.5.30 to a
+  serial login or, on the graphics console, to the X login and desktop.
+  Needs the IP30 PROM image. Runs under jitv2 as well as the interpreter.
+  The devices are time-driven by `hptimer`. Serial input is polled every
+  2 ms by one receive thread per port; every thread is joined when the
+  machine stops.
+  iris-gui can run it.
+- **The Octane's memory and bus bookkeeping are cheaper.** A MEMCFG write
+  that leaves the decode as it was no longer rebuilds the table and empties
+  ppmem's window under the running CPU. The first 64 distinct misses and
+  unsupported accesses are still listed, but once a list is full it costs one
+  atomic load instead of a lock and a scan. A swapped Bridge DMA transfer
+  that is whole 4- or 8-byte units reverses the bytes in place rather than
+  through a spanning copy.
+- **One 1-wire bus for the board records.** `dev::w1` holds the bus, the
+  slot decode and the Dallas parts (DS2501/2502, DS2505); HEART, the Bridge,
+  IOC3 and the graphics board each own a wire. `dev::w1::sgi` only builds the
+  SGI record formats.
+- **CP0 Count writes can open the late-Compare window** (`count_write_samples`,
+  opt-in; the Octane sets it): IRIX on the Octane arms Compare a few
+  instructions after writing Count, and a host stall in between no longer
+  costs a full Count wrap.
+- **IMPACT gains hooks for boards outside the Indigo2**: a settable board
+  identity, pixel reads started at the DMA kick, a bound on how long STATUS
+  reads busy, and a board callback for GE state readbacks and raster
+  register decode. The Indigo2 path is unchanged.
+- **A machine with no graphics board runs on its serial console** instead of
+  stopping when it is not headless.
+- **A PCI function's configuration header can be reset** (`PciConfig::reset`),
+  as a bus reset drives it: the command register and BARs return to power-up.
+
+### SGI O2 (IP32)
+
+- **The O2 is on `Physical`.** Its bus is the same decode table and memory
+  window as the Indy's: CRIME's banks are RAM banks a bank-control write
+  remaps, CRIME, GBE, VICE, MACE and the flash are table entries, and
+  addresses nothing claims still read zero and show in `o2 unmapped`. The
+  Ethernet, serial and audio DMA, the PCI bridge's bus masters and GBE's
+  scan-out reach memory through the bus; the rendering engine draws through
+  the window. The monitor has the `phys` commands. Raw disk reads went from
+  about 1 to 1.9 MB/s with 4 KiB blocks and from about 11 to 19 MB/s with
+  1 MiB blocks, together with the interpreter fixes below. Snapshots are
+  unchanged.
+- **A new machine: the SGI O2.** `[machine] profile = "o2_ip32"` with an `[o2]`
+  section ([guide](docs/o2-ip32.md)): R10000 or R5000, CRIME memory and
+  rendering engine, MACE (PCI with two Adaptec 7880 SCSI controllers,
+  Ethernet on the NAT gateway, serial ports, PS/2, audio, clocks), GBE
+  display. Runs IRIX 6.5.22 to the desktop with OpenGL through the rendering
+  engine, and NetBSD 11 to multi-user and X. Needs the O2 PROM image; not in
+  iris-gui yet.
+- **A headless O2 is still an O2.** CRIME reads as revision 0xa1 and MACE
+  as revision 2 whether or not a keyboard is plugged in; `headless` now only
+  leaves the PS/2 ports empty, so the PROM and IRIX take the serial console.
+- **IRIX boots on any O2 memory size, and headless.** IRIX 6.5.22 panicked
+  in early console setup (`TLBMISS: KERNEL FAULT`, bad address 0xff800000)
+  on a headless O2 and with less than 1 GB: the kernel waits for the
+  rendering engine's FIFO for about 4096 of its own microseconds and gave up
+  while the engine, on its own host thread, was still drawing. A status read
+  now gives a busy engine up to 100 us of host time before it answers.
+  Tested to login with 32, 64, 128, 256, 224 (128+64+32), 384, 512 MB and
+  1 GB, and headless.
+- **O2 SCSI commands run on their own thread.** Each AIC-7880 now has a
+  worker (`AIC-7880-0`, `AIC-7880-1`) that fetches the command, moves the
+  data and does the disk I/O; the CPU's register write only queues the tag.
+  Before, a whole transfer ran inside that write and the guest stopped for
+  it. `scsi regs` reports the worker.
+- **O2 interrupts are delivered like the Indy's.** Devices drive their
+  line when an access, a host event or a timer tick changes it, through
+  MACE's ISA status or the PCI router into CRIME and on to IP2, each
+  controller under one lock. Before, every CRIME register read and MACE
+  write re-drove every MACE device's lines (about 200 lock operations), and
+  the service thread did it again 10,000 times a second. IRIX `diskperf -D`
+  gains 30-45% at every request size (4 KiB: 1.46 to 2.11 MB/s writes;
+  4 MiB: 14.0 to 18.0), and boot to login is about 10% faster. A key typed
+  on the host now interrupts as it arrives.
+- **CRIME's debug records are off the register path.** The
+  interrupt-register log records only after `crime irqlog on` (IRIX touches
+  those registers on every interrupt and priority change), the
+  touched-register list costs one relaxed load after a register's first
+  access, CRIME's counter offset is an atomic, and the bus stops looking at
+  its unmapped-access list once it holds 64 entries. A `lightning` build
+  keeps none of them. A 32-bit CRIME store no longer logs a read the guest
+  never made.
+- **The O2 interpreter is about 2.5x faster.** Three faults compounded, so
+  O2 R10000 interpreter builds ran IRIX at about a third of an IP28's speed:
+  - Without `tcache` (every build without `jitv2`), the cache model the
+    kernel runs on never learned where RAM was, so every load, store and
+    instruction fetch went through the bus.
+  - Every fetch, load and store went through an out-of-line call that
+    switched between the PROM's cache model and the kernel's.
+  - The decoded-instruction cache was indexed by the low bits of the page
+    number. The O2's IRIX places program and library code on pages that
+    share those bits, so they evicted each other on every call. The index is
+    now a hash of the page number, which every machine uses.
+
+  Dhrystone (4M loops) went from about 35 000/s, after the first fix, to
+  42 000/s; an IP28 runs 47 000/s.
+- **The O2's clock reads take no lock.** UST and CRIME's counter lock only
+  while the PROM bit-bangs the 1-Wire ID chip, the one time the guest clock
+  holds host stalls out. A UART keeps the last 64 KiB it sent, not every
+  byte since boot.
+- **O2 PCI register accesses take no bridge locks.** MACE's bridge keeps a
+  table of the functions' open BAR windows, rebuilt after each
+  configuration write, and a CPU access reads it without locking; the
+  AIC-7880 locks its state once per access rather than once per byte.
+- **O2 memory has no lock.** Devices and the CPU's slow path reach RAM
+  without taking a mutex, as the hardware's masters do; PCI DMA decodes
+  once per page instead of once per byte. A disk transfer on the SCSI
+  thread no longer holds up the CPU. Disk throughput under IRIX is bounded
+  by the emulated CPU, not by SCSI or DMA (the controller's thread uses
+  about 1% of a core while IRIX reads at its full rate).
+- **The AIC-7880 is specified.** [docs/o2/aic7880.md](docs/o2/aic7880.md)
+  describes the O2's SCSI controller from the Adaptec data books, the
+  open-source drivers, the MACE spec and what the PROM and IRIX download: principles of operation, PCI
+  configuration space, every register and bit, the sequencer's instruction
+  set, the two downloaded programs (Adaptec's HIM and Gibbs' `aic7xxx.seq`),
+  and how the O2 wires and addresses the chips.
+- **Disks come from `[scsi.N]`.** The O2 reads the same SCSI tables as the
+  Indy and Indigo2, with `controller` naming the bus (0 internal, 1
+  external): changer lists, scratch volumes, CHD images, copy-on-write
+  overlays and the `--scsi1`/`--cdrom4` options now work on it, disc changes
+  reach its CD-ROMs, and an image that will not open stops the run as it
+  does elsewhere. `o2.disks` is deprecated and folded into `[scsi.N]` on
+  load. The monitor's `scsi` and `cow` commands (`scsi1`/`cow1` for the
+  external bus) work on the O2's Adaptec controllers: status, disc changes,
+  overlay commit and reset, and the chip's registers.
+- **One configuration.** The O2 is set up with the shared keys: `prom`,
+  `nvram` (the PROM's flash), `banks` (the kit in each DIMM pair),
+  `serial_port_a`/`serial_port_b`/`serial_log`, `headless`, `[clock]
+  fixed_mhz` (CP0 Count, half the CPU clock), `[network]` with `mac` and the
+  new `mode = "off"`, `[[port_forward]]`, `nat_subnet` and `[nfs]`. `[o2]`
+  keeps `mouse`, `control_port` and `arcs_fpu`; its old keys are folded into
+  the shared ones on load, with a note. The second serial port is served too,
+  and the flash is kept between runs by default.
+- **Scripting and inspection.** The O2's devices have monitor commands, and
+  `o2 <command>` (also on `[o2] control_port`) takes screen shots, types,
+  moves the mouse and reads memory ([debug.md](debug.md#sgi-o2-ip32)).
+- **`glReadPixels` reads the frame buffer.** IRIX's OpenGL reads pixels back
+  through a rendering-engine transfer from the frame buffer into a linear
+  buffer; the engine placed that transfer by the wrong registers and copied
+  nothing, so every read returned zeros.
+- **PROM network boot.** `[network] tftp_dir` serves the O2's PROM too:
+  `boot -f bootp():FILE`.
+- **Memory through CRIME's no-ECC alias.** Physical 0x00_8000_0000 is a
+  second view of memory, not MACE's PCI window. IRIX maps some pages there,
+  and they read as all ones: `netstat -ni` spun forever, so Netscape never
+  opened, and `/dev/mem` and `/dev/kmem` returned 0xffffffff for about one
+  page in six. IRIX on an R5000 O2 panicked with "init died" for the same
+  reason; it now boots to the desktop.
+
+### Physical address decoding
+
+- **`Physical` belongs to no machine.** It is the decode table, the RAM
+  banks with ppmem's window, and the plain devices every machine needs; each
+  machine maps its own devices and memory on it. The Indy and Indigo2 address
+  map and MEMCFG remap moved to `src/ip22_bus.rs`, so the O2 and the Octane
+  can build their buses from the same parts. `phys bench` now fills the first
+  fully mapped 64 MB of RAM instead of the Indy's high-memory window.
+- **The decode table is sparse and spans 40 bits.** `Physical` used to embed
+  a 1 MB array of device pointers covering a 32-bit physical space. It is now
+  a host-mapped table over a 40-bit space (`SparseDeviceMap`,
+  `src/ppmem/devmap.rs`, [design](docs/devmap-design.md)): pages of one
+  device share one 64 KB page, mixed pages come from a pool, and a page the
+  guest touches that nobody mapped is faulted in as the bus-error device with
+  a message naming the address. An Indy's table is about ten pages. Changes
+  swap whole pages in, so the DMA worker dispatching through the table during
+  a MEMCFG remap can no longer read a torn pointer. `phys map` in the monitor
+  shows the table. Groundwork for machines with a 40-bit address space.
+- **4 KB slots.** The table has one entry per 4 KB, the guest's page size
+  and the smallest window a PCI BAR gets, so small devices no longer need
+  to answer a whole 64 KB. A page filled with one device is only recorded
+  and mapped the first time it is used, which keeps host mappings in
+  proportion to what the guest touches (an Octane's 64 GB widget windows
+  cost nothing until used).
+- **The Octane uses `Physical`.** Its bus (`Ip30Bus`) and HEART's memory
+  placement are built from the same parts as the Indy's and the O2's: RAM
+  banks placed as bank views, the low-memory window as a view of the same
+  bank, and `phys` monitor commands on the Octane too. Bus masters still
+  reach memory through HEART's DMA view, now with `physical::read_bytes`
+  and `write_bytes`.
+- **PCI BARs go on the bus.** The Octane's Bridge and the O2's MACE publish
+  the pages of their windows that one BAR decodes whole, and the machine
+  maps them on `Physical`, so a CPU access to a PCI register goes straight
+  to the function through the bridge's lane rules, with no search of the
+  slots and no bridge lock.
+- **The bus takes 64-bit addresses.** Every `BusDevice` method now takes
+  `addr: u64`. `Physical` masks to the table's 40 bits before dispatch, and
+  devices below 4 GB turn the address into a 32-bit offset from their base,
+  so their internals and the GFIFO stay 32-bit.
+- **Translation keeps the whole physical address.** `TranslateResult.phys`
+  is 64-bit, so the CPU can hand the bus up to 40 bits. Each machine folds
+  it to the bits its board decodes (`MipsExecutor::phys_mask`): the Indy,
+  Indigo2 and O2 decode 32 and alias the rest away, as they always did.
+  IRIX depends on that: on the IP28 its page-table entries carry software
+  bits into EntryLo's top PFN bits, and its kernel stack sits at physical
+  0x6_2040_4000 as far as the CPU is concerned. Where a machine does decode
+  above 4 GB, RAM there goes through the bus rather than the direct window,
+  and code there runs in the interpreter: the JIT's page map covers 4 GB.
+
+### Memory configuration
+
+- **`banks` has eight entries.** Every machine today uses the first four and
+  the rest must be 0; a config may list fewer, and files are written back with
+  four. Room for machines with more banks.
+
+### SCSI configuration
+
+- **One id on both controllers.** A `[scsi.N]` key is a slot: 1–7 on
+  controller 0, 16 + id on controller 1, so `[scsi.1]` and `[scsi.17]` put a
+  disk at id 1 on each of an Indigo2's or O2's controllers. `controller = 1`
+  in a low key still works, and two tables naming one target are refused.
+  Snapshot manifests record disks by slot, so an Indigo2 snapshot with a disk
+  on controller 1 taken before this change does not match its configuration.
+- **One `scsi` command for every controller.** The monitor's `scsi` and `cow`
+  subcommands and the run-time disc changes are implemented once, in
+  `src/scsi_monitor.rs`, over a controller's target table; the WD33C93A and
+  the Adaptec 7880 lend theirs and keep only their own subcommands (`regs`,
+  and the WD's `wdt`, `defer`, `debug`). `scsi status` now lists disks too.
+
+### Newport (REX3)
+
+- **Conformance tests for RGBMODE and the command FIFO.** A 24-bit RGB fill
+  needs `DRAWMODE1` bit 15 as well as the RGB plane selection; fills issued
+  back to back are accepted without polling because the emulated FIFO is much
+  deeper than the hardware's and back-pressures rather than dropping writes at
+  its brim. Both behaviours, and the deliberate divergences from a real REX3
+  (reset values, visible `GFIFOLEVEL` only for the last 32 slots, no FIFO
+  threshold interrupt), are now pinned by tests and recorded in
+  `docs/Indy/rex3.md`.
+### Monitor and CI
+
+- **The emulator's name matches the machine.** The IRIS expansion shown by
+  the console banner, the monitor prompt and the window title picked its
+  third word from a fixed list that included "Indy" whatever the profile.
+  The word now comes from the configured machine: Indy or IP24, Indigo2 with
+  IP22 or IP28, and only IP32 for the O2, alongside the model-neutral IRIX
+  and Iris. (`src/machine.rs`)
+
+- **`machine-start` is idempotent and acknowledges the transition, and
+  `machine-status` reports guest state and monitor readiness.** The monitor
+  command now prints `idle -> starting -> running` (or `running (no change)`),
+  `machine-stop` acknowledges symmetrically, and `machine-status [json]` gives
+  a caller one place to ask whether the guest is `idle`, `starting`, `running`
+  or `halted` and whether the monitor has bound its port. The CI socket gains
+  the same `status` command, `iris-ci status [--wait-ready SECS]` polls it
+  instead of sleeping, and `--ci` creates the control socket only after
+  `Machine::start` has bound the monitor, so a successful connection is
+  itself a readiness signal. Tests cover a command sent before the monitor is
+  ready, duplicate starts, start after halt/reset, and invalid transitions.
+- **IMPACT machines keep their display after a stop and start.** `machine-start`,
+  `reset`, snapshot loads and rollbacks restarted every peripheral a stop had
+  stopped except the IMPACT display engines and the Ultra64 board; those now
+  restart too.
+
+### NAT gateway
+
+- **Gateway replies no longer wait for a poll tick.** A reply to a guest
+  frame is still held for one engine pass, but the engine now comes back for
+  it after 150 µs instead of a whole 1 ms `poll(2)` tick (about 15.6 ms on
+  Windows). Lock-step exchanges paid that tick on every packet: the built-in
+  TFTP server was capped near 450 KB/s on Linux and 30 KB/s on Windows, and
+  NFS and DNS replies were delayed the same way.
+- **A built-in rsh server at the gateway.** `[network] rsh_dir = "DIR"` (or
+  `--rsh-dir DIR`) answers TCP 514 at the gateway with `cat`, `dd`, `ls`, `echo`
+  and `pwd` on DIR, read-only, so the guest can pull files with
+  `rsh 192.168.0.1 cat /file` without a host `rshd`. It is not a shell and runs
+  nothing on the host. `exec /bin/sh` (what `inst` runs) is accepted: stdin is
+  run line by line against the same commands, including the
+  `( status=$? ; ... echo 'MARK\c' ; echo 'MARK'$status 1>&2 )` tail `inst`
+  waits for, `trap`, `echo X | dd`, `dd ... | fgrep STR` and the IRIX
+  `ls -inld` format; with `IRIS_RSH_TRACE` each line is logged. It speaks the BSD `rcmd` protocol, including the
+  stderr connection back to the guest from a reserved port. `src/net/rsh.rs`
+  is the protocol and the sandbox; `TcpService` gained `pull` (stream output
+  instead of holding it) and `side_connect` (a service asks for a connection
+  to the guest).
+
+### CPU idle parking
+
+- **An idle-park build no longer hangs IRIX at a raised spl.** The idle
+  detector could park the CPU while the guest was at high spl (IRIX's
+  `splhi` leaves only IP6 unmasked) in a loop waiting for an interrupt
+  handler, and `park` then waited for an unmasked interrupt that never came:
+  the timer's arrived masked, and the guest only takes it once it runs on to
+  `splx`. Seen as an IRIX 6.5.22 Indy going dead (keyboard, serial, telnet)
+  after hours, with the CPU thread idle. The CPU now parks only while
+  nothing is pending and wakes on any pending line, masked or not
+  (`clanker/perf/idle-pause-masked-interrupt-must-wake.md`).
+
 ### iris-gui text and languages
 
 - **GUI text was rewritten, and moved into translatable catalogs.** Labels,
@@ -59,7 +545,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   UDP replies now keep their real source port (TFTP to an outside server),
   and portmap answers only at the gateway. Tests: `net::testnet` (directed,
   frames in and out against real host sockets) and `test/net` (guest and
-  host, with `nettest.c`). Design and numbers: `docs/net-stack.md`.
+  host, with `nettest.c`). Design and numbers: `clanker/plans/net-stack.md`.
 - **TFTP works for PROM network boot and for guest clients.** `boot -f
   bootp()/unix` failed in two places. The BOOTP reply left the boot file
   empty, which the PROM treats as "File not found on server". Its second
@@ -111,7 +597,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   plugin and the card's own device alike: the poll descriptor stays ready
   while there is no room to write), starving the emulator into a stream of
   underruns, while the PulseAudio client used 0.01 s of CPU in 5 s. See
-  `rules/testing/cpal-alsa-busy-poll.md`. `[audio] cpal_buffer_frames`,
+  `clanker/devices/cpal-alsa-busy-poll.md`. `[audio] cpal_buffer_frames`,
   which was parsed but never reached HAL2, now sets the host buffer size; a
   size the device refuses falls back to the host's default. Unset,
   PulseAudio gets 512 frames (two of them, ~21 ms at 48 kHz) instead of its
@@ -185,6 +671,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### iris-gui
 
+- **Save state keeps the machine running** ([#307](https://github.com/techomancer/iris/issues/307)).
+  It resumed by starting the whole machine again, so the monitor complained
+  that its port was in use; it now resumes as `machine-start` does, and only
+  if the machine was running. The Save and Restore state name boxes no longer
+  close the Machine menu when you click into them.
 - **GUI settings for this month's core changes.** The Networking tab sets the
   TFTP boot folder (`[network] tftp_dir`; NAT mode, with the `boot -f
   bootp()/unix` line to use) and shows and edits the Ethernet address
@@ -252,7 +743,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   visual, mailbox reads bottom row first, 3:3:2 widening by bit
   replication, and depth reads of z20 s4 visuals with the stencil above Z.
   The suites flag libGLcore EXPRESS's own bugs as GR2 XFAILs
-  (rules/gr2/gl-test-suites.md).
+  (clanker/gr2/gl-test-suites.md).
 
 - **Host GL on Linux.** `--features hostgl` now has an EGL backend
   (`iris-hostgl/src/backend/egl.rs`): headless contexts in the compatibility
@@ -273,7 +764,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   and o32, glcheck with the reference checksum, irisgltest, Quake 3. Fedora
   44, Arch and Ubuntu 24.04 (x86_64, Mesa's software renderer, no GPU):
   builds, hostgl tests 31/31. See
-  `rules/hostgl/linux-egl-and-mesa.md`.
+  `clanker/hostgl/linux-egl-and-mesa.md`.
 - **Host GL no longer stops the machine while it draws.** A host call is
   answered on the emulated CPU's thread, so while host GL replayed a
   command buffer (2-5 ms for a big one) no instruction ran and no interrupt
@@ -289,7 +780,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   33.9 fps; boot, idle CPU, sound without GL and SGI's own libGL on the
   emulated board are unchanged. Libraries without `OP_BATCH_ASYNC` work
   unchanged. `IRIS_HOSTGL_INLINE=1` keeps the service on the CPU thread.
-  See `rules/hostgl/host-calls-hold-the-cpu-thread.md`.
+  See `clanker/hostgl/host-calls-hold-the-cpu-thread.md`.
 - **Maximum Impact draws correctly, on two raster engines.** Its two RE4s
   each own every other scanline in their own 12MB, so a buffer takes half
   the pages per engine. The model assumed one engine; buffers overlapped,
@@ -301,7 +792,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   step by two). Replays come out identical to one engine, desktop2.rec
   passes every checkpoint, and a recorded gltest fill/triangle session
   replays 1.75x faster. `IRIS_MGRAS_ENGINES=1` keeps one RSS thread. See
-  `rules/mgras/DESIGN.md`.
+  `clanker/mgras/DESIGN.md`.
 - **IMPACT locks show in `locks`, with their holders.** The board's locks
   are now light spinlocks (`locks::SpinLock`) that record the holding thread
   and call site. A thread stuck waiting 5 s prints both sides, so a deadlock
@@ -313,14 +804,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   double-buffered readback shape was compiled, every read after the first
   returned the other buffer's pixels. Its screen-to-screen copy had the same
   gap for RGB. Both now take the plane's bits as the interpreter does. See
-  `rules/rex3/jit-reads-take-the-plane-bits.md`.
+  `clanker/rex3/jit-reads-take-the-plane-bits.md`.
 - **Newport (REX3) honours STEPZ.** A GO on STEPZ fails the Z pattern test
   for its one pixel (rex3.pdf): the iteration advances but the pixel is not
   written (COLORBACK under ZPOPAQUE). IRIX's software rasteriser draws
   textured, alpha-tested spans one GO per pixel and skips rejected texels
   this way; the emulator drew them, so `blast -T`'s billboards showed their
   transparent corners as smeared rows and solid white triangles. See
-  `rules/rex3/stepz-steps-over-one-pixel.md`.
+  `clanker/rex3/stepz-steps-over-one-pixel.md`.
 - **2026-10-09 — Newport (REX3) blends again under IRIX OpenGL.**
   DRAWMODE1's BLENDALPHA bit was applied to every channel, so with it clear
   `BF_SA` was 1.0 for red, green and blue too and nothing was ever
@@ -364,7 +855,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   banks provide 1 GB; IRIX 6.5 reports 1024 MB after POST. The GUI offers
   512 MB banks and 768/1024 MB totals. IP22/IP24 still reject banks above
   128 MB; the fourth-bank policy is unchanged. See
-  [IP28 512 MB banks](rules/irix/ip28-512mb-banks.md).
+  [IP28 512 MB banks](clanker/devices/ip28-512mb-banks.md).
 - **2026-10-04 — IP28 boot chime** (`ce56123`): report R10000 revision 2.5
   so the PROM takes its supported audio path; correct PBUS register decoding
   and masking used by the tune's DMA setup.
@@ -465,7 +956,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   VC3/XMAP/colormap/DAC scanout, interrupts, tracing, and replayable recordings.
   The OpenGL, TE1, and tiled pixel-memory work lands on October 6 (above).
   Solid, High, and Maximum configurations share the generic `GfxDisplay`
-  output used by the CLI and GUI. See [MGRAS design](rules/mgras/DESIGN.md).
+  output used by the CLI and GUI. See [MGRAS design](clanker/mgras/DESIGN.md).
 - **2026-09-30 — Graphics DMA and FIFO fixes** (`5787d02`, `b5cc363`): improved
   DMA reads, FIFO handling, and fillrate benchmark crash fixes.
 
@@ -498,13 +989,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   offset against `fb_rgb` while the pixel pointer was already `fb_aux`-based,
   reading `fb_aux + (fb_aux - fb_rgb) + off` — a wild pointer that segfaulted the
   REX3 thread under X11. `Dm1::use_aux()` now picks the base in both shader
-  emitters (`rules/rex3/cidmatch-aux-plane-base.md`).
+  emitters (`clanker/rex3/cidmatch-aux-plane-base.md`).
   Landed 2026-09-18 (`44f4b24`).
 - The GFIFO push is retryable, and a shader rejected by a full compile queue can
-  be requested again (`rules/testing/rex-jit-queue-retry.md`).
+  be requested again (`clanker/rex3/rex-jit-queue-retry.md`).
 - `CIDMATCH` is a mask of permitted CIDs, not an equality value
-  (`rules/rex3/cidmatch-is-a-mask.md`).
-- Blend-alpha handling fixed (`rules/rex3/blendalpha-and-alpha-blending.md`).
+  (`clanker/rex3/cidmatch-is-a-mask.md`).
+- Blend-alpha handling fixed (`clanker/rex3/blendalpha-and-alpha-blending.md`).
 - REX3 benchmarking tests; a triangle benchmark in `gltest`.
 
 ### CPU, timing, and audio
@@ -544,10 +1035,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   seeded from the host at startup; clamped to the chip's 1970–2039 range.
 - IP7 delivery improved for Linux guests' timer checks and calibration.
 - Misaligned-fetch exception, and Config.K0 cache modes including the reserved
-  ones (`rules/irix/cache-attributes-and-fetch-alignment.md`).
+  ones (`clanker/cpu/cache-attributes-and-fetch-alignment.md`).
 - FR=1 FPU mode handled better, with a guard for `MOVCI`
-  (`rules/jitv2/fr1-pin-must-be-re-derived.md`,
-  `rules/testing/movci-is-cp1-by-behaviour-not-encoding.md`).
+  (`clanker/jitv2/fr1-pin-must-be-re-derived.md`,
+  `clanker/cpu/movci-is-cp1-by-behaviour-not-encoding.md`).
 
 ### JIT v2
 
@@ -581,7 +1072,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   `PhysicalCodePage::saved_bits` bitmap to dedup them. It had to be compiled in
   *before* the run that would produce the interesting pages, so a corpus could
   only be captured by deciding in advance you wanted one — and the corpus every
-  `rules/jitv2/` measurement cites was a local artifact that got lost, with no
+  `clanker/jitv2/` measurement cites was a local artifact that got lost, with no
   way to reproduce it.
 
   `j2 corpus [dir]` now walks the live JIT page cache on demand and writes one
@@ -599,7 +1090,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   the build that invalidates such a measurement (`developer` forces
   `opt_level=none` and injects a per-instruction trace callout) — so
   `zz_corpus_sizes` reported `total_bytes=0` in exactly the build it was meant
-  to measure. See `rules/jitv2/corpus-capture-from-the-pcp-cache.md`, including
+  to measure. See `clanker/jitv2/corpus-capture-from-the-pcp-cache.md`, including
   the `requested`-vs-`compiled` trap that silently discards 99.5% of a corpus.
 
 - **2026-09-19 — Compile churn avoidance** (`d1bf817`). Each page now remembers the bytes its
@@ -613,7 +1104,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   (`PhysicalCodePage` 720 → 4976 bytes across the 4096-slot pool). `j2 status`
   and `j2 pcp` report the skipped/recompiled split (since last flush, and
   available in `lightning` builds, not just `developer`). See
-  `rules/jitv2/compile-churn-avoidance-snapshot.md`.
+  `clanker/jitv2/compile-churn-avoidance-snapshot.md`.
 - Inline load/store for the R5000 cache model, not only the R4400.
 - Physical code pages are found through a flat pfn array instead of a hash map;
   PC/BD stores are emitted only when needed; the last instruction on a page and
@@ -712,7 +1203,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   thread instead of being called from other threads, the GL surface and the first
   `make_current` happen on the main thread, and further cross-thread UI fixes.
 - `crash_diag`: silent Windows deaths (`0xC000041D`) are logged with a symbolised
-  stack to `iris-crash.log` (`rules/gui/windows-silent-exit-0xc000041d.md`).
+  stack to `iris-crash.log` (`clanker/gui/windows-silent-exit-0xc000041d.md`).
 
 ## August 2026
 
@@ -736,7 +1227,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 - `MipsCore` reorganised: the interrupt word, `in_delay_slot` and its target live
   in the core; fields reordered for cache locality; the cycles counter is a plain
   variable. Cranelift upgraded 0.116 → 0.134, and every dependency except the
-  egui stack updated (`rules/build/dependency-upgrade-gotchas.md`).
+  egui stack updated (`clanker/build/dependency-upgrade-gotchas.md`).
 - IP7 is driven by a host timer instead of instruction counting (`1e05210`), and a
   fixed CP0 Count clock option was added (superseded in September).
 
@@ -754,7 +1245,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### JIT v2 (new) and the old JIT (removed)
 
 - **jitv2** (`c340118`): a physical-page Cranelift compiler with memory-resident
-  registers and no speculation (`rules/jitv2/jit-v2-design.md`). Over the month:
+  registers and no speculation (`clanker/jitv2/jit-v2-design.md`). Over the month:
   a multi-threaded compile pool with a lock-free queue (`[jitv2] threads`,
   `--jitv2-threads`), compiles triggered on page transitions, FMOVCF and DADDIU
   emitters, interpreter fallbacks that don't break streaks, NOP elimination,
@@ -762,14 +1253,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   cache, a dirty-cache-page probe, self-modifying-code detection, and a Windows
   x64 callout ABI that returns status in registers.
 - `jitv2_opcodefusion` (LUI+ORI/ADDIU, branch+NOP) exists but is **off by
-  default** after it broke Linux (`rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`).
+  default** after it broke Linux (`clanker/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`).
 - `j2wp` whole-page compile, `jitv2_lockstep`, `jitv2_smc_check`,
   the `j2` monitor command (`clear`, `deny`, `pagewb`,
   `html` physical code page visualiser, …) and the `jitv2-analyze`,
   `jitv2-verify`, `jitv2-pcp-dump` tools.
 - Status-bar feedback for JIT activity.
 - **The original tiered MIPS JIT was removed** (`33c4e68`), along with its
-  `jit` feature, `IRIS_JIT*` environment variables and `rules/jit/`.
+  `jit` feature, `IRIS_JIT*` environment variables and `clanker/jit/`.
 
 ### Bare-metal testing and benchmarking
 
@@ -800,7 +1291,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   lightning run). `--load-elf` skips the PROM, so the SCC's transmitter was never
   enabled and every character the guest printed burned a 100,000-iteration spin
   waiting for a TX-empty bit that would never come. `cpu-tests` gets the same
-  speedup. See `rules/testing/scc-serial-output-from-bare-metal-code.md`.
+  speedup. See `clanker/testing/scc-serial-output-from-bare-metal-code.md`.
 - **Quick mode** (`iris-bench run --quick`, and the GUI's default): about half
   the wall clock for the same numbers to within a couple of percent. It never
   runs fewer kernels, it only shortens the timed passes. Requested through a
@@ -813,7 +1304,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   R4700, R5000, R8000, R10000, R12000, R14000, RM5200 and RM7000 from PRId and
   runs on anything else too; `golden.h` was always CPU-independent.
 - **Platform limits documented** in
-  `rules/testing/bare-metal-harness-platform-assumptions.md`.
+  `clanker/testing/bare-metal-harness-platform-assumptions.md`.
 - `iris::bench_report` holds the report parser, data model and reference table,
   shared by the CLI, the runner and the GUI.
 
@@ -825,7 +1316,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   retrace delivery for Indigo2 graphics.
 - **DaynaPort SCSI/Link** (`--features daynaport`, `734660b`): Ethernet over the
   SCSI bus as a per-ID target with its own NAT or PCAP backend
-  (`docs/daynaport.md`, `docs/iris-daynaport-target.md`).
+  (`docs/daynaport.md`, `clanker/plans/iris-daynaport-target.md`).
 - **TFTP server** in the NAT gateway for PROM network boot (`--tftp-dir`,
   `src/net/tftp.rs`).
 - **SGI volume headers**: volume-directory support and the `mkvh` tool.
@@ -889,10 +1380,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   and Indigo2 IMPACT preview stubs (removed/replaced in September), dual-head Newport and
   forced Newport resolutions.
 - IndyCam CDMC register map and power-on defaults corrected
-  (`rules/irix/indycam-cdmc-register-map.md`).
+  (`clanker/video/indycam-cdmc-register-map.md`).
 - NFS resolves `.` and `..` server-side.
 - NAT: port forwards to rsh/rlogin use a reserved source port, probing for a free
-  one (`rules/irix/rsh-forward-needs-reserved-source-port.md`).
+  one (`clanker/net/rsh-forward-needs-reserved-source-port.md`).
 - Recent HAL2 changes reverted after they broke audio.
 - `libchdman-rs` 0.288.8 (BSD-3-Clause; drops GPL-3.0), then 0.288.9 (bin/cue fix).
 - Machine and other large objects are constructed with bigger stacks (#60).
@@ -907,7 +1398,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   IntelliMouse wheel support in the core.
 - **Mac App Store support**: security-scoped bookmarks, interpreter-only under the
   App Sandbox, notarised-distribution entitlements, winit's private blur API
-  stubbed out (guideline 2.5.1, `rules/macos/appstore-private-api.md`), camera
+  stubbed out (guideline 2.5.1, `clanker/macos/appstore-private-api.md`), camera
   and network entitlements made testable, keyboard capture, CHD folder grants,
   licenses window, and `PRIVACY.md`.
 - Adaptive framebuffer filtering and the left control column; windowed-first
@@ -962,16 +1453,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - **VINO / IndyCam** end to end: pixel pipeline, CDMC and SAA7191, host camera
   capture on macOS, SYSID bit 4 so IRIX attaches the driver, I2C fixes, capture
-  on IRIX 6.5, colour and interlace fixes (`rules/irix/vino-*`,
-  `rules/irix/indycam-end-to-end-capture.md`).
+  on IRIX 6.5, colour and interlace fixes (`clanker/irix/vino-*`,
+  `clanker/video/indycam-end-to-end-capture.md`).
 - **Idle park** (`--features idle-pause`, off by default): the CPU thread sleeps
   while IRIX idles. The REX3 GFIFO consumer parks instead of spinning, the refresh
   thread skips unchanged frames, and the winit loop waits when idle.
-- IRIX install guide for 5.3 and 6.5.22 (`rules/irix/irix-install.md`) with
+- IRIX install guide for 5.3 and 6.5.22 (`clanker/irix/irix-install.md`) with
   `tools/inst-*.py` helpers; config templates `iris-irix53.toml` and
   `iris-irix65.toml`; per-config `nvram = "..."`.
 - SCSI: IRIX miniroot install hang fixed
-  (`rules/irix/miniroot-install-hang-scsi0-dma-irq-storm.md`).
+  (`clanker/scsi/miniroot-install-hang-scsi0-dma-irq-storm.md`).
 - `--serial-log` mirrors ttyd1 output; the monitor port stays bound under `--ci`;
   telnet option negotiation on the serial and monitor listeners.
 - `iris-ci rtc-save`, `cdrom-eject`, `cdrom-load`; `get`/`put` work under a

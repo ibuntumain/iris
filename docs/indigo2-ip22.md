@@ -19,9 +19,10 @@ No separate build is required — the same `iris` / `iris-gui` binary supports I
   (default `nveeprom.bin`, `--nveeprom`) and written back with the monitor's
   `nveeprom save` or automatically on normal Stop. `[network] mac` is
   injected into a blank slot before boot; an existing MAC is retained.
-- **SCSI:** two WD33C93A controllers. Put a device on the second one with
-  `controller = 1` in its `[scsi.N]` section; `scsi0` / `scsi1` in the monitor
-  address each controller.
+- **SCSI:** two WD33C93A controllers. A device goes on the second one as
+  `[scsi.16+N]` (so `[scsi.17]` is id 1 there, and id 1 can be on both), or
+  with `controller = 1` in its `[scsi.N]` section; `scsi0` / `scsi1` in the
+  monitor address each controller.
 - **Interrupts:** INT2 and the fullhouse cascade are modelled; the IRIX kernel
   never hooks GIO interrupt 2, so vertical retrace is delivered the way the
   table below describes.
@@ -82,7 +83,7 @@ Set `[graphics] board` to `xz`, `extreme`, `solidimpact`, `highimpact`, or
 command interpreters, software rasterizers, and a display path; they are no
 longer preview stubs. Require `heads = 1` and `resolution = "guest"` for these
 boards. There is no separate `[impact]` section. See
-[GR2 graphics](indy-xz-elan.md) and [MGRAS design](../rules/mgras/DESIGN.md).
+[GR2 graphics](indy-xz-elan.md) and [MGRAS design](../clanker/mgras/DESIGN.md).
 
 For the R10000 Indigo2 profile and larger RAM banks, see
 [Indigo2 IP28](indigo2-ip28.md). IP28 has its own embedded PROM fallback.
@@ -91,4 +92,4 @@ For the R10000 Indigo2 profile and larger RAM banks, see
 
 - Full EXTIO bus-error and EISA interrupt paths
 
-See also [`docs/interrupt_map.md`](interrupt_map.md) and [`rules/gui/machine-profile-vs-guest-ip22.md`](../rules/gui/machine-profile-vs-guest-ip22.md).
+See also [`docs/interrupt_map.md`](interrupt_map.md) and [`clanker/gui/machine-profile-vs-guest-ip22.md`](../clanker/gui/machine-profile-vs-guest-ip22.md).

@@ -211,7 +211,7 @@ struct App {
     /// Timestamp of the most recent edit; used to debounce auto-save.
     cfg_dirty_since: Option<std::time::Instant>,
     /// Banks passed to the last `Cmd::Start` (guest-visible RAM is fixed until Stop).
-    started_banks: Option<[u32; 4]>,
+    started_banks: Option<[u32; iris::config::MAX_BANKS]>,
     /// The CPU the running guest booted on — see `MemoryUiContext::started_cpu`.
     started_cpu: Option<iris::config::CpuModel>,
     tab: Tab,
@@ -818,34 +818,40 @@ impl App {
         // message, so every step below collects into `notes` and one final
         // call reports them all, rather than each overwriting the last.
         let mut notes = Vec::new();
-        if settings::ensure_nvram_seeded(&self.cfg.nvram) {
-            notes.push(t!("toast-nvram-seeded"));
-        }
-        // Networking needs an Ethernet MAC in NVRAM (6 raw bytes at a fixed
-        // offset). If there's none, write a generated one *now*, before boot —
-        // so IRIX attaches ec0 on the first boot, no PROM monitor / reboot.
-        //
-        // Indigo2/IP28 read `eaddr` from the NVRAM *EEPROM* instead
-        // (`nveeprom`, see `rules/irix/networking.md`) — the DS1386 write
-        // above has no effect on those profiles' guest networking at all.
-        // Patch whichever chip(s) the config carries; harmless on a profile
-        // that doesn't use one (core's own `backdoor_set_mac_if_blank` simply
-        // never reads it then).
-        if !settings::nvram_has_mac(&self.cfg.nvram) {
-            let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
-            let mac = settings::generate_mac_bytes(seed);
-            notes.push(match settings::write_nvram_mac(&self.cfg.nvram, mac) {
-                Ok(true)  => t!("toast-nvram-mac-written", mac = settings::mac_to_string(mac)),
-                Ok(false) => t!("toast-nvram-mac-no-file"),
-                Err(e)    => t!("toast-nvram-mac-failed", error = e.to_string()),
-            });
-        }
-        if !settings::nveeprom_has_mac(&self.cfg.nveeprom) {
-            settings::ensure_nveeprom_exists(&self.cfg.nveeprom);
-            let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
-            let mac = settings::generate_mac_bytes(seed);
-            if let Ok(true) = settings::write_nveeprom_mac(&self.cfg.nveeprom, mac) {
-                notes.push(t!("toast-nveeprom-mac-written", mac = settings::mac_to_string(mac)));
+        // The Octane's NVRAM is a DS1685 with its own layout and no Ethernet
+        // address in it, so none of the Indy/Indigo2 seeding below applies; a
+        // missing file is a blank NVRAM.
+        let octane = self.cfg.machine.profile == iris::config::MachineProfile::OctaneIp30;
+        if !octane {
+            if settings::ensure_nvram_seeded(&self.cfg.nvram) {
+                notes.push(t!("toast-nvram-seeded"));
+            }
+            // Networking needs an Ethernet MAC in NVRAM (6 raw bytes at a fixed
+            // offset). If there's none, write a generated one *now*, before boot —
+            // so IRIX attaches ec0 on the first boot, no PROM monitor / reboot.
+            //
+            // Indigo2/IP28 read `eaddr` from the NVRAM *EEPROM* instead
+            // (`nveeprom`, see `clanker/irix/networking.md`) — the DS1386 write
+            // above has no effect on those profiles' guest networking at all.
+            // Patch whichever chip(s) the config carries; harmless on a profile
+            // that doesn't use one (core's own `backdoor_set_mac_if_blank` simply
+            // never reads it then).
+            if !settings::nvram_has_mac(&self.cfg.nvram) {
+                let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
+                let mac = settings::generate_mac_bytes(seed);
+                notes.push(match settings::write_nvram_mac(&self.cfg.nvram, mac) {
+                    Ok(true)  => t!("toast-nvram-mac-written", mac = settings::mac_to_string(mac)),
+                    Ok(false) => t!("toast-nvram-mac-no-file"),
+                    Err(e)    => t!("toast-nvram-mac-failed", error = e.to_string()),
+                });
+            }
+            if !settings::nveeprom_has_mac(&self.cfg.nveeprom) {
+                settings::ensure_nveeprom_exists(&self.cfg.nveeprom);
+                let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
+                let mac = settings::generate_mac_bytes(seed);
+                if let Ok(true) = settings::write_nveeprom_mac(&self.cfg.nveeprom, mac) {
+                    notes.push(t!("toast-nveeprom-mac-written", mac = settings::mac_to_string(mac)));
+                }
             }
         }
         self.emu.send(Cmd::Start(Box::new(self.cfg.clone())));
@@ -1199,7 +1205,13 @@ impl App {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             });
-            ui.menu_button(t!("menu-machine"), |ui| {
+            // Closes only on a click outside it: the Save and Restore state
+            // name boxes take clicks, and the default would close the menu
+            // on the click that focuses one. Its buttons close it themselves.
+            egui::containers::menu::MenuButton::new(t!("menu-machine"))
+                .config(egui::containers::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
+                .ui(ui, |ui| {
                 let running = self.emu.is_running();
                 if ui.add_enabled(!running, egui::Button::new(t!("menu-machine-start"))).clicked() {
                     self.start_emulator();
@@ -1221,7 +1233,7 @@ impl App {
                 {
                     // Indigo2/IP28 read eaddr and PROM env from the NVRAM
                     // EEPROM (nveeprom), not the DS1386 nvram file below — see
-                    // rules/irix/networking.md. Reset and re-MAC both, so this
+                    // clanker/irix/networking.md. Reset and re-MAC both, so this
                     // button actually works regardless of machine profile
                     // instead of only ever touching the Indy chip. `toast`
                     // holds one message, so collect both outcomes into a
@@ -1230,19 +1242,31 @@ impl App {
                     let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
                     let mac = settings::generate_mac_bytes(seed);
                     let mut errors = Vec::new();
-                    match settings::reset_nvram(&self.cfg.nvram) {
-                        Ok(()) => { let _ = settings::write_nvram_mac(&self.cfg.nvram, mac); }
-                        Err(e) => errors.push(t!("toast-nvram-reset-failed", error = e.to_string())),
-                    }
-                    match settings::reset_nveeprom(&self.cfg.nveeprom) {
-                        Ok(()) => { let _ = settings::write_nveeprom_mac(&self.cfg.nveeprom, mac); }
-                        Err(e) => errors.push(t!("toast-nveeprom-reset-failed", error = e.to_string())),
-                    }
-                    self.toast(if errors.is_empty() {
-                        t!("toast-nvram-reset", mac = settings::mac_to_string(mac))
+                    if self.cfg.machine.profile == iris::config::MachineProfile::OctaneIp30 {
+                        // A blank DS1685 NVRAM is the Octane's factory state:
+                        // keep a backup and remove the file.
+                        let path = &self.cfg.nvram;
+                        let _ = std::fs::copy(path, format!("{path}.bak"));
+                        match std::fs::remove_file(path) {
+                            Ok(()) => self.toast(t!("toast-nvram-reset-octane")),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.toast(t!("toast-nvram-reset-octane")),
+                            Err(e) => self.toast(t!("toast-nvram-reset-failed", error = e.to_string())),
+                        }
                     } else {
-                        errors.join("\n")
-                    });
+                        match settings::reset_nvram(&self.cfg.nvram) {
+                            Ok(()) => { let _ = settings::write_nvram_mac(&self.cfg.nvram, mac); }
+                            Err(e) => errors.push(t!("toast-nvram-reset-failed", error = e.to_string())),
+                        }
+                        match settings::reset_nveeprom(&self.cfg.nveeprom) {
+                            Ok(()) => { let _ = settings::write_nveeprom_mac(&self.cfg.nveeprom, mac); }
+                            Err(e) => errors.push(t!("toast-nveeprom-reset-failed", error = e.to_string())),
+                        }
+                        self.toast(if errors.is_empty() {
+                            t!("toast-nvram-reset", mac = settings::mac_to_string(mac))
+                        } else {
+                            errors.join("\n")
+                        });
+                    }
                     ui.close();
                 }
                 ui.separator();
@@ -1250,12 +1274,14 @@ impl App {
                 // same shape as the Memory menu's RAM rows.
                 ui.set_min_width(240.0);
                 ui.label(RichText::new(t!("menu-machine-processor", cpu = self.cfg.machine.cpu.label())).strong());
-                ui.add_enabled_ui(!running, |ui| {
+                // The Octane is an R10000 and nothing else.
+                ui.add_enabled_ui(!running && self.cfg.machine.profile != iris::config::MachineProfile::OctaneIp30, |ui| {
                     for c in iris::config::CpuModel::ALL {
                         if ui.radio(self.cfg.machine.cpu == c, c.label()).clicked() {
                             self.cfg.machine.cpu = c;
                             self.mark_dirty();
                             self.toast(t!("toast-cpu-set", cpu = c.label()));
+                            ui.close();
                         }
                     }
                 });
@@ -1278,6 +1304,7 @@ impl App {
                     ui.add(egui::TextEdit::singleline(&mut self.save_state_name).desired_width(120.0));
                     if ui.button(t!("common-save")).clicked() {
                         self.emu.send(Cmd::SaveState(self.save_state_name.clone()));
+                        ui.close();
                     }
                 });
                 ui.horizontal(|ui| {
@@ -1285,6 +1312,7 @@ impl App {
                     ui.add(egui::TextEdit::singleline(&mut self.restore_state_name).desired_width(120.0));
                     if ui.button(t!("menu-machine-restore")).clicked() {
                         self.emu.send(Cmd::RestoreState(self.restore_state_name.clone()));
+                        ui.close();
                     }
                 });
                 ui.separator();
@@ -1322,16 +1350,16 @@ impl App {
                 } else {
                     subtitle(ui, t!("menu-memory-stopped-subtitle"));
                 }
-                let ip28_banks = self.cfg.machine.profile.ip28();
+                let profile = self.cfg.machine.profile;
                 ui.separator();
                 ui.label(t!("menu-memory-presets"));
-                for &p in ram_presets(ip28_banks) {
+                for &p in ram_presets(profile) {
                     if ui
                         .add_enabled(!running, egui::Button::new(t!("menu-memory-size", mb = p)))
                         .on_disabled_hover_text(t!("menu-memory-stop-first-tip"))
                         .clicked()
                     {
-                        self.cfg.banks = distribute_ram(p, ip28_banks);
+                        self.cfg.banks = distribute_ram(p, profile);
                         self.mark_dirty();
                         self.toast(t!("toast-ram-set", ram = ram_summary(&self.cfg.banks), banks = format!("{:?}", self.cfg.banks)));
                         ui.close();
@@ -1343,11 +1371,11 @@ impl App {
                     ui.menu_button(t!("menu-memory-bank", bank = i, mb = self.cfg.banks[i]), |ui| {
                         for &sz in iris::config::VALID_BANK_SIZES {
                             if ui
-                                .add_enabled(!running && (sz <= 128 || ip28_banks), egui::Button::new(t!("menu-memory-size", mb = sz)))
+                                .add_enabled(!running && profile.bank_sizes().contains(&sz), egui::Button::new(t!("menu-memory-size", mb = sz)))
                                 .on_disabled_hover_text(if running {
                                     t!("menu-memory-stop-first-tip")
                                 } else {
-                                    t!("menu-memory-ip28-only-tip")
+                                    ram::bank_size_tip(profile)
                                 })
                                 .clicked()
                             {
@@ -1826,7 +1854,7 @@ impl App {
         let mut want_check = false;
         ui.horizontal(|ui| {
             // U+2022 (bullet) as a status light. NOT U+25CF (●), which renders as
-            // tofu in egui's font chain. See rules/gui/egui-…-tofu.md.
+            // tofu in egui's font chain. See clanker/gui/egui-…-tofu.md.
             ui.label(RichText::new("\u{2022}").size(18.0).color(net_color)).tip(net_tip.clone());
             ui.label(net_label).tip(net_tip);
             if nat_running && ui.small_button(t!("status-net-check")).tip(t!("status-net-check-tip")).clicked() {
@@ -3796,7 +3824,7 @@ mod machine_storage_integration {
         std::env::set_var("IRIS_NO_EXIT_ON_POWEROFF", "1");
         let mut prefs = GuiSettings::load_in(root.clone(), launch_dir());
         let mut cfg = MachineConfig::default();
-        cfg.banks = [8, 8, 0, 0];
+        cfg.banks = iris::config::banks_from4([8, 8, 0, 0]);
         cfg.scsi.clear();
         cfg.headless = true;
         cfg.monitor_port = Some(0);
@@ -3842,10 +3870,10 @@ mod machine_storage_integration {
         assert_ne!(settings::nvram_mac(alpha.join("nvram.bin").to_str().unwrap()), settings::nvram_mac(beta.join("nvram.bin").to_str().unwrap()));
         // Switch rereads external TOML edits rather than the startup map.
         let mut edited = machines::read(&app.prefs.machine_path("alpha").unwrap()).unwrap();
-        edited.banks = [16, 16, 0, 0];
+        edited.banks = iris::config::banks_from4([16, 16, 0, 0]);
         machines::save(&root, "alpha", &mut edited).unwrap();
         app.switch_to("alpha");
-        assert_eq!(app.cfg.banks, [16, 16, 0, 0]);
+        assert_eq!(app.cfg.banks, iris::config::banks_from4([16, 16, 0, 0]));
         app.apply_rename("renamed");
         assert_eq!(app.prefs.active_machine.as_deref(), Some("renamed"));
         assert_eq!(std::env::current_dir().unwrap(), root.join("machines/renamed"));

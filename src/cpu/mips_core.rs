@@ -271,7 +271,7 @@ impl CyclesPtr {
 /// a CP0 Compare write, not every dispatch) trail at the end.
 ///
 /// `#[repr(C)]`: JIT v2 compiled code addresses fields directly via a pinned
-/// base pointer + fixed byte offset (`mov [base+disp]`, rules/jitv2/jit-v2-design.md
+/// base pointer + fixed byte offset (`mov [base+disp]`, clanker/jitv2/jit-v2-design.md
 /// §5 — "memory-resident registers", no copy-in/copy-out shadow struct like v1's
 /// `JitContext`). That requires deterministic, ABI-stable field layout, which
 /// `repr(Rust)` does not guarantee. Offsets must be computed via
@@ -841,7 +841,7 @@ pub struct MipsCore {
     pub cp0_epc: u64,         // 14: Exception Program Counter
     pub cp0_prid: u32,        // 15: Processor Revision ID
     pub cp0_config: u32,      // 16: Configuration Register
-    pub cp0_lladdr: u32,      // 17: LLAddr (also mirrored on d_cache for invalidation)
+    pub cp0_lladdr: u64,      // 17: LLAddr, PA[PA_BITS-1:4] (also mirrored on d_cache for invalidation)
     pub cp0_watchlo: u32,     // 18: Watchpoint Low
     pub cp0_watchhi: u32,     // 19: Watchpoint High
     pub cp0_xcontext: u64,    // 20: Extended Context (64-bit)
@@ -927,6 +927,13 @@ pub struct MipsCore {
     /// we simply overran (Compare differs from it, yet already lies behind
     /// the freshly materialized Count). See `write_cp0` reg 11.
     pub(crate) count_last_guest_read: u32,
+    /// A Count write also sets `count_last_guest_read`, so a Compare written
+    /// a few instructions after it, against the value written, is measured
+    /// from that value. The Octane's IRIX zeroes Count and arms Compare
+    /// 1000 ticks later with register instructions between; a host stall
+    /// there must not cost a full Count wrap. A machine opts in; it is an
+    /// emulator approximation for host scheduling, not processor behaviour.
+    pub count_write_samples: bool,
     /// IP7 delivery sequence, CPU-thread copy. Incremented by
     /// `arm_ip7_sequence` on every Compare write / re-arm; the value it
     /// becomes is the ticket that the *next* IP7 delivery must present.
@@ -1397,6 +1404,7 @@ impl MipsCore {
             #[cfg(feature = "developer_ip7")]
             ip7_past_writes: 0,
             count_last_guest_read: 0,
+            count_write_samples: false,
             ip7_seq: 0,
             ip7_seq_shared: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "developer_ip7")]
@@ -1585,7 +1593,7 @@ impl MipsCore {
             14 => self.cp0_epc,
             15 => self.cp0_prid as u64,
             16 => self.cp0_config as u64,
-            17 => self.cp0_lladdr as u64,
+            17 => self.cp0_lladdr,
             18 => self.cp0_watchlo as u64,
             19 => self.cp0_watchhi as u64,
             20 => self.cp0_xcontext,
@@ -1637,7 +1645,7 @@ impl MipsCore {
             14 => self.cp0_epc,
             15 => self.cp0_prid as u64,
             16 => self.cp0_config as u64,
-            17 => self.cp0_lladdr as u64,
+            17 => self.cp0_lladdr,
             18 => self.cp0_watchlo as u64,
             19 => self.cp0_watchhi as u64,
             20 => self.cp0_xcontext,
@@ -1822,11 +1830,7 @@ impl MipsCore {
         // The Compare *write* path classifies that case (a deliberate ack vs
         // a deadline we overran) and delivers IP7 itself when warranted; this
         // function only schedules the next architectural match.
-        let delta = match (self.cp0_compare as u32).wrapping_sub(self.cp0_count as u32) as u64 {
-            0 => 1u64 << 32,
-            d => d,
-        };
-        let ns = ((delta as u128 * 1_000_000_000) / self.count_hz as u128) as u64;
+        let ns = compare_delay_ns(self.cp0_compare as u32, self.cp0_count as u32, self.count_hz);
         #[cfg(feature = "ci_clock")]
         {
             self.count_fire_cycle = self.hot.cycles.saturating_add(ns / NS_PER_GUEST_CYCLE);
@@ -1906,6 +1910,17 @@ impl MipsCore {
         self.schedule_compare_timer();
     }
 
+    /// After a snapshot restore set Count and Compare as raw fields: the
+    /// restored Compare is a deadline the guest programmed, so it gets a
+    /// ticket of its own before the timer is armed against it. A core that
+    /// has not run yet still holds ticket 0, the "already delivered"
+    /// sentinel, and the guest (waiting for that very interrupt before it
+    /// writes Compare again) would never get it.
+    pub fn restore_compare_deadline(&mut self) {
+        self.arm_ip7_sequence();
+        self.reanchor_count_and_reschedule();
+    }
+
     /// CPU thread is stopping: latch the virtual count at its current value
     /// and silence the compare timer, so a stopped CPU (monitor `cpu stop`,
     /// debugger stepping) sees a frozen Count and never gets IP7 raised
@@ -1974,6 +1989,9 @@ impl MipsCore {
                 // Re-anchor the virtual count at the written value and re-arm
                 // the compare timer against the moved count.
                 self.cp0_count = value as u32 as u64;
+                if self.count_write_samples {
+                    self.count_last_guest_read = value as u32;
+                }
                 self.reanchor_count_and_reschedule();
             }
             10 => { // always use 64bit mask because the entries need to be valid in 64 bit mode even when they were set from 32 bit mode
@@ -2181,7 +2199,7 @@ impl MipsCore {
                 }
                 self.cp0_config = new;
             }
-            17 => self.cp0_lladdr = value as u32,
+            17 => self.cp0_lladdr = value,
             18 => self.cp0_watchlo = value as u32,
             19 => self.cp0_watchhi = value as u32,
             20 => {
@@ -2608,6 +2626,18 @@ pub fn deliver_exception_at(core: &mut MipsCore, status: u32, fault_pc: u64, bd:
 
     core.pc = vector_base + offset;
 
+    // A vector is a region entry, but only the 32-bit refill vector sits on
+    // a page's word 0, the one landing a page crossing marks as compile-
+    // worthy. The XTLB refill (0x080, every refill once UX is set, as on the
+    // O2) and the general vector (0x180, reached by syscalls only through
+    // their own trigger) were never requested, so every TLB refill ran in
+    // the interpreter. Once compiled, a trigger at a runnable entry costs
+    // nothing: dispatch just runs it.
+    #[cfg(feature = "jitv2")]
+    {
+        core.jit_trigger = true;
+    }
+
     // Jumping to a handler vector ends any delay slot in progress: the vector's
     // first instruction is never in one. `bd` was already consumed above (into
     // Cause.BD / EPC), so clearing here cannot lose information.
@@ -2617,7 +2647,7 @@ pub fn deliver_exception_at(core: &mut MipsCore, status: u32, fault_pc: u64, bd:
     // which left `bin/jitv2_verify.rs`'s bare-`MipsCore` call — no wrapper — able
     // to enter a handler with `in_delay_slot` still set. Same
     // "every caller must remember" shape as the CP0-Status resync bug; see
-    // rules/testing/cp0-status-writes-must-resync-privilege-state.md.
+    // clanker/cpu/cp0-status-writes-must-resync-privilege-state.md.
     core.in_delay_slot = false;
 }
 
@@ -2645,6 +2675,17 @@ impl Default for MipsCore {
     }
 }
 
+/// Host nanoseconds until a Count at `count` next equals `compare`, at `hz`
+/// ticks per second. The distance is taken modulo 2^32, so a target just
+/// past the wrap is a short wait; a target equal to Count is a full wrap.
+fn compare_delay_ns(compare: u32, count: u32, hz: u64) -> u64 {
+    let delta = match compare.wrapping_sub(count) as u64 {
+        0 => 1u64 << 32,
+        d => d,
+    };
+    ((delta as u128 * 1_000_000_000) / hz as u128) as u64
+}
+
 #[cfg(test)]
 mod ip7_ticket_tests {
     use super::*;
@@ -2657,13 +2698,43 @@ mod ip7_ticket_tests {
     fn core_past_its_compare() -> MipsCore {
         let mut core = MipsCore::default();
         core.cp0_compare = 0x40;
-        std::thread::sleep(std::time::Duration::from_millis(3));
         // `materialize_count` memoizes per cycle count: a core that has never
         // executed has `hot.cycles == count_read_cycle == 0` and short-circuits
         // before materializing anything, so Count would stay 0 and no crossing
-        // could ever be detected. Make it look like it has run.
-        core.hot.cycles = 1;
+        // could ever be detected. Make it look like it has run: real time
+        // under the wall clock, retired cycles under `ci_clock` (~0.33 ticks
+        // per cycle at the default 33 MHz).
+        #[cfg(not(feature = "ci_clock"))]
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        #[cfg(not(feature = "ci_clock"))]
+        {
+            core.hot.cycles = 1;
+        }
+        #[cfg(feature = "ci_clock")]
+        {
+            core.hot.cycles = 100_000;
+        }
         core
+    }
+
+    /// Let enough time pass for Count to move the requested distance:
+    /// wall-clock time under the default build, retired cycles under
+    /// `ci_clock` (10 ns each).
+    fn advance_count(core: &mut MipsCore, count_ticks: u64) {
+        #[cfg(not(feature = "ci_clock"))]
+        {
+            let _ = count_ticks;
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            core.hot.cycles += 1; // see core_past_its_compare: let Count move
+        }
+        #[cfg(feature = "ci_clock")]
+        {
+            let ns = (count_ticks as u128 * 1_000_000_000) / core.count_hz as u128;
+            core.hot.cycles = core
+                .hot
+                .cycles
+                .saturating_add((ns as u64 / NS_PER_GUEST_CYCLE).max(1));
+        }
     }
 
     /// The ticket `schedule_compare_timer` arms its one-shot with is
@@ -2694,6 +2765,24 @@ mod ip7_ticket_tests {
             shared, core.ip7_seq,
             "the armed one-shot's ticket must be the live sequence"
         );
+    }
+
+    /// A snapshot restored into a core that has never run: its ticket is still
+    /// 0, the "already delivered" sentinel, so a one-shot armed with it could
+    /// never claim, and a guest that waits for that interrupt before writing
+    /// Compare again would stop for good. The restored deadline gets a live
+    /// ticket.
+    #[test]
+    fn a_deadline_restored_into_a_fresh_core_can_be_delivered() {
+        let mut core = MipsCore::default();
+        core.cp0_count = 0x1000;
+        core.cp0_compare = 0x2000;
+        core.restore_compare_deadline();
+        let shared = core.ip7_seq_shared.load(Ordering::SeqCst);
+        assert_ne!(shared, IP7_SEQ_CONSUMED, "the restored deadline was armed with the delivered sentinel");
+        assert_eq!(shared, core.ip7_seq, "the armed one-shot's ticket must be the live sequence");
+        assert!(claim_ip7(&core.ip7_seq_shared, core.ip7_seq, &core.hot.interrupts, &core.fasttick_count),
+            "the restored deadline's one-shot could not deliver IP7");
     }
 
     /// The overrun case still delivers -- suppressing the crossing must not
@@ -2744,8 +2833,7 @@ mod ip7_ticket_tests {
     fn a_missed_deadline_across_a_count_wrap_still_raises_ip7() {
         let mut core = core_past_its_compare();
         core.write_cp0(9, 0xFFFF_FF00);
-        std::thread::sleep(std::time::Duration::from_millis(3));
-        core.hot.cycles += 1; // see core_past_its_compare: let Count move
+        advance_count(&mut core, 1_000_000);
         let now = core.count_peek();
         assert!(now < 0x8000_0000, "Count should have wrapped by now: {now:#x}");
 
@@ -2755,5 +2843,120 @@ mod ip7_ticket_tests {
             core.hot.interrupts.load(Ordering::SeqCst) as u32 & CAUSE_IP7, 0,
             "a deadline between the last read and Count is owed across a wrap"
         );
+    }
+
+    /// With `count_write_samples`, a Count write is the reference a later
+    /// Compare is measured from: Count zeroed, a read long before it lying
+    /// between the target and the materialized Count, and the target passed
+    /// during a stall is still owed. Without it, the stale read hides it.
+    #[test]
+    fn a_count_write_opens_the_sample_window_when_asked() {
+        for samples in [false, true] {
+            let mut core = core_past_its_compare();
+            core.count_write_samples = samples;
+            core.count_last_guest_read = 1_200;
+            core.write_cp0(9, 0);
+            advance_count(&mut core, 1_000_000);
+            assert!(core.count_peek() > 1_200);
+            core.write_cp0(11, 1_000);
+            let ip7 = core.hot.interrupts.load(Ordering::SeqCst) as u32 & CAUSE_IP7 != 0;
+            assert_eq!(ip7, samples, "count_write_samples = {samples}");
+        }
+    }
+
+    /// The Octane's timer settings: Count at half the 195 MHz R10000 clock,
+    /// and a Count write opening the sample window.
+    #[cfg(not(feature = "ci_clock"))]
+    fn octane_core() -> MipsCore {
+        let mut core = MipsCore::default();
+        // A slow Count, so the host's own time between two statements (a
+        // loaded test machine can take microseconds) never carries Count
+        // past a target; `elapse_ticks` moves it explicitly.
+        core.set_count_hz(1_000);
+        core.count_write_samples = true;
+        core
+    }
+
+    /// Let Count advance `ticks` without sleeping: move the wall-clock
+    /// anchor back by that much time.
+    #[cfg(not(feature = "ci_clock"))]
+    fn elapse_ticks(core: &mut MipsCore, ticks: u64) {
+        let ns = (ticks as u128 * 1_000_000_000 / core.count_hz as u128) as u64 + 1;
+        core.count_anchor_instant -= std::time::Duration::from_nanos(ns);
+        core.hot.cycles += 1;
+    }
+
+    #[cfg(not(feature = "ci_clock"))]
+    fn ip7(core: &MipsCore) -> bool {
+        core.hot.interrupts.load(Ordering::SeqCst) as u32 & CAUSE_IP7 != 0
+    }
+
+    /// A Compare just before and just after the 32-bit wrap, with Count
+    /// carried across 0xffffffff in one materialization: the Count read
+    /// raises IP7, it does not wait for the next wrap.
+    #[cfg(not(feature = "ci_clock"))]
+    #[test]
+    fn octane_count_crossing_a_compare_across_the_wrap_raises_ip7() {
+        for compare in [0xFFFF_FFF0u32, 0x10] {
+            let mut core = octane_core();
+            core.write_cp0(9, 0xFFFF_FF00);
+            core.hot.cycles += 1;
+            core.write_cp0(11, compare as u64);
+            assert!(!ip7(&core), "compare {compare:#x} is still ahead");
+            elapse_ticks(&mut core, 0x200);
+            let count = core.read_cp0(9) as u32;
+            assert!(count >= 0x100 && count < 0x8000_0000, "Count should have wrapped: {count:#x}");
+            assert!(ip7(&core), "compare {compare:#x} was crossed across the wrap");
+        }
+    }
+
+    /// IRIX on the Octane writes Count and then, a few instructions later,
+    /// a Compare a short way ahead. A host stall between them that carries
+    /// Count past the target and across the wrap still delivers the tick.
+    #[cfg(not(feature = "ci_clock"))]
+    #[test]
+    fn octane_late_compare_after_a_count_write_across_the_wrap_raises_ip7() {
+        for compare in [0xFFFF_FFF0u32, 0x80] {
+            let mut core = octane_core();
+            core.write_cp0(9, 0xFFFF_FF00);
+            elapse_ticks(&mut core, 0x400);
+            core.write_cp0(11, compare as u64);
+            assert!(ip7(&core), "compare {compare:#x} written behind Count after a stall");
+        }
+    }
+
+    /// The other side of the rule: a target behind the sample, such as
+    /// IRIX's Count=1 then Compare=0 disarm when Count wrapped from just
+    /// below 2^32, stays a full-wrap wait.
+    #[cfg(not(feature = "ci_clock"))]
+    #[test]
+    fn octane_compare_behind_the_count_written_stays_clear_across_the_wrap() {
+        let mut core = octane_core();
+        core.write_cp0(9, 1);
+        elapse_ticks(&mut core, 0x400);
+        core.write_cp0(11, 0);
+        assert!(!ip7(&core), "Count=1 then Compare=0 is a disarm");
+
+        let mut core = octane_core();
+        core.write_cp0(9, 0x10);
+        elapse_ticks(&mut core, 0x400);
+        core.write_cp0(11, 0xFFFF_FFF0);
+        assert!(!ip7(&core), "a target behind the Count written is a full-wrap wait");
+    }
+
+    /// The one-shot armed across the wrap waits the short distance, not a
+    /// full wrap (about 44 s at 97.5 MHz).
+    #[test]
+    fn octane_one_shot_armed_across_the_wrap_waits_the_short_distance() {
+        let hz = 97_500_000;
+        // 0x1000 ticks past the wrap from 0x100 before it: 0x1100 ticks,
+        // about 45 us.
+        let ns = compare_delay_ns(0x1000, 0xFFFF_FF00, hz);
+        assert_eq!(ns, 0x1100u64 * 1_000_000_000 / hz);
+        assert!(ns < 1_000_000, "{ns} ns is not the short distance");
+        // A target equal to Count is a full wrap away, about 44 s.
+        assert_eq!(compare_delay_ns(5, 5, hz), (1u64 << 32) * 1_000_000_000 / hz);
+        // A target behind Count waits out the wrap.
+        assert!(compare_delay_ns(0x10, 0x20, hz) > 40_000_000_000);
     }
 }

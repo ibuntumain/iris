@@ -182,7 +182,7 @@ fn fifo_backpressure_never_duplicates_64bit_stores() {
     tp_init(g);
     g.wait_idle();
     // A 64-bit store into the FIFO is two command words: COLOR then its data.
-    while g.write64(GR2_BASE + FIFO_BASE + hq2::PUC_COLOR * 4, (5u64 << 32) | 5) == BUS_BUSY {}
+    while g.write64(GR2_BASE + (FIFO_BASE + hq2::PUC_COLOR * 4) as u64, (5u64 << 32) | 5) == BUS_BUSY {}
     cmd(g, hq2::PUC_PNT2I, 1);
     data(g, 1);
     g.wait_idle();

@@ -4,8 +4,10 @@
     tools/mon.py "mgras status" "rss regs"
 
 Each argument is one command; outputs are printed in order, separated by a
-"== cmd" header when there is more than one.
+"== cmd" header when there is more than one. Set IRIS_MON_PORT to reach an
+iris whose monitor_port is not 8888.
 """
+import os
 import re
 import socket
 import sys
@@ -37,7 +39,7 @@ def main():
     if not cmds:
         print(__doc__.strip())
         return 2
-    m = Monitor()
+    m = Monitor(port=int(os.environ.get("IRIS_MON_PORT", "8888")))
     for c in cmds:
         if len(cmds) > 1:
             print(f"== {c}")

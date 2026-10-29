@@ -13,7 +13,9 @@
 //! (`REX3_REPLAY_OUT=<dir>` saves the final framebuffers there,
 //! `REX3_REPLAY_TRACE=<file>` writes the annotated trace of the replay,
 //! `REX3_REPLAY_ENGINE=interp|jit` picks the draw path in `rex-jit` builds,
-//! `REX3_REPLAY_NOCHECK=1` skips the checkpoints).
+//! `REX3_REPLAY_NOCHECK=1` skips the checkpoints, `REX3_REPLAY_LIMIT=<n>`
+//! replays only the first n records, `REX3_REPLAY_STATE=<file>` writes the
+//! final register state as TOML).
 //!
 //! File: `REX3REC\0` + u32 version, then records, little-endian. Offsets are
 //! within the REX3's 8 KB window, GO bit (0x800) included:
@@ -588,7 +590,7 @@ pub(crate) mod tests {
     /// the board already (`board`).
     pub fn replay_recs(rex: &Rex3, recs: &[Rec], check_hashes: bool) -> Report {
         let mut rep = Report { records: recs.len(), ..Default::default() };
-        let addr = |off: u32| REX3_BASE | (off & (REX3_SIZE - 1));
+        let addr = |off: u32| (REX3_BASE | (off & (REX3_SIZE - 1))) as u64;
         let differ = |rep: &mut Report, off: u32| {
             rep.reads_differ += 1;
             *rep.differ_at.entry(off).or_default() += 1;
@@ -660,7 +662,11 @@ pub(crate) mod tests {
 
     /// Replay a recording file on a fresh board and check every checkpoint.
     pub fn replay(path: &str, png: Option<&str>) -> Result<(), String> {
-        let recs = load(path).map_err(|e| format!("{path}: {e}"))?;
+        let mut recs = load(path).map_err(|e| format!("{path}: {e}"))?;
+        // REX3_REPLAY_LIMIT=<n>: only the first n records (bisecting).
+        if let Some(n) = std::env::var("REX3_REPLAY_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+            recs.truncate(n);
+        }
         let jit = match std::env::var("REX3_REPLAY_ENGINE").as_deref() {
             Ok("interp") => false,
             Ok("jit") | Err(_) => true,
@@ -677,6 +683,15 @@ pub(crate) mod tests {
         rex.stop_trace();
         if let Some(p) = png {
             rex.save_framebuffers_named(std::path::Path::new(p), "replay").map_err(|e| format!("{p}: {e}"))?;
+        }
+        // REX3_REPLAY_STATE=<file>: the final register state as TOML, to diff
+        // two replays (engines, or before and after a change).
+        if let Ok(f) = std::env::var("REX3_REPLAY_STATE") {
+            let mut st = rex.save_state();
+            if let Some(t) = st.as_table_mut() {
+                t.insert("rec_extra".into(), rex.rec_extra());
+            }
+            std::fs::write(&f, toml::to_string(&st).unwrap_or_default()).map_err(|e| format!("{f}: {e}"))?;
         }
         let h = rex.rec_state_hash();
         rex.stop();

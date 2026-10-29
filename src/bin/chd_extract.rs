@@ -5,6 +5,9 @@
 use std::env;
 use std::io::Write;
 use std::process::exit;
+
+use iris::block_node::{BlockNode, ChdNode};
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
@@ -15,7 +18,7 @@ fn main() {
     let output = &args[2];
 
     // Extract reads through the merged view; COW off (no diff is created here).
-    let mut chd = match iris::chd_disk::ChdHd::open(input, false) {
+    let mut chd = match ChdNode::open(input, false) {
         Ok(c) => c,
         Err(e) => { eprintln!("open {}: {}", input, e); exit(1); }
     };
@@ -35,10 +38,10 @@ fn main() {
     let mut last_pct: u64 = 0;
     while lba < total_sectors {
         let n = std::cmp::min(CHUNK, total_sectors - lba);
-        let buf = match chd.read_blocks(lba, n as usize, sector_size) {
-            Ok(b) => b,
-            Err(e) => { eprintln!("read at lba {}: {}", lba, e); exit(1); }
-        };
+        let mut buf = vec![0u8; n as usize * sector_size as usize];
+        if let Err(e) = chd.read(lba * sector_size, &mut buf) {
+            eprintln!("read at lba {}: {}", lba, e); exit(1);
+        }
         if let Err(e) = out.write_all(&buf) {
             eprintln!("write at lba {}: {}", lba, e); exit(1);
         }

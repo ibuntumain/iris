@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 use crate::cpu::jitv2::Jitv2;
-use crate::physical::HIMEM_BASE;
+use crate::ip22_bus::HIMEM_BASE;
 use crate::traits::BusDevice;
 
 pub mod jitv2_html {
@@ -489,7 +489,7 @@ pub fn write_jitv2_html(
 
         let mut words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
         for (i, w) in words.iter_mut().enumerate() {
-            *w = bus.read32(phys_addr + (i as u32) * 4).data;
+            *w = bus.read32((phys_addr + (i as u32) * 4) as u64).data;
         }
 
         // §13: one function/gen/instr_count/code_size/call_count/

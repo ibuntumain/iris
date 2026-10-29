@@ -23,12 +23,7 @@ use crate::dev::saa7191::Saa7191;
 use crate::dev::cdmc::Cdmc;
 use crate::devlog::{LogModule, devlog_is_active};
 use crate::video_source::{VideoSource, Field, FieldParity};
-
-/// Interrupt callback — implemented by the machine glue to assert/deassert
-/// the VINO interrupt line on the IOC.  Keeps vino.rs free of IOC details.
-pub trait VinoIrq: Send + Sync {
-    fn set_interrupt(&self, active: bool);
-}
+use crate::irq::IrqLine;
 
 // ─── GIO64 mapping ──────────────────────────────────────────────────────────
 
@@ -357,7 +352,7 @@ impl DmaWake {
 #[derive(Clone)]
 pub struct Vino {
     state:   Arc<Mutex<VinoState>>,
-    irq:     Arc<Mutex<Option<Arc<dyn VinoIrq>>>>,
+    irq:     Arc<Mutex<Option<IrqLine>>>,
     sys_mem: Arc<Mutex<Option<Arc<dyn BusDevice>>>>,
     /// D0 / composite (SAA7191 path) — defaults to black field generator.
     source_d0: Arc<Mutex<Option<Arc<dyn VideoSource>>>>,
@@ -385,7 +380,9 @@ impl Vino {
     }
 
     /// Set the interrupt callback (called from machine setup after IOC is ready).
-    pub fn set_irq(&self, irq: Arc<dyn VinoIrq>) {
+    /// Wire the interrupt to `irq` (the IOC's video line on an Indy). Keeps
+    /// vino.rs free of IOC details.
+    pub fn set_irq(&self, irq: IrqLine) {
         *self.irq.lock() = Some(irq);
     }
 
@@ -422,7 +419,7 @@ impl Vino {
 
     // ── Interrupt assertion ───────────────────────────────────────────────
 
-    fn raise_interrupt(st: &mut VinoState, irq: &Option<Arc<dyn VinoIrq>>, new_status: u32) {
+    fn raise_interrupt(st: &mut VinoState, irq: &Option<IrqLine>, new_status: u32) {
         // Only bits enabled in CONTROL (shifted right by 1) appear in int_status.
         // ctrl bits [6:1] are the six enable bits; isr bits [5:0] are the six status bits.
         let enable_mask = (st.control >> 1) & isr::MASK;
@@ -432,11 +429,11 @@ impl Vino {
         let newly_raised = !old & st.int_status;
         if newly_raised != 0 {
             if let Some(irq) = irq {
-                irq.set_interrupt(true);
+                irq.set(true);
             }
         } else if st.int_status == 0 && old != 0 {
             if let Some(irq) = irq {
-                irq.set_interrupt(false);
+                irq.set(false);
             }
         }
     }
@@ -444,7 +441,7 @@ impl Vino {
     // ── Control register write ────────────────────────────────────────────
 
     /// Returns true if a DMA channel was just enabled (caller should notify wake).
-    fn control_w(st: &mut VinoState, irq: &Option<Arc<dyn VinoIrq>>, val: u32) -> bool {
+    fn control_w(st: &mut VinoState, irq: &Option<IrqLine>, val: u32) -> bool {
         let old = st.control;
         st.control = val & ctrl::MASK;
 
@@ -496,7 +493,7 @@ impl Vino {
 
     // ── Interrupt status write (write 0 to individual bits to clear) ──────
 
-    fn intr_status_w(st: &mut VinoState, irq: &Option<Arc<dyn VinoIrq>>, val: u32) {
+    fn intr_status_w(st: &mut VinoState, irq: &Option<IrqLine>, val: u32) {
         // A 0-bit in the written value clears the corresponding status bit.
         for bit in 0..6u32 {
             if val & (1 << bit) == 0 {
@@ -521,7 +518,7 @@ impl Vino {
     fn descriptor_fetch(chan: &mut ChannelState, addr: u32, mem: &Arc<dyn BusDevice>) {
         for i in 0..4usize {
             let word_addr = addr.wrapping_add((i as u32) * 4);
-            let word = { let _r = mem.read32(word_addr); if _r.is_ok() { _r.data } else {
+            let word = { let _r = mem.read32(word_addr as u64); if _r.is_ok() { _r.data } else {
                     eprintln!("VINO: descriptor_fetch read error at {:#010x}", word_addr);
                     0
                 }
@@ -630,7 +627,7 @@ impl Vino {
             // Deferring completion to the second field lets the kernel's parity go
             // odd and the frame deliver. Both fields still render their own rows
             // into the shared buffer; only the DESC interrupt is deferred.
-            // (Full derivation: rules/irix/vino-capture-on-6.5-progress.md cont.12.)
+            // (Full derivation: clanker/video/vino-capture-on-6.5-progress.md cont.12.)
             //
             // 5.3 GATE: IRIX 5.3 capture is EOF-driven and page-steps NEXT_4_DESC
             // per field, so it never reaches a STOP descriptor here — this branch
@@ -651,7 +648,7 @@ impl Vino {
         let write_addr = desc_base | (chan.page_index & 0x0FF8);
         drop(st);
 
-        mem.write64(write_addr, dword);
+        mem.write64(write_addr as u64, dword);
 
         let mut st = self.state.lock();
         let interleave = st.control & [ctrl::CHA_INTERLEAVE_EN, ctrl::CHB_INTERLEAVE_EN][ch] != 0;
@@ -1252,50 +1249,50 @@ impl BusDevice for Vino {
     // (`PANIC: KERNEL FAULT … Bad addr: 0xa0080016`). Routing
     // smaller-width accesses through read_reg keeps the bus quiet without
     // imposing semantics the real chip doesn't have.
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn read8(&self, addr: u64) -> BusRead8 {
         let aligned = addr & !3;
         let shift = (3 - (addr & 3)) * 8;
-        let w = self.read_reg(aligned.wrapping_sub(VINO_BASE));
+        let w = self.read_reg(aligned.wrapping_sub(VINO_BASE as u64) as u32);
         BusRead8::ok(((w >> shift) & 0xFF) as u8)
     }
 
-    fn read16(&self, addr: u32) -> BusRead16 {
+    fn read16(&self, addr: u64) -> BusRead16 {
         let aligned = addr & !3;
         let shift = (2 - (addr & 2)) * 8;
-        let w = self.read_reg(aligned.wrapping_sub(VINO_BASE));
+        let w = self.read_reg(aligned.wrapping_sub(VINO_BASE as u64) as u32);
         BusRead16::ok(((w >> shift) & 0xFFFF) as u16)
     }
 
-    fn write8(&self, _addr: u32, _val: u8) -> u32 {
+    fn write8(&self, _addr: u64, _val: u8) -> u32 {
         // Sub-word writes to MMIO registers are atypical; quietly accept
         // them so the kernel doesn't panic. No partial-register update is
         // performed — full-register semantics is what the driver expects.
         BUS_OK
     }
 
-    fn write16(&self, _addr: u32, _val: u16) -> u32 {
+    fn write16(&self, _addr: u64, _val: u16) -> u32 {
         BUS_OK
     }
 
-    fn read32(&self, addr: u32) -> BusRead32 {
-        let offset = addr.wrapping_sub(VINO_BASE);
+    fn read32(&self, addr: u64) -> BusRead32 {
+        let offset = addr.wrapping_sub(VINO_BASE as u64) as u32;
         BusRead32::ok(self.read_reg(offset))
     }
 
-    fn write32(&self, addr: u32, val: u32) -> u32 {
-        let offset = addr.wrapping_sub(VINO_BASE);
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        let offset = addr.wrapping_sub(VINO_BASE as u64) as u32;
         self.write_reg(offset, val);
         BUS_OK
     }
 
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn read64(&self, addr: u64) -> BusRead64 {
         // GIO64 double-word: high word at addr, low word at addr+4.
         let hi = { let _r = self.read32(addr); if _r.is_ok() { let v = _r.data; v } else { 0 } };
         let lo = { let _r = self.read32(addr + 4); if _r.is_ok() { let v = _r.data; v } else { 0 } };
         BusRead64::ok(((hi as u64) << 32) | lo as u64)
     }
 
-    fn write64(&self, addr: u32, val: u64) -> u32 {
+    fn write64(&self, addr: u64, val: u64) -> u32 {
         self.write32(addr,     (val >> 32) as u32);
         self.write32(addr + 4, val as u32);
         BUS_OK
@@ -1515,8 +1512,8 @@ mod tests {
         fn dword_count(&self) -> usize { self.writes.lock().len() }
     }
     impl BusDevice for MockMem {
-        fn write64(&self, addr: u32, val: u64) -> u32 {
-            self.writes.lock().push((addr, val));
+        fn write64(&self, addr: u64, val: u64) -> u32 {
+            self.writes.lock().push((addr as u32, val));
             BUS_OK
         }
     }

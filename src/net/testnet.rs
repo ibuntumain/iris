@@ -33,11 +33,14 @@ pub struct TestNet {
     pub inbox: VecDeque<Vec<u8>>,
     /// The NIC side's "frames sent" signal.
     pub tx_wake: Arc<super::Wake>,
+    /// The NIC side of the guest-to-engine ring, for tests that need frames
+    /// to arrive the way the enet thread delivers them (see `send_via_nic`).
+    tx: rtrb::Producer<Vec<u8>>,
 }
 
 impl TestNet {
     pub fn new(config: GatewayConfig) -> Self {
-        let (_tx_prod, tx_cons) = rtrb::RingBuffer::new(16);
+        let (tx, tx_cons) = rtrb::RingBuffer::new(16);
         let (rx_prod, rx) = rtrb::RingBuffer::new(4096);
         let tx_wake = super::Wake::new();
         let e = NatEngine::new(
@@ -48,7 +51,7 @@ impl TestNet {
             NatControl::new(),
         );
         let (guest_ip, gw_ip, gw_mac) = (e.config.client_ip, e.config.gateway_ip, e.config.gateway_mac);
-        Self { e, rx, guest_ip, gw_ip, gw_mac, ip_id: 1, inbox: VecDeque::new(), tx_wake }
+        Self { e, rx, guest_ip, gw_ip, gw_mac, ip_id: 1, inbox: VecDeque::new(), tx_wake, tx }
     }
 
     pub fn default() -> Self {
@@ -68,6 +71,25 @@ impl TestNet {
     /// Hand a guest frame to the engine.
     pub fn send(&mut self, frame: Vec<u8>) {
         self.e.process(&frame);
+    }
+
+    /// Put a guest frame on the NIC ring and signal, as the enet thread does.
+    /// Unlike `send`, the engine meets it inside `step`, so its replies take
+    /// the held path (`next_pass`) the real guest sees.
+    pub fn send_via_nic(&mut self, frame: Vec<u8>) {
+        self.tx.push(frame).expect("NIC ring full");
+        self.tx_wake.notify();
+    }
+
+    /// One pass of the engine as its own thread runs it: wait as long as the
+    /// engine asks, then step. Collects what it sent, like `pump`.
+    pub fn run_pass(&mut self) {
+        let wait = self.e.idle_timeout();
+        self.e.step(wait);
+        while let Ok(f) = self.rx.pop() {
+            check_frame(&f, &self.gw_mac);
+            self.inbox.push_back(f);
+        }
     }
 
     /// Run one engine pass and move everything it sent into the inbox,
@@ -542,6 +564,8 @@ fn udp_echo_host() -> (u16, thread::JoinHandle<()>) {
     let s = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = s.local_addr().unwrap().port();
     s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    // The echo must send back what the engine relayed, 20 KB included.
+    super::nat_udp::allow_large_datagrams(&s);
     let h = thread::spawn(move || {
         let mut buf = vec![0u8; 65536];
         while let Ok((n, from)) = s.recv_from(&mut buf) {
@@ -1200,6 +1224,61 @@ fn silent_dns_upstream_does_not_stall_the_engine() {
     assert!(silent.recv_from(&mut buf).is_ok(), "the query still reached the upstream");
 }
 
+/// Replies to guest frames are held briefly (see `step`), but the hold must
+/// not cost a whole poll tick: lock-step TFTP paid that once per 512-byte
+/// block, capping it near 450 KB/s on Linux and 30 KB/s on Windows.
+#[test]
+fn tftp_blocks_are_not_paced_by_the_poll_tick() {
+    const BLOCKS: usize = 300;
+    let root = tmp_dir("tftp-pace");
+    let data = pattern(BLOCKS * 512 + 100);
+    std::fs::write(root.join("big"), &data).unwrap();
+    let mut net = TestNet::new(GatewayConfig { tftp_dir: Some(root.clone()), ..GatewayConfig::default() });
+    let gw = net.gw_ip;
+
+    // DATA for `block`, in order, run the way the engine thread runs.
+    let next_data = |net: &mut TestNet, block: u16| -> Vec<u8> {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let hit = net.inbox.iter().position(|f| {
+                let Some(u) = Ether::parse(f).and_then(|e| e.ipv4()).and_then(|i| i.udp()) else { return false };
+                u.dport() == 4270 && u.payload().get(..4) == Some(&[0, 3, (block >> 8) as u8, block as u8][..])
+            });
+            if let Some(i) = hit {
+                let f = net.inbox.remove(i).unwrap();
+                let u = Ether::parse(&f).unwrap().ipv4().unwrap().udp().unwrap().payload().to_vec();
+                return u;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for DATA {}", block);
+            net.run_pass();
+        }
+    };
+
+    let id = net.next_id();
+    let f = net.route_to(gw).udp(id, 4270, 69, b"\x00\x01big\x00octet\x00");
+    net.send_via_nic(f);
+    let mut got = next_data(&mut net, 1)[4..].to_vec();
+
+    let start = Instant::now();
+    for block in 1..=BLOCKS as u16 {
+        let id = net.next_id();
+        let f = net.route_to(gw).udp(id, 4270, 69, &[0, 4, (block >> 8) as u8, block as u8]);
+        net.send_via_nic(f);
+        if block == 1 {
+            // The reply is held, and the engine asks to come back for it at once.
+            net.run_pass();
+            assert_eq!(net.e.idle_timeout(), super::engine::REPLY_HOLD);
+        }
+        got.extend_from_slice(&next_data(&mut net, block + 1)[4..]);
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(got, data);
+    // The old 1 ms tick made this at least BLOCKS ms by construction.
+    assert!(elapsed < Duration::from_millis(BLOCKS as u64),
+            "{} blocks took {:?}: replies are waiting for the poll tick", BLOCKS, elapsed);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn tftp_retransmits_through_the_service_timer() {
     let root = tmp_dir("tftp-rtx");
@@ -1270,4 +1349,119 @@ fn engine_wakes_for_host_data() {
     let f = net.route_to(gw).udp(id, 52001, port, b"quit");
     net.send(f);
     h.join().unwrap();
+}
+
+// ── Built-in rsh ─────────────────────────────────────────────────────────────
+
+fn rsh_config(root: &std::path::Path) -> GatewayConfig {
+    GatewayConfig { rsh_dir: Some(root.to_path_buf()), ..GatewayConfig::default() }
+}
+
+/// The gateway's connection back to the guest, answered as `rcmd` would: a
+/// guest listening on `port`.
+fn accept_side_connection(net: &mut TestNet, port: u16) -> GuestTcp {
+    let (gw, guest) = (net.gw_ip, net.guest_ip);
+    let syn = net.wait_for("stderr SYN", |f| {
+        tcp_of(f).is_some_and(|t| t.flags() == TcpFlags::SYN && t.dport() == port)
+    });
+    let ip = Ether::parse(&syn).unwrap().ipv4().unwrap();
+    let t = ip.tcp().unwrap();
+    assert_eq!((ip.src(), ip.dst()), (gw, guest));
+    assert!((512..=1023).contains(&t.sport()), "rcmd refuses a stderr connection from port {}", t.sport());
+    let mut c = GuestTcp { sport: port, dst: gw, dport: t.sport(), snd_una: 7000, snd_nxt: 7001,
+                           rcv_nxt: t.seq().wrapping_add(1), window: 65535, peer_window: t.window() as u32,
+                           peer_mss: t.mss(), received: Vec::new(), peer_fin: false, reset: false };
+    c.seg(net, TcpFlags::SYN_ACK, 7000, &[]);
+    c
+}
+
+/// `rsh gateway cat ...` as BSD `rcmd` speaks it: a request from a reserved
+/// port naming a stderr port, then the gateway connects back to that port.
+#[test]
+fn rsh_cat_with_a_stderr_connection() {
+    let root = tmp_dir("rsh");
+    let data = pattern(70_000);
+    std::fs::write(root.join("hello.txt"), &data).unwrap();
+    let mut net = TestNet::new(rsh_config(&root));
+    let gw = net.gw_ip;
+    let (mut out, flags) = GuestTcp::connect(&mut net, gw, 514, 1023);
+    assert!(flags.syn(), "the gateway answers on 514");
+    // rcmd sends the port alone and waits for the connection back before it
+    // sends the user names and the command.
+    out.send_all(&mut net, b"5000\0");
+    let mut err = accept_side_connection(&mut net, 5000);
+    out.send_all(&mut net, b"guest\0root\0cat /hello.txt nope ../hello.txt\0");
+
+    let want_err = b"cat: nope: No such file or directory\ncat: ../hello.txt: Permission denied\n";
+    out.recv(&mut net, Some(1 + data.len()));
+    err.recv(&mut net, Some(want_err.len()));
+    assert_eq!(out.received[0], 0, "accepted");
+    assert_eq!(&out.received[1..], &data[..]);
+    assert_eq!(err.received, want_err);
+    // Both connections end with the gateway's FIN.
+    out.recv(&mut net, None);
+    err.recv(&mut net, None);
+    assert_eq!(out.received.len(), 1 + data.len(), "nothing after the file");
+    out.close(&mut net);
+    err.close(&mut net);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A client that wants no stderr connection gets none, and its errors come
+/// down the main connection.
+#[test]
+fn rsh_without_a_stderr_port() {
+    let root = tmp_dir("rsh0");
+    std::fs::write(root.join("a"), b"A").unwrap();
+    let mut net = TestNet::new(rsh_config(&root));
+    let gw = net.gw_ip;
+    let (mut c, _) = GuestTcp::connect(&mut net, gw, 514, 1022);
+    c.send_all(&mut net, b"0\0guest\0guest\0ls\0");
+    c.recv(&mut net, None);
+    assert_eq!(c.received, b"\0a\n");
+    net.settle(Duration::from_millis(50));
+    assert!(!net.inbox.iter().any(|f| tcp_of(f).is_some_and(|t| t.flags() == TcpFlags::SYN)),
+            "no connection back to the guest");
+    c.close(&mut net);
+
+    let (mut c, _) = GuestTcp::connect(&mut net, gw, 514, 1021);
+    c.send_all(&mut net, b"0\0guest\0guest\0cat /missing\0");
+    c.recv(&mut net, None);
+    assert_eq!(c.received, b"\0cat: /missing: No such file or directory\n");
+    c.close(&mut net);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The request may be split across segments, and a client with a small
+/// window still receives the whole file.
+#[test]
+fn rsh_survives_a_split_request_and_a_small_window() {
+    let root = tmp_dir("rshwin");
+    let data = pattern(40_000);
+    std::fs::write(root.join("f"), &data).unwrap();
+    let mut net = TestNet::new(rsh_config(&root));
+    let gw = net.gw_ip;
+    let (mut c, _) = GuestTcp::connect_win(&mut net, gw, 514, 1020, 2048);
+    c.send_all(&mut net, b"0\0gu");
+    c.send_all(&mut net, b"est\0guest\0cat f");
+    c.send_all(&mut net, b"\0");
+    c.recv(&mut net, None);
+    assert_eq!(c.received[0], 0);
+    assert_eq!(&c.received[1..], &data[..]);
+    c.close(&mut net);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A bad request is refused the way rshd does: a 1 byte, the reason, a newline.
+#[test]
+fn rsh_refuses_a_malformed_request() {
+    let root = tmp_dir("rshbad");
+    let mut net = TestNet::new(rsh_config(&root));
+    let gw = net.gw_ip;
+    let (mut c, _) = GuestTcp::connect(&mut net, gw, 514, 1019);
+    c.send_all(&mut net, b"not-a-port\0x\0y\0pwd\0");
+    c.recv(&mut net, None);
+    assert_eq!(c.received, b"\x01rshd: protocol failure in circuit setup\n");
+    c.close(&mut net);
+    let _ = std::fs::remove_dir_all(&root);
 }

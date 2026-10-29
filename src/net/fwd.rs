@@ -51,6 +51,7 @@ pub(super) fn bind_forwards(rules: &[PortForwardConfig]) -> (Vec<TcpFwdListener>
             ForwardProto::Udp => match UdpSocket::bind(addr) {
                 Ok(sock) => {
                     let _ = sock.set_nonblocking(true);
+                    super::nat_udp::allow_large_datagrams(&sock);
                     eprintln!("iris: UDP port forward {}:{} → guest:{}", bind_addr, rule.host_port, rule.guest_port);
                     udp.push(UdpFwdListener { sock, guest_port: rule.guest_port, host_port: rule.host_port,
                                               last_sender: None });
@@ -92,7 +93,13 @@ impl NatEngine {
     /// 49152..=65535. Probing past ports in use keeps a wrapped counter from
     /// overwriting a live entry. None if the range is exhausted.
     fn alloc_fwd_sport(&mut self, guest_port: u16) -> Option<u16> {
-        let reserved = matches!(guest_port, 513 | 514);
+        self.alloc_sport(guest_port, matches!(guest_port, 513 | 514))
+    }
+
+    /// `alloc_fwd_sport` with the range chosen by the caller: the gateway's own
+    /// connections back to the guest (rsh's stderr channel) must come from a
+    /// reserved port whatever port the guest listens on.
+    pub(super) fn alloc_sport(&mut self, guest_port: u16, reserved: bool) -> Option<u16> {
         let (lo, hi) = if reserved { (512u16, 1023u16) } else { (49152u16, 65535u16) };
         let gw = u32::from(self.config.gateway_ip);
         let mut cur = if reserved { self.fwd_reserved_next } else { self.fwd_ephemeral_next };

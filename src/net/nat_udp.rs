@@ -19,6 +19,14 @@ use crate::devlog::LogModule;
 
 const UDP_IDLE: Duration = Duration::from_secs(60);
 
+/// Let `sock` send any datagram the guest can send (up to 64 KB, reassembled
+/// from fragments). macOS refuses a datagram larger than the socket's send
+/// buffer with EMSGSIZE, and that buffer defaults to 9216 bytes
+/// (`net.inet.udp.maxdgram`); Linux and Windows already allow 64 KB.
+pub(super) fn allow_large_datagrams(sock: &UdpSocket) {
+    let _ = socket2::SockRef::from(sock).set_send_buffer_size(65_535);
+}
+
 /// Guest UDP endpoint: (guest IP, guest port).
 pub(super) type UdpKey = (u32, u16);
 
@@ -60,6 +68,14 @@ impl NatEngine {
             _ if to_gw && self.udp_service_ports.contains_key(&dport) =>
                 self.udp_service(src_mac, src_ip, sport, dport, payload),
             _ => {
+                // A read request that is not ours: say where it goes, since
+                // "no TFTP trace" otherwise looks the same as "no request".
+                if dport == super::services::TFTP_PORT && payload.starts_with(&[0, 1]) && super::tftp::trace_enabled() {
+                    eprintln!("iris: tftp: guest {}:{} -> {}:{} read request {}",
+                              src_ip, sport, dst_ip, dport,
+                              if to_gw { "relayed to the host's port 69: tftp_dir is not set" }
+                              else { "relayed to that address: it is not the gateway" });
+                }
                 let (ip, port) = self.gateway_to_host(dst_ip, dport);
                 self.udp_relay(src_mac, src_ip, sport, visible, SocketAddrV4::new(ip, port), payload);
             }
@@ -77,6 +93,7 @@ impl NatEngine {
                 return;
             };
             let _ = sock.set_nonblocking(true);
+            allow_large_datagrams(&sock);
             dlog_dev!(LogModule::Net, "NAT UDP new flow guest {}:{} via host {:?}", src_ip, sport, sock.local_addr());
             self.udp_nat.insert(key, NatUdpEntry { sock, client_mac, aliases: HashMap::new(),
                                                    last_dst: visible, last_use: Instant::now() });
@@ -89,7 +106,9 @@ impl NatEngine {
         entry.last_dst = visible;
         entry.last_use = Instant::now();
         dlog_dev!(LogModule::Net, "NAT UDP {}:{} → {} (as {}) len={}", src_ip, sport, real, visible, payload.len());
-        let _ = entry.sock.send_to(payload, real);
+        if let Err(e) = entry.sock.send_to(payload, real) {
+            dlog_dev!(LogModule::Net, "NAT UDP {}:{} → {}: send of {} bytes failed: {}", src_ip, sport, real, payload.len(), e);
+        }
     }
 
     pub(super) fn poll_udp(&mut self) {

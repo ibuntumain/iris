@@ -302,7 +302,7 @@ impl Table {
 /// graphics, no audio.
 pub fn bench_config(banks: [u32; 4], cpu: CpuModel) -> MachineConfig {
     let mut cfg = MachineConfig {
-        banks,
+        banks: crate::config::banks_from4(banks),
         headless: true,
         no_audio: true,
         ..Default::default()

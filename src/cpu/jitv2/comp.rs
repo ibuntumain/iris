@@ -1,4 +1,4 @@
-//! JIT v2 compiler-thread logic. See `rules/jitv2/jit-v2-design.md`.
+//! JIT v2 compiler-thread logic. See `clanker/jitv2/jit-v2-design.md`.
 //!
 //! `handle_request` is the compile-from-snapshot protocol (§6.5): read the
 //! page's 4KB snapshot off the bus, bounded-walk it from the requested
@@ -166,7 +166,7 @@ fn prepare_multi_entry_compile(
         let gen0 = page.current_gen();
         let mut read_ok = true;
         for (i, w) in words.iter_mut().enumerate() {
-            let r = bus.read32(phys_base + (i as u32) * 4);
+            let r = bus.read32((phys_base + (i as u32) * 4) as u64);
             if !r.is_ok() {
                 read_ok = false;
                 break;
@@ -888,17 +888,17 @@ mod tests {
     /// without needing a real memory device.
     struct AddiuDevice;
     impl BusDevice for AddiuDevice {
-        fn read8(&self, _addr: u32) -> BusRead8 { BusRead8::err() }
-        fn write8(&self, _addr: u32, _val: u8) -> u32 { BUS_ERR }
-        fn read16(&self, _addr: u32) -> BusRead16 { BusRead16::err() }
-        fn write16(&self, _addr: u32, _val: u16) -> u32 { BUS_ERR }
-        fn read32(&self, _addr: u32) -> BusRead32 {
+        fn read8(&self, _addr: u64) -> BusRead8 { BusRead8::err() }
+        fn write8(&self, _addr: u64, _val: u8) -> u32 { BUS_ERR }
+        fn read16(&self, _addr: u64) -> BusRead16 { BusRead16::err() }
+        fn write16(&self, _addr: u64, _val: u16) -> u32 { BUS_ERR }
+        fn read32(&self, _addr: u64) -> BusRead32 {
             BusRead32::ok((OP_ADDIU << 26) | (1 << 16) | 1)
         }
-        fn write32(&self, _addr: u32, _val: u32) -> u32 { BUS_ERR }
-        fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::err() }
-        fn write64(&self, _addr: u32, _val: u64) -> u32 { BUS_ERR }
-        fn gen_ptr(&self, _addr: u32) -> *const AtomicU64 { std::ptr::null() }
+        fn write32(&self, _addr: u64, _val: u32) -> u32 { BUS_ERR }
+        fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
+        fn write64(&self, _addr: u64, _val: u64) -> u32 { BUS_ERR }
+        fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { std::ptr::null() }
     }
 
     /// Every word decodes as the JIT region-boundary sentinel — a genuine
@@ -910,30 +910,30 @@ mod tests {
     /// now the only thing that reliably yields an empty region.)
     struct BoundaryDevice;
     impl BusDevice for BoundaryDevice {
-        fn read8(&self, _addr: u32) -> BusRead8 { BusRead8::err() }
-        fn write8(&self, _addr: u32, _val: u8) -> u32 { BUS_ERR }
-        fn read16(&self, _addr: u32) -> BusRead16 { BusRead16::err() }
-        fn write16(&self, _addr: u32, _val: u16) -> u32 { BUS_ERR }
-        fn read32(&self, _addr: u32) -> BusRead32 {
+        fn read8(&self, _addr: u64) -> BusRead8 { BusRead8::err() }
+        fn write8(&self, _addr: u64, _val: u8) -> u32 { BUS_ERR }
+        fn read16(&self, _addr: u64) -> BusRead16 { BusRead16::err() }
+        fn write16(&self, _addr: u64, _val: u16) -> u32 { BUS_ERR }
+        fn read32(&self, _addr: u64) -> BusRead32 {
             BusRead32::ok(crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL)
         }
-        fn write32(&self, _addr: u32, _val: u32) -> u32 { BUS_ERR }
-        fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::err() }
-        fn write64(&self, _addr: u32, _val: u64) -> u32 { BUS_ERR }
-        fn gen_ptr(&self, _addr: u32) -> *const AtomicU64 { std::ptr::null() }
+        fn write32(&self, _addr: u64, _val: u32) -> u32 { BUS_ERR }
+        fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
+        fn write64(&self, _addr: u64, _val: u64) -> u32 { BUS_ERR }
+        fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { std::ptr::null() }
     }
 
     struct ErrDevice;
     impl BusDevice for ErrDevice {
-        fn read8(&self, _addr: u32) -> BusRead8 { BusRead8::err() }
-        fn write8(&self, _addr: u32, _val: u8) -> u32 { BUS_ERR }
-        fn read16(&self, _addr: u32) -> BusRead16 { BusRead16::err() }
-        fn write16(&self, _addr: u32, _val: u16) -> u32 { BUS_ERR }
-        fn read32(&self, _addr: u32) -> BusRead32 { BusRead32::err() }
-        fn write32(&self, _addr: u32, _val: u32) -> u32 { BUS_ERR }
-        fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::err() }
-        fn write64(&self, _addr: u32, _val: u64) -> u32 { BUS_ERR }
-        fn gen_ptr(&self, _addr: u32) -> *const AtomicU64 { std::ptr::null() }
+        fn read8(&self, _addr: u64) -> BusRead8 { BusRead8::err() }
+        fn write8(&self, _addr: u64, _val: u8) -> u32 { BUS_ERR }
+        fn read16(&self, _addr: u64) -> BusRead16 { BusRead16::err() }
+        fn write16(&self, _addr: u64, _val: u16) -> u32 { BUS_ERR }
+        fn read32(&self, _addr: u64) -> BusRead32 { BusRead32::err() }
+        fn write32(&self, _addr: u64, _val: u32) -> u32 { BUS_ERR }
+        fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::err() }
+        fn write64(&self, _addr: u64, _val: u64) -> u32 { BUS_ERR }
+        fn gen_ptr(&self, _addr: u64) -> *const AtomicU64 { std::ptr::null() }
     }
 
     #[test]

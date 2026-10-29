@@ -6,20 +6,16 @@ use std::net::TcpStream;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::config::{GraphicsBoard, MachineConfig, MachineProfile, NetworkConfig};
+use crate::config::{GraphicsBoard, MachineConfig, MachineProfile, NetworkConfig, ScsiDeviceConfig};
+use crate::machine_state::GuestState;
 use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::locks::LockMonitor;
 use crate::dev::eeprom_93c56::Eeprom93c56;
 use crate::physical::Physical;
+use crate::ip22_bus::{Ip22Bus, Ip22Devices};
 
 // Helper for passing *mut Physical into a Send+Sync closure (MEMCFG callback).
 // Safety: Physical is Send+Sync, and the Arc keeps it alive for the callback's lifetime.
-struct PhysPtr(*mut Physical);
-unsafe impl Send for PhysPtr {}
-unsafe impl Sync for PhysPtr {}
-impl PhysPtr {
-    fn get(&self) -> *mut Physical { self.0 }
-}
 use crate::physical::RamBank;
 use crate::dev::prom::Prom;
 use crate::dev::mc::MemoryController;
@@ -39,34 +35,76 @@ use crate::dev::ng1::rex3::Rex3;
 use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRef, enabled_features};
 use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks};
 use crate::hptimer::TimerManager;
+use crate::workstation::{MachineRef, MachineSlot, SystemController, Workstation};
 
-pub fn emulator_name() -> &'static str {
-    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    NAME.get_or_init(|| {
+/// The profile of the machine this process is running, set by
+/// [`crate::workstation::build`] so [`emulator_name`] can pick a model word
+/// that matches it. Stored as the `MachineProfile` discriminant; `u8::MAX`
+/// means no machine has been built yet.
+static EMULATOR_PROFILE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Record the profile of the machine being built (see [`emulator_name`]).
+pub fn set_emulator_profile(profile: MachineProfile) {
+    EMULATOR_PROFILE.store(profile as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn emulator_profile() -> Option<MachineProfile> {
+    let raw = EMULATOR_PROFILE.load(std::sync::atomic::Ordering::Relaxed);
+    [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30]
+        .into_iter().find(|p| *p as u8 == raw)
+}
+
+/// The words an `I` in the expansion may stand for, per machine. Each list
+/// names the machine as the user configured it, so the title never calls an
+/// Indigo2 an Indy or an O2 anything but IP32. Without a profile only the
+/// model-neutral words remain.
+fn emulator_name_thirds(profile: Option<MachineProfile>) -> &'static [&'static str] {
+    match profile {
+        Some(MachineProfile::IndyIp24) => &["IRIX", "Iris", "Indy", "IP24"],
+        Some(MachineProfile::Indigo2Ip22) => &["IRIX", "Iris", "Indigo2", "IP22"],
+        Some(MachineProfile::Indigo2Ip28) => &["IRIX", "Iris", "Indigo2", "IP28"],
+        Some(MachineProfile::O2Ip32) => &["IRIX", "Iris", "IP32"],
+        Some(MachineProfile::OctaneIp30) => &["IRIX", "Iris", "IP30"],
+        None => &["IRIX", "Iris"],
+    }
+}
+
+/// The emulator's name for banners and window titles. Three runs in four it
+/// is the canonical one; otherwise an expansion of IRIS rolled once per
+/// process, whose third word is chosen to match the machine profile that
+/// `set_emulator_profile` recorded (so a GUI that starts a different machine
+/// later gets the same roll with the right model word).
+pub fn emulator_name() -> String {
+    /// `None` for the canonical name, else the roll (first, third, fourth).
+    static ROLL: std::sync::OnceLock<Option<(usize, u64, usize)>> = std::sync::OnceLock::new();
+    const FIRSTS: [&str; 9] = ["Irresponsible", "Incredible", "Insufferable", "Infuriating", "Inaccurate", "Incomplete", "Interactive", "Indomitable", "Irresistible"];
+    const FOURTHS: [&str; 4] = ["Simulator", "System", "Substitute", "Sandbox"];
+
+    let roll = ROLL.get_or_init(|| {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-
         if now % 4 != 0 {
-            return "Irresponsible Rust IRIX Simulator".to_string();
+            return None;
         }
+        Some((((now / 4) % FIRSTS.len() as u64) as usize, now / 64, ((now / 256) % FOURTHS.len() as u64) as usize))
+    });
 
-        let firsts = ["Irresponsible", "Incredible", "Insufferable", "Infuriating", "Inaccurate", "Incomplete", "Interactive", "Indomitable", "Irresistible"];
-        let thirds = ["IRIX", "Indy", "Iris"];
-        let fourths = ["Simulator", "System", "Substitute", "Sandbox"];
-
-        let first = firsts[((now / 4) % firsts.len() as u64) as usize];
-        let third = thirds[((now / 64) % thirds.len() as u64) as usize];
-        let fourth = fourths[((now / 256) % fourths.len() as u64) as usize];
-
-        format!("{} Rust {} {}", first, third, fourth)
-    }).as_str()
+    match *roll {
+        None => "Irresponsible Rust IRIX Simulator".to_string(),
+        Some((first, third_roll, fourth)) => {
+            let thirds = emulator_name_thirds(emulator_profile());
+            let third = thirds[(third_roll % thirds.len() as u64) as usize];
+            format!("{} Rust {} {}", FIRSTS[first], third, FOURTHS[fourth])
+        }
+    }
 }
 
 pub struct Machine {
     cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice>,
-    _phys: Arc<Physical>, // Keep reference to Physical Bus
+    /// The physical bus and the Indy's or Indigo2's devices on it.
+    board: Arc<Ip22Bus>,
     mc: MemoryController,
     hpc3: Hpc3,
     monitor: Arc<Monitor>,
@@ -79,6 +117,9 @@ pub struct Machine {
     /// When `cfg.ci` is set, the channel-A backend is replaced by this
     /// in-process one so the CI control socket can drive the console.
     ci_serial: Option<Arc<crate::dev::z85c30::CiSerialBackend>>,
+    /// The shared `--serial-log` sink, kept so `stop` can flush a final
+    /// partial line (wall-timestamp mode holds one until its newline).
+    serial_log: Option<Arc<crate::dev::serial_log::SerialLog>>,
     /// Most recent snapshot restored via `ci_restore`. `rollback` reuses this
     /// name as the fallback path if the in-memory checkpoint is absent.
     last_restore: Option<String>,
@@ -112,6 +153,11 @@ pub struct Machine {
     /// instead of freed memory.
     controller_slot: Option<MachineSlot>,
     controller_registered: bool,
+    /// Where the machine is in its start/stop lifecycle. Never `Running`:
+    /// `status` derives that from the CPU's own running flag, so an
+    /// execution-control command cannot leave it stale. See
+    /// [`crate::machine_state`].
+    lifecycle: GuestState,
 }
 
 /// In-memory snapshot of the just-restored guest state. Populated at the end
@@ -159,7 +205,7 @@ struct RollbackCheckpoint {
 /// capture and snapshot load so the two paths can't drift.
 /// Inverse of `parse_cow_table`: build a `{"scsi<id>": [dirty sectors...]}`
 /// table from `export_overlays`'s output.
-fn build_cow_table(overlays: Vec<(usize, Vec<u64>)>) -> toml::Value {
+pub(crate) fn build_cow_table(overlays: Vec<(usize, Vec<u64>)>) -> toml::Value {
     let mut tbl = toml::map::Map::new();
     for (id, dirty) in overlays {
         let arr: Vec<toml::Value> = dirty.into_iter().map(|v| toml::Value::Integer(v as i64)).collect();
@@ -168,7 +214,7 @@ fn build_cow_table(overlays: Vec<(usize, Vec<u64>)>) -> toml::Value {
     toml::Value::Table(tbl)
 }
 
-fn parse_cow_table(cow_toml: &toml::Value) -> Vec<(usize, Vec<u64>)> {
+pub(crate) fn parse_cow_table(cow_toml: &toml::Value) -> Vec<(usize, Vec<u64>)> {
     let mut sets = Vec::new();
     if let Some(tbl) = cow_toml.as_table() {
         for (k, v) in tbl {
@@ -265,7 +311,7 @@ impl Machine {
         #[cfg(feature = "jitv2")]
         let jitv2_threads = cfg.jitv2.threads;
         let display_resolution = cfg.graphics.resolution;
-        let newport_active = !cfg.headless && cfg.graphics.board == GraphicsBoard::Newport;
+        let newport_active = !cfg.headless && cfg.graphics_board() == GraphicsBoard::Newport;
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
         let clock_fixed_mhz = cfg.clock.fixed_mhz;
         let cfg_cpu_model = cfg.machine.cpu;
@@ -297,8 +343,9 @@ impl Machine {
 
         // 1. Create all devices first
         // Memory Controller
+        let mc_banks: [u32; 4] = cfg.banks[..4].try_into().expect("the MC has four banks");
         let mc = MemoryController::new_for_profile(
-            eeprom_mc.clone(), guinness, cfg.banks, cfg.machine.profile.ip28());
+            eeprom_mc.clone(), guinness, mc_banks, cfg.machine.profile.ip28());
         // IP28: IRIX takes the CPU speed from the PROM's `cpufreq` (194, i.e.
         // a 195 MHz R10000) instead of measuring it, and times with it: UST
         // assumes Count at half that, and the RPSS cycle counter the MC clock
@@ -352,38 +399,42 @@ impl Machine {
         let ioc = Ioc::new_for_profile(guinness, ci_enabled, cfg.machine.profile.ip28(), cfg.serial_ports());
         ioc.ps2().set_layout(cfg.keyboard);
 
+        // One sink for both serial paths, so the CI and TCP logs are the same
+        // bytes (timestamps included). Opened once, before any peripheral
+        // `start()` clones the current backend Arc into the RX/TX threads.
+        let serial_log = cfg.serial_log.as_deref().and_then(|path| {
+            match crate::dev::serial_log::SerialLog::open(
+                std::path::Path::new(path),
+                cfg.serial_log_timestamps,
+            ) {
+                Ok(log) => {
+                    eprintln!("iris: serial console mirroring to {}", path);
+                    Some(log)
+                }
+                Err(e) => {
+                    eprintln!("iris: serial_log: failed to open {}: {}", path, e);
+                    None
+                }
+            }
+        });
+
         // CI mode replaces the default TCP backend on channel B (tty1, the
         // SGI serial console) with an in-process backend the control socket
         // drives directly. Channel A (tty2) keeps its default TCP backend.
-        // Must happen before any peripheral `start()` call (which clones the
-        // current backend Arc into the RX/TX threads).
         let ci_serial = if ci_enabled {
             let b = Arc::new(crate::dev::z85c30::CiSerialBackend::new());
-            if let Some(path) = cfg.serial_log.as_deref() {
-                if let Err(e) = b.set_log_file(path) {
-                    eprintln!("iris: serial_log: failed to open {}: {}", path, e);
-                } else {
-                    eprintln!("iris: serial console mirroring to {}", path);
-                }
+            if let Some(log) = &serial_log {
+                b.set_log(log.clone());
             }
             ioc.scc().set_backend_b(b.clone());
             Some(b)
         } else {
             // Non-CI mode: channel B already has its TCP listener on
-            // 127.0.0.1:8881 (or `serial_port_b`).  If --serial-log was passed, wrap it in a
-            // TeeBackend so guest-emitted bytes get mirrored to the file
-            // in addition to whatever client is attached to the TCP socket.
-            if let Some(path) = cfg.serial_log.as_deref() {
+            // 127.0.0.1:8881 (or `serial_port_b`). Wrap it in a TeeBackend so
+            // guest-emitted bytes also reach the file.
+            if let Some(log) = &serial_log {
                 let inner = ioc.scc().backend_b();
-                match crate::dev::z85c30::TeeBackend::new(inner, path) {
-                    Ok(tee) => {
-                        ioc.scc().set_backend_b(Arc::new(tee));
-                        eprintln!("iris: serial console mirroring to {}", path);
-                    }
-                    Err(e) => {
-                        eprintln!("iris: serial_log: failed to open {}: {}", path, e);
-                    }
-                }
+                ioc.scc().set_backend_b(Arc::new(crate::dev::z85c30::TeeBackend::new(inner, log.clone())));
             }
             None
         };
@@ -411,39 +462,37 @@ impl Machine {
             if initialized { eeprom.update_ip28_checksum(); }
         }
 
-        // Attach SCSI devices from config (IDs 1–7).
-        let mut scsi_ids: Vec<u8> = cfg.scsi.keys().copied().collect();
-        scsi_ids.sort();
-        // CI mode: isolate each COW overlay under /tmp so an interactive
-        // iris holding {base}.overlay can coexist with any number of `--ci`
-        // processes. Files are kept for post-mortem inspection; cleanup
-        // happens on machine drop below.
-        let ci_pid = std::process::id();
+        // Attach SCSI devices from config: each `[scsi.KEY]` table puts a
+        // target on a controller (`ScsiDeviceConfig::placement`).
+        let mut scsi_keys: Vec<u8> = cfg.scsi.keys().copied().collect();
+        scsi_keys.sort();
         // Track the on-disk path of any scratch device so the CI socket can
         // read/write its bytes directly (Phase 2.4).
         let mut scratch_path: Option<std::path::PathBuf> = None;
-        for id in scsi_ids {
-            let dev = &cfg.scsi[&id];
+        for key in scsi_keys {
+            let dev = &cfg.scsi[&key];
+            let (controller, id) = dev.placement(key);
+            let label = crate::config::scsi_label(controller, id);
             // DaynaPort SCSI/Link: a network adapter, not storage. None of the
             // scratch / changer / overlay handling below applies — it has no
             // image at all.
             if dev.is_daynaport() {
-                let params = match dev.daynaport_params(id) {
+                let params = match dev.daynaport_params(key) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("iris: fatal: SCSI ID {}: {}", id, e);
+                        eprintln!("iris: fatal: {}: {}", label, e);
                         std::process::exit(1);
                     }
                 };
-                match hpc3.add_scsi_daynaport(dev.controller, id as usize, params) {
+                match hpc3.add_scsi_daynaport(controller, id as usize, params) {
                     Ok(()) => println!(
-                        "iris: DaynaPort SCSI/Link at SCSI ID {} — MAC {}, gateway {} (guest {}/{})",
-                        id, crate::net::mac_str(&params.mac),
+                        "iris: DaynaPort SCSI/Link at {} — MAC {}, gateway {} (guest {}/{})",
+                        label, crate::net::mac_str(&params.mac),
                         params.subnet.gateway_ip, params.subnet.client_ip, params.subnet.netmask),
                     Err(e) => {
-                        let msg = format!("could not attach DaynaPort to SCSI ID {id}: {e}");
+                        let msg = format!("could not attach DaynaPort to {label}: {e}");
                         if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
-                            eprintln!("iris: warning: {msg}; continuing without SCSI ID {id}");
+                            eprintln!("iris: warning: {msg}; continuing without {label}");
                         } else {
                             eprintln!("iris: fatal: {msg}");
                             std::process::exit(1);
@@ -452,64 +501,29 @@ impl Machine {
                 }
                 continue;
             }
-            // Scratch volume: pre-create a raw file with a minimal SGI Volume
-            // Header if it doesn't exist. Refuse cdrom/overlay combinations —
-            // scratch must be a host-writable raw file. Default size 64 MB.
-            //
-            // The VH lays out partition 7 ("vol") spanning sectors 8..end and
-            // partition 8 ("vh") spanning sectors 0..7 (the VH itself).
-            // Without a VH, IRIX recognises the device but returns I/O error
-            // on every read because /dev/rdsk/dks0dNvh and /dev/rdsk/dks0dNvol
-            // both consult the partition table at sector 0.
-            //
-            // Convention: host writes payload via scratch-write at offset >=
-            // SCRATCH_PAYLOAD_OFFSET (4096). Guest reads from offset 0 of
-            // /dev/rdsk/dks0dNvol (which maps to sector 8 of the disk by
-            // partition 7's first_block=8).
-            if dev.scratch {
-                if dev.cdrom || dev.overlay {
-                    println!("Note: SCSI ID {}: scratch=true is incompatible with cdrom/overlay; ignoring scratch flag", id);
+            // Scratch volume (see `ScsiDeviceConfig::prepare_scratch`): the
+            // file gets an SGI volume header, without which IRIX returns I/O
+            // errors on every read of /dev/rdsk/dks0dNvh and dks0dNvol.
+            // Convention: the host writes its payload at offset >=
+            // SCRATCH_PAYLOAD_OFFSET (4096); the guest reads from offset 0 of
+            // the vol partition, which starts at sector 8.
+            if let Some(path) = dev.prepare_scratch(key) {
+                if scratch_path.is_some() {
+                    println!("Note: multiple scratch SCSI devices configured; CI socket will use the lowest-id one");
                 } else {
-                    let path = std::path::Path::new(&dev.path);
-                    if !path.exists() {
-                        let size_mb = dev.size_mb.unwrap_or(64) as u64;
-                        let bytes = size_mb * 1024 * 1024;
-                        match crate::sgi_vh::create_scratch_image(path, bytes) {
-                            Ok(()) => println!("iris: created scratch volume {} ({} MB, with SGI VH)", dev.path, size_mb),
-                            Err(e) => println!("Note: could not create scratch volume {}: {}", dev.path, e),
-                        }
-                    }
-                    if scratch_path.is_some() {
-                        println!("Note: multiple scratch SCSI devices configured; CI socket will use the lowest-id one");
-                    } else {
-                        scratch_path = Some(path.to_path_buf());
-                    }
+                    scratch_path = Some(path);
                 }
             }
-            let (path, discs) = if dev.cdrom {
-                // Build the changer list, skipping empty paths (an empty path
-                // means "drive present, tray empty" — a valid CD-ROM state
-                // where media is loaded later at runtime).
-                let mut list: Vec<String> = Vec::new();
-                if !dev.path.is_empty() {
-                    list.push(dev.path.clone());
-                }
-                for d in &dev.discs {
-                    if !d.is_empty() && !list.contains(d) {
-                        list.push(d.clone());
-                    }
-                }
-                // Active disc is the first entry, or empty (no media) if none.
-                let active = list.first().cloned().unwrap_or_default();
-                (active, list)
+            let (path, discs) = dev.media();
+            let cdrom = dev.is_cdrom();
+            // CI mode: isolate each COW overlay under /tmp so an interactive
+            // iris holding {base}.overlay can coexist with any number of `--ci`
+            // processes; cleanup happens on machine drop below.
+            let result = if ci_enabled && dev.overlay && !cdrom {
+                let ci_overlay = ScsiDeviceConfig::ci_overlay_path(key);
+                hpc3.add_scsi_device_with_overlay(controller, id as usize, &path, cdrom, discs, dev.overlay, &ci_overlay)
             } else {
-                (dev.path.clone(), vec![])
-            };
-            let result = if ci_enabled && dev.overlay && !dev.cdrom {
-                let ci_overlay = format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id);
-                hpc3.add_scsi_device_with_overlay(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay, &ci_overlay)
-            } else {
-                hpc3.add_scsi_device(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay)
+                hpc3.add_scsi_device(controller, id as usize, &path, cdrom, discs, dev.overlay)
             };
             if let Err(e) = result {
                 // A configured disk that won't attach (missing/corrupt image,
@@ -525,9 +539,9 @@ impl Machine {
                 // skip just this device and boot without it; the GUI's Start
                 // preflight already warns the user about an unreadable disk, and
                 // they can stop, re-pick or detach it, and start again.
-                let msg = format!("could not attach {path} to SCSI ID {id}: {e}");
+                let msg = format!("could not attach {path} to {label}: {e}");
                 if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
-                    eprintln!("iris: warning: {msg}; continuing without SCSI ID {id}");
+                    eprintln!("iris: warning: {msg}; continuing without {label}");
                     continue;
                 }
                 eprintln!("iris: fatal: {msg}");
@@ -537,31 +551,26 @@ impl Machine {
 
         // Disk + nvram provenance for snapshot manifests. Captured here while
         // the MachineConfig `cfg` is still in scope (it is shadowed by the CPU
-        // config below). Identity is the configured path + host file size.
+        // config below). Identity is the slot (controller * 16 + id, see
+        // `config::scsi_slot`), the configured path and the host file size.
         let mut disk_provenance: Vec<DiskRef> = cfg.scsi.iter()
             .filter(|(_, dev)| !dev.is_daynaport()) // no image behind a DaynaPort
-            .map(|(&id, dev)| {
+            .map(|(&key, dev)| {
+                let (controller, id) = dev.placement(key);
                 let size_bytes = std::fs::metadata(&dev.path).map(|m| m.len()).unwrap_or(0);
-                DiskRef { id, path: dev.path.clone(), size_bytes }
+                DiskRef { id: crate::config::scsi_slot(controller, id), path: dev.path.clone(), size_bytes }
             }).collect();
         disk_provenance.sort_by_key(|d| d.id);
         let nvram_provenance = cfg.nvram.clone();
 
         // REX3 Graphics — Newport only; skipped in headless mode or when non-Newport board selected.
-        let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.board != crate::config::GraphicsBoard::Newport {
+        let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics_board() != crate::config::GraphicsBoard::Newport {
             None
         } else {
             let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Gfx as usize];
-            let ioc_clone = ioc.clone();
-            r.set_vblank_callback(Arc::new(move |active| {
-                if active { crate::pf_instant!(crate::perfetto::events::REX3_VBLANK); }
-                ioc_clone.set_interrupt(wiring.retrace, active);
-            }));
-            let ioc_ff = ioc.clone();
-            r.set_fifo_full_callback(Arc::new(move |active| {
-                ioc_ff.set_interrupt(wiring.fifo_full, active);
-            }));
+            r.set_vblank_irq(ioc.irq_line(wiring.retrace));
+            r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
             Some(r)
         };
 
@@ -570,24 +579,17 @@ impl Machine {
         } else {
             let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Exp0 as usize];
-            let ioc_clone = ioc.clone();
-            r.set_vblank_callback(Arc::new(move |active| {
-                if active { crate::pf_instant!(crate::perfetto::events::REX3_VBLANK); }
-                ioc_clone.set_interrupt(wiring.retrace, active);
-            }));
-            let ioc_ff = ioc.clone();
-            r.set_fifo_full_callback(Arc::new(move |active| {
-                ioc_ff.set_interrupt(wiring.fifo_full, active);
-            }));
+            r.set_vblank_irq(ioc.irq_line(wiring.retrace));
+            r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
             Some(r)
         };
 
         // GR2 (XZ / Extreme) in the GIO gfx slot. Created even when headless:
         // selecting the board is explicit, and the PROM needs it to probe.
-        let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics.board {
+        let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics_board() {
             crate::config::GraphicsBoard::Xz | crate::config::GraphicsBoard::Extreme => {
                 use crate::dev::gr2::{Gr2, Gr2Stats, Gr2Variant};
-                let variant = if cfg.graphics.board == crate::config::GraphicsBoard::Extreme { Gr2Variant::Extreme } else { Gr2Variant::Xz };
+                let variant = if cfg.graphics_board() == crate::config::GraphicsBoard::Extreme { Gr2Variant::Extreme } else { Gr2Variant::Xz };
                 let g = Gr2::new(variant, Gr2Stats { heartbeat: heartbeat.clone(), fasttick: fasttick_count.clone() });
                 // GR2 retrace is GIO interrupt 2 (LIO_GIO_2): on Indigo2 through
                 // the EXTIO SG_RETRACE fan-out, on Indy the direct line. It is a
@@ -610,18 +612,21 @@ impl Machine {
         };
 
         // IMPACT graphics in the GIO graphics slot.
-        let mgras: Option<Arc<crate::dev::mgras::Mgras>> = match cfg.graphics.board {
+        let mgras: Option<Arc<crate::dev::mgras::Mgras>> = match cfg.graphics_board() {
             crate::config::GraphicsBoard::SolidImpact
             | crate::config::GraphicsBoard::HighImpact
             | crate::config::GraphicsBoard::MaxImpact => {
-                Some(crate::dev::mgras::Mgras::new(cfg.graphics.board, ioc.clone(), heartbeat.clone(), fasttick_count.clone()))
+                Some(crate::dev::mgras::Mgras::new(cfg.graphics_board(), {
+                    use crate::dev::ioc::IocInterrupt::{GioSgFifo, GioSgGraphics, GioSgRetrace};
+                    [ioc.irq_line(GioSgFifo), ioc.irq_line(GioSgGraphics), ioc.irq_line(GioSgRetrace)]
+                }, heartbeat.clone(), fasttick_count.clone()))
             }
             _ => None,
         };
 
         // N64 development board (Ultra64) — GIO slot 0 at 0x1F400000
         let ultra64: Option<Arc<crate::dev::ultra64::Ultra64>> = if cfg.ultra64.enabled {
-            match crate::dev::ultra64::Ultra64::new(ioc.clone()) {
+            match crate::dev::ultra64::Ultra64::new(ioc.irq_line(crate::dev::ioc::IocInterrupt::GioExp0)) {
                 Ok(dev) => Some(Arc::new(dev)),
                 Err(e)  => {
                     eprintln!("ultra64: failed to initialize ({e}); running without N64 dev board");
@@ -634,15 +639,7 @@ impl Machine {
 
         // VINO (Video-In, No Out) — GIO64 at 0x1F080000
         let vino = crate::dev::vino::Vino::new();
-        {
-            struct VinoIrqAdapter { ioc: crate::dev::ioc::Ioc }
-            impl crate::dev::vino::VinoIrq for VinoIrqAdapter {
-                fn set_interrupt(&self, active: bool) {
-                    self.ioc.set_interrupt(crate::dev::ioc::IocInterrupt::VideoVsync, active);
-                }
-            }
-            vino.set_irq(Arc::new(VinoIrqAdapter { ioc: ioc.clone() }));
-        }
+        vino.set_irq(ioc.irq_line(crate::dev::ioc::IocInterrupt::VideoVsync));
 
         // 2. Create Physical Bus with devices
         // `cfg` is shadowed by MipsCpuConfig further down; grab this first.
@@ -668,51 +665,41 @@ impl Machine {
             None
         };
 
-        let phys_raw = Physical::new(
-            banks,
-            rex3.clone(),
-            rex3_head1.clone(),
-            gr2.clone(),
-            mgras.clone(),
+        let phys = Physical::new(banks.into());
+        let board = Arc::new(Ip22Bus::new(phys.clone(), Ip22Devices {
+            rex3: rex3.clone(),
+            rex3_head1: rex3_head1.clone(),
+            gr2: gr2.clone(),
+            mgras: mgras.clone(),
             ultra64,
             testdev,
             vino,
-            mc.clone(),
-            hpc3.clone(),
-            prom_port,
-            cfg.machine.profile.ip28(),
-        );
-
-        // Wrap Physical in Arc
-        let phys = Arc::new(phys_raw);
-
-        // Initialize device map now that Physical is in final location
-        // SAFETY: We have exclusive access since Arc was just created and not shared yet
-        unsafe {
-            let phys_ptr = Arc::as_ptr(&phys) as *mut Physical;
-            (*phys_ptr).init();
-        }
+            mc: mc.clone(),
+            hpc3: hpc3.clone(),
+            prom: prom_port,
+        }, cfg.machine.profile.ip28()));
 
         // Connect Physical to MC (for VDMA)
         mc.set_phys(phys.clone());
-        mc.set_ioc(ioc.clone());
+        mc.set_dma_irq(ioc.irq_line(crate::dev::ioc::IocInterrupt::McDma));
 
-        // Wire MEMCFG callback: when MC writes MEMCFG0/1, remap banks in Physical.
-        // SAFETY: Physical is pinned in Arc; remap_banks(&mut self) is only invoked
-        // from the CPU thread (same thread that writes MEMCFG), never concurrently.
+        // Wire MEMCFG callback: when MC writes MEMCFG0/1, remap the banks. Runs
+        // on the CPU thread (the thread that writes MEMCFG). Weak: the MC is
+        // one of the board's devices.
         {
-            let phys_ptr = PhysPtr(Arc::as_ptr(&phys) as *mut Physical);
+            let board = Arc::downgrade(&board);
             mc.set_memcfg_callback(Box::new(move |addrs| {
-                unsafe { (*phys_ptr.get()).remap_banks(addrs); }
+                if let Some(board) = board.upgrade() {
+                    board.remap_banks(addrs);
+                }
             }));
         }
 
         // Fire initial remap using MC's boot-time MEMCFG values
         {
-            let phys_ptr = Arc::as_ptr(&phys) as *mut Physical;
             let (memcfg0, memcfg1) = mc.get_memcfg();
             let addrs = mc.parse_memcfg(memcfg0, memcfg1);
-            unsafe { (*phys_ptr).remap_banks(addrs); }
+            board.remap_banks(addrs);
         }
         
         // Connect HPC3 to System Memory (via Physical)
@@ -720,11 +707,11 @@ impl Machine {
 
         // Connect VINO to System Memory, install a video source, start DMA.
         // Source kind + broadcast standard come from `[vino]` in iris.toml.
-        phys.vino.set_phys(phys.clone());
-        if let Some(mgras) = &phys.mgras { mgras.set_phys(phys.clone()); }
+        board.vino.set_phys(phys.clone());
+        if let Some(mgras) = &board.mgras { mgras.set_phys(phys.clone()); }
         // Host GL frames composite straight into the IMPACT framebuffer.
         #[cfg(feature = "hostgl")]
-        if let Some(mgras) = &phys.mgras {
+        if let Some(mgras) = &board.mgras {
             iris_hostcall::set_display(Arc::new(crate::dev::mgras::ImpactScreen(mgras.clone())));
         }
         let standard = match cfg.vino.standard {
@@ -753,9 +740,9 @@ impl Machine {
         };
         if let Some(source) = source {
             let adjusted: Arc<dyn crate::video_source::VideoSource> =
-                Arc::new(crate::video_source::CdmcAdjustedSource::new(source, phys.vino.clone()));
-            phys.vino.set_source(adjusted);
-            phys.vino.start();
+                Arc::new(crate::video_source::CdmcAdjustedSource::new(source, board.vino.clone()));
+            board.vino.set_source(adjusted);
+            board.vino.start();
         }
 
         // 5. CPU config + TLB + Executor. The model is a runtime choice, but each
@@ -765,6 +752,8 @@ impl Machine {
         let cfg = MipsCpuConfig::for_model::<$cache>();
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
+        // The MC decodes 32 physical address bits; see `MipsExecutor::phys_mask`.
+        executor.phys_mask = u32::MAX as u64;
 
         // Load default symbol maps if they exist
         {
@@ -822,7 +811,7 @@ impl Machine {
 
         // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.
         #[cfg(feature = "developer")]
-        if let Some(rex3) = &phys.rex3 { rex3.set_count_hz_atomic(cpu.count_hz_atomic()); }
+        if let Some(rex3) = &board.rex3 { rex3.set_count_hz_atomic(cpu.count_hz_atomic()); }
 
         // Connect CPU to MC and IOC for signaling
         let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
@@ -840,11 +829,8 @@ impl Machine {
             }
             // Point Physical's cached bitmap at the CPU's field too, or its
             // direct-access fast path would keep reading the sink the space
-            // just abandoned. Same &mut-through-Arc discipline as init().
-            unsafe {
-                let phys_ptr = Arc::as_ptr(&phys) as *mut Physical;
-                (*phys_ptr).resync_ppmem_bitmap();
-            }
+            // just abandoned.
+            phys.resync_ppmem_bitmap();
             // The cache reads RAM straight out of the same window: the full
             // cache under tcache, the shadow cache always. A cache that does
             // not (the full cache without tcache) has no bitmap field and
@@ -872,13 +858,13 @@ impl Machine {
         // be a constructor parameter (see Hot::cycles's doc comment). Must
         // happen before hpc3.scsi().start() (called later, from
         // Machine::start) actually spawns the worker thread that reads it.
-        if let Some(rex3) = &phys.rex3 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(mgras) = &phys.mgras { mgras.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(rex3) = &phys.rex3_head1 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(gr2) = &phys.gr2 { gr2.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(td) = &phys.testdev { td.attach_core(cpu.core_ptr()); }
+        if let Some(rex3) = &board.rex3 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
+        if let Some(mgras) = &board.mgras { mgras.set_cpu_cycles(cpu.cycles_ptr()); }
+        if let Some(rex3) = &board.rex3_head1 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
+        if let Some(gr2) = &board.gr2 { gr2.set_cpu_cycles(cpu.cycles_ptr()); }
+        if let Some(td) = &board.testdev { td.attach_core(cpu.core_ptr()); }
         if cheritest_hook {
-            if phys.testdev.is_none() {
+            if board.testdev.is_none() {
                 eprintln!("iris: --cheritest-dump-hook needs --test-device; ignoring");
             } else {
                 cpu.set_cheritest_dump_hook(true);
@@ -936,19 +922,19 @@ impl Machine {
         let devlog = crate::devlog::init_devlog();
 
         // Setup Monitor
-        let mut monitor = Monitor::new();
+        let monitor = Monitor::new();
         monitor.register_device(devlog.clone());
         monitor.register_device(cpu.clone());
         monitor.register_device(Arc::new(mc.clone()));
         monitor.register_device(Arc::new(hpc3.clone()));
         monitor.register_device(phys.clone());
-        if let Some(rex3) = &phys.rex3 { monitor.register_device(rex3.clone()); }
-        if let Some(rex3) = &phys.rex3_head1 { monitor.register_device(rex3.clone()); }
-        if let Some(td) = &phys.testdev { monitor.register_device(td.clone()); }
-        if let Some(gr2) = &phys.gr2 { monitor.register_device(gr2.clone()); }
-        if let Some(mgras) = &phys.mgras { monitor.register_device(mgras.clone()); }
-        if let Some(u64) = &phys.ultra64 { monitor.register_device(u64.clone()); }
-        monitor.register_device(Arc::new(phys.vino.clone()));
+        if let Some(rex3) = &board.rex3 { monitor.register_device(rex3.clone()); }
+        if let Some(rex3) = &board.rex3_head1 { monitor.register_device(rex3.clone()); }
+        if let Some(td) = &board.testdev { monitor.register_device(td.clone()); }
+        if let Some(gr2) = &board.gr2 { monitor.register_device(gr2.clone()); }
+        if let Some(mgras) = &board.mgras { monitor.register_device(mgras.clone()); }
+        if let Some(u64) = &board.ultra64 { monitor.register_device(u64.clone()); }
+        monitor.register_device(Arc::new(board.vino.clone()));
         #[cfg(feature = "perfetto")]
         {
             crate::perfetto::set_guest_cycles(Some(cpu.cycles_ptr()));
@@ -958,7 +944,7 @@ impl Machine {
             cpu.running_flag(),
             cpu.cycles_ptr(),
             cpu.fasttick_count(),
-            phys.rex3.clone(),
+            board.rex3.clone(),
             hpc3.hal2().cloned(),
         ));
         let monitor = Arc::new(monitor);
@@ -970,9 +956,9 @@ impl Machine {
             register_lock_fn("mc::eeprom", move || ep.is_locked());
             mc.register_locks();
             hpc3.register_locks();
-            if let Some(rex3) = &phys.rex3 { rex3.register_locks(); }
-            if let Some(rex3) = &phys.rex3_head1 { rex3.register_locks(); }
-            if let Some(mgras) = &phys.mgras { mgras.register_locks(); }
+            if let Some(rex3) = &board.rex3 { rex3.register_locks(); }
+            if let Some(rex3) = &board.rex3_head1 { rex3.register_locks(); }
+            if let Some(mgras) = &board.mgras { mgras.register_locks(); }
             cpu.register_locks();
         }
         {
@@ -990,7 +976,7 @@ impl Machine {
 
         Self {
             cpu,
-            _phys: phys,
+            board,
             mc,
             hpc3,
             monitor,
@@ -999,6 +985,7 @@ impl Machine {
             event_rx: Some(event_rx),
             timer_manager,
             ci_serial,
+            serial_log,
             last_restore: None,
             last_restore_checkpoint: None,
             scratch_path,
@@ -1009,6 +996,7 @@ impl Machine {
             fullhouse: !guinness,
             controller_slot: None,
             controller_registered: false,
+            lifecycle: GuestState::Idle,
         }
     }
 
@@ -1028,10 +1016,10 @@ impl Machine {
         } else {
             self.display_resolution
         };
-        if let Some(rex3) = &self._phys.rex3 {
+        if let Some(rex3) = &self.board.rex3 {
             rex3.apply_display_resolution(mode);
         }
-        if let Some(rex3) = &self._phys.rex3_head1 {
+        if let Some(rex3) = &self.board.rex3_head1 {
             rex3.apply_display_resolution(mode);
         }
     }
@@ -1043,34 +1031,24 @@ impl Machine {
         self.scratch_path.as_deref()
     }
 
-    /// Briefly stop the machine, run `work`, then restart peripherals and the
-    /// CPU only if it was running before. Used by the scratch-write/read/clear
-    /// CI commands to mutate the scratch file without racing the SCSI device's
-    /// in-flight reads. CPU stays stopped if the harness hasn't called `start`
-    /// yet — a file injected before boot stays injected, the CPU doesn't get
-    /// auto-started.
-    pub fn with_paused<R>(&mut self, work: impl FnOnce() -> R) -> R {
-        let was_running = self.cpu.is_running();
-        self.stop();
-        let r = work();
-        self.restart_peripherals();
-        if was_running {
-            self.cpu.start();
-        }
-        r
-    }
-
     pub fn start(&mut self) {
+        // Publish "starting" before the monitor binds, so a caller that polls
+        // readiness can tell "not started" (Idle) from "startup under way".
+        // Halted -> Starting covers the GUI's Stop then Start; a stored
+        // Running state is impossible (status derives it from the CPU).
+        if let Ok(starting) = self.lifecycle.transition(GuestState::Starting) {
+            self.lifecycle = starting;
+        }
         // Start peripherals
         self.mc.start();
         self.hpc3.start();
         // Program VC2 before the refresh thread runs so the first frame has size.
         self.apply_host_display_resolution();
-        if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
-        if let Some(mgras) = &self._phys.mgras { mgras.start_display(); }
-        if let Some(rex3) = &self._phys.rex3_head1 { rex3.start(); }
-        if let Some(gr2) = &self._phys.gr2 { gr2.start(); }
-        if let Some(u64) = &self._phys.ultra64 { u64.start(); }
+        if let Some(rex3) = &self.board.rex3 { rex3.start(); }
+        if let Some(mgras) = &self.board.mgras { mgras.start_display(); }
+        if let Some(rex3) = &self.board.rex3_head1 { rex3.start(); }
+        if let Some(gr2) = &self.board.gr2 { gr2.start(); }
+        if let Some(u64) = &self.board.ultra64 { u64.start(); }
 
         // Monitor server on localhost (port 8888 unless `monitor_port` says
         // otherwise) — always start, even in CI mode, so debug helpers
@@ -1090,10 +1068,10 @@ impl Machine {
     /// use. Must be called while `self` is in its final location (boxed, or on
     /// `main`'s stack) — the slot records this address.
     pub(crate) fn machine_slot(&mut self) -> MachineSlot {
-        let ptr = self as *mut Machine;
+        let ptr = self as *mut Machine as *mut dyn Workstation;
         let slot = self.controller_slot
             .get_or_insert_with(|| Arc::new(Mutex::new(MachineRef(ptr))));
-        debug_assert_eq!(slot.lock().0, ptr, "Machine moved after its slot was handed out");
+        debug_assert!(std::ptr::addr_eq(slot.lock().0, ptr), "Machine moved after its slot was handed out");
         slot.clone()
     }
 
@@ -1105,63 +1083,28 @@ impl Machine {
         // The controller and the event thread reach this Machine through the
         // shared slot, which `Drop` nulls: iris-gui drops a Machine on Stop
         // while the monitor thread (and a connected client) lives on.
-        // SystemController stops all threads before mutating machine state.
         assert!(!self.controller_registered, "register_system_controller called twice");
         self.controller_registered = true;
-        let ctrl = Arc::new(SystemController {
-            machine: self.machine_slot(),
-        });
-        // We need interior mutability to register after construction.
-        // Monitor::register_device takes &mut self, so we use unsafe to call it.
-        // SAFETY: This is called once, before the monitor server thread starts,
-        // while we have exclusive access to Machine.
-        let monitor_ptr = Arc::as_ptr(&self.monitor) as *mut Monitor;
-        unsafe {
-            (*monitor_ptr).register_device(ctrl.clone());
-        }
-
-        // Spawn the event dispatch thread: receives MachineEvent from devices and
-        // performs the requested system-level action.
-        // Uses the same SystemController (which is Send+Sync via unsafe impls) so it
-        // can stop all threads and mutate machine state safely.
-        if let Some(rx) = self.event_rx.take() {
-            thread::Builder::new().name("machine-events".to_string()).spawn(move || {
-                while let Ok(event) = rx.recv() {
-                    let _ = ctrl.with_machine(|machine| {
-                        match event {
-                            MachineEvent::HardReset => {
-                                println!("Machine: SIN hard reset");
-                                machine.reset();
-                                machine.cpu.start();
-                            }
-                            MachineEvent::PowerOff => {
-                                println!("Machine: soft power-off");
-                                machine.stop();
-                                // Hosts that embed iris as a library (e.g. iris-gui)
-                                // set IRIS_NO_EXIT_ON_POWEROFF=1 so a guest halt
-                                // does not kill the host process.
-                                #[cfg(not(feature = "developer"))]
-                                if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
-                                    std::process::exit(0);
-                                }
-                            }
-                        }
-                        Ok(())
-                    });
-                }
-            }).unwrap();
-        }
+        let slot = self.machine_slot();
+        crate::workstation::register_system_controller(&self.monitor, slot, self.event_rx.take());
     }
 
     pub fn stop(&mut self) {
         self.cpu.stop();
-        if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
-        if let Some(mgras) = &self._phys.mgras { mgras.stop_display(); }
-        if let Some(rex3) = &self._phys.rex3_head1 { rex3.stop(); }
-        if let Some(gr2) = &self._phys.gr2 { gr2.stop(); }
+        if let Some(rex3) = &self.board.rex3 { rex3.stop(); }
+        if let Some(mgras) = &self.board.mgras { mgras.stop_display(); }
+        if let Some(rex3) = &self.board.rex3_head1 { rex3.stop(); }
+        if let Some(gr2) = &self.board.gr2 { gr2.stop(); }
         self.hpc3.stop();
         self.mc.stop();
-        if let Some(u64) = &self._phys.ultra64 { u64.stop(); }
+        if let Some(u64) = &self.board.ultra64 { u64.stop(); }
+        // Idle -> Halted is not a lifecycle transition: a machine that was
+        // never started has nothing to halt, and the monitor is not up to ask.
+        if self.lifecycle != GuestState::Idle {
+            self.lifecycle = GuestState::Halted;
+        }
+        // A graceful stop must not lose the final partial line.
+        if let Some(log) = &self.serial_log { log.flush(); }
     }
 
     /// The address this Machine's own monitor is serving on, or None when it
@@ -1231,31 +1174,31 @@ impl Machine {
     }
 
     pub fn get_rex3(&self) -> Option<Arc<crate::dev::ng1::rex3::Rex3>> {
-        self._phys.rex3.clone()
+        self.board.rex3.clone()
     }
 
     pub fn get_rex3_head1(&self) -> Option<Arc<crate::dev::ng1::rex3::Rex3>> {
-        self._phys.rex3_head1.clone()
+        self.board.rex3_head1.clone()
     }
 
     /// The graphics board driving the primary display, whichever it is.
     pub fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
-        if let Some(g) = &self._phys.gr2 {
+        if let Some(g) = &self.board.gr2 {
             return Some(g.clone() as Arc<dyn crate::gfx_display::GfxDisplay>);
         }
-        if let Some(m) = &self._phys.mgras {
+        if let Some(m) = &self.board.mgras {
             return Some(m.clone() as Arc<dyn crate::gfx_display::GfxDisplay>);
         }
-        self._phys.rex3.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>)
+        self.board.rex3.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>)
     }
 
     pub fn get_gr2(&self) -> Option<Arc<crate::dev::gr2::Gr2>> {
-        self._phys.gr2.clone()
+        self.board.gr2.clone()
     }
 
     /// The second head's display (Newport dual-head only).
     pub fn get_display_head1(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
-        self._phys.rex3_head1.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>)
+        self.board.rex3_head1.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>)
     }
 
     pub fn get_timer_manager(&self) -> Arc<TimerManager> {
@@ -1372,67 +1315,6 @@ impl Machine {
         cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {
         self.hpc3.scsi().sync_chd_disks(only, progress, cancel)
-    }
-
-    /// Cumulative count of guest-originated Ethernet frames the NAT engine has
-    /// processed. Monotonic for the life of the machine; an embedder samples the
-    /// delta to tell whether the guest's internal networking is alive.
-    pub fn net_guest_frames(&self) -> u64 {
-        self.hpc3.seeq().nat_control().guest_frames()
-    }
-
-    /// NAT addresses the emulator hands the guest: (ec0 client IP, gateway IP,
-    /// netmask) — the source of truth for what the guest's ec0 should be.
-    pub fn nat_expected(&self) -> (std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr) {
-        self.hpc3.seeq().gateway_addrs()
-    }
-
-    /// The guest's own source IP as last seen on the wire (None if no frame has
-    /// revealed one yet). Captured passively, so it works even when the guest's
-    /// networking is misconfigured and nothing routes.
-    pub fn net_observed_guest_ip(&self) -> Option<std::net::Ipv4Addr> {
-        self.hpc3.seeq().nat_control().observed_guest_ip()
-    }
-
-    /// The guest's likely default gateway, inferred passively from the in-subnet
-    /// address it keeps ARP-ing for but can't resolve. None if none seen.
-    pub fn net_observed_gateway(&self) -> Option<std::net::Ipv4Addr> {
-        self.hpc3.seeq().nat_control().observed_gateway()
-    }
-
-    /// Live status of the PCAP bridged-capture backend. `Inactive` unless this is
-    /// a `--features pcap` build whose active machine uses `mode = "pcap"`; goes
-    /// `PermissionDenied` when the raw capture can't be opened for lack of
-    /// privilege, which the GUI turns into an "Enable packet capture" prompt.
-    pub fn net_pcap_status(&self) -> crate::net::PcapStatus {
-        self.hpc3.seeq().nat_control().pcap_status()
-    }
-
-    /// Move the running NAT onto a new subnet without a reboot: the NAT thread
-    /// swaps its `(gateway, client, netmask)` and flushes connection state on
-    /// its next loop. Typically gateway = network+1, client = network+2.
-    pub fn set_nat_subnet(&self, gateway: std::net::Ipv4Addr, client: std::net::Ipv4Addr, netmask: std::net::Ipv4Addr) {
-        self.hpc3.seeq().nat_control().request_subnet(gateway, client, netmask);
-    }
-
-    /// Tell the NAT engine the host's own IPv4 networks `(network, prefix)` so it
-    /// won't adopt a guest subnet that overlaps them (which would shadow the
-    /// host's real LAN). The embedder gathers these from the host interfaces.
-    pub fn set_host_nets(&self, nets: Vec<(std::net::Ipv4Addr, u8)>) {
-        self.hpc3.seeq().nat_control().set_host_nets(nets);
-    }
-
-    /// Replace the running NAT's inbound port-forward rules without a reboot;
-    /// the NAT thread rebinds its host listeners on its next loop.
-    pub fn set_port_forwards(&self, rules: Vec<crate::config::PortForwardConfig>) {
-        self.hpc3.seeq().nat_control().set_port_forwards(rules);
-    }
-
-    /// Change the PCAP bridged host interface (`None` = auto-pick) on a running
-    /// machine without rebooting the guest: the PcapEngine reopens its capture on
-    /// the new NIC. No-op in NAT mode.
-    pub fn set_pcap_interface(&self, iface: Option<String>) {
-        self.hpc3.seeq().nat_control().request_pcap_interface(iface);
     }
 
     /// Step the CPU `n` instructions in-line on the calling thread, with all
@@ -1559,17 +1441,17 @@ impl Machine {
         let scsi1 = self.hpc3.scsi1().map(|dev| dev.save_state());
         let seeq = self.hpc3.seeq().save_state();
         let hpc3 = self.hpc3.save_state();
-        let rex3 = self._phys.rex3.as_ref().map(|r| r.save_state());
-        let rex3_head1 = self._phys.rex3_head1.as_ref().map(|r| r.save_state());
+        let rex3 = self.board.rex3.as_ref().map(|r| r.save_state());
+        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| r.save_state());
 
         let bank_words: [Vec<u32>; 4] = [
-            self._phys.snapshot_bank_inmem(0),
-            self._phys.snapshot_bank_inmem(1),
-            self._phys.snapshot_bank_inmem(2),
-            self._phys.snapshot_bank_inmem(3),
+            self.board.phys.snapshot_bank_inmem(0),
+            self.board.phys.snapshot_bank_inmem(1),
+            self.board.phys.snapshot_bank_inmem(2),
+            self.board.phys.snapshot_bank_inmem(3),
         ];
 
-        let framebuffers = self._phys.rex3.as_ref()
+        let framebuffers = self.board.rex3.as_ref()
             .map(|r| r.snapshot_framebuffers_inmem());
 
         // Re-read cow.toml (and cow1.toml, for controller 1) so rollback
@@ -1614,17 +1496,17 @@ impl Machine {
         }
         self.hpc3.seeq().load_state(&cp.seeq)?;
         self.hpc3.load_state(&cp.hpc3)?;
-        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3, &cp.rex3) {
+        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3, &cp.rex3) {
             rex3.load_state(rex3_toml)?;
         }
-        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3_head1, &cp.rex3_head1) {
+        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3_head1, &cp.rex3_head1) {
             rex3.load_state(rex3_toml)?;
         }
 
         for (i, words) in cp.bank_words.iter().enumerate() {
-            self._phys.restore_bank_inmem(i, words);
+            self.board.phys.restore_bank_inmem(i, words);
         }
-        if let (Some(rex3), Some((rgb, aux))) = (&self._phys.rex3, &cp.framebuffers) {
+        if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &cp.framebuffers) {
             rex3.restore_framebuffers_inmem(rgb, aux);
         }
 
@@ -1668,17 +1550,17 @@ impl Machine {
         let eeprom = self.hpc3.eeprom().lock().save_state_owned();
         let seeq = self.hpc3.seeq().save_state();
         let hpc3 = self.hpc3.save_state();
-        let rex3 = self._phys.rex3.as_ref().map(|r| r.save_state());
-        let rex3_head1 = self._phys.rex3_head1.as_ref().map(|r| r.save_state());
+        let rex3 = self.board.rex3.as_ref().map(|r| r.save_state());
+        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| r.save_state());
 
         let bank_words: [Vec<u32>; 4] = [
-            self._phys.snapshot_bank_inmem(0),
-            self._phys.snapshot_bank_inmem(1),
-            self._phys.snapshot_bank_inmem(2),
-            self._phys.snapshot_bank_inmem(3),
+            self.board.phys.snapshot_bank_inmem(0),
+            self.board.phys.snapshot_bank_inmem(1),
+            self.board.phys.snapshot_bank_inmem(2),
+            self.board.phys.snapshot_bank_inmem(3),
         ];
 
-        let framebuffers = self._phys.rex3.as_ref()
+        let framebuffers = self.board.rex3.as_ref()
             .map(|r| r.snapshot_framebuffers_inmem());
 
         // Deliberately NOT restart_peripherals()/cpu.start() here — see this
@@ -1717,17 +1599,17 @@ impl Machine {
         self.hpc3.eeprom().lock().load_state_mut(&cp.eeprom)?;
         self.hpc3.seeq().load_state(&cp.seeq)?;
         self.hpc3.load_state(&cp.hpc3)?;
-        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3, &cp.rex3) {
+        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3, &cp.rex3) {
             rex3.load_state(rex3_toml)?;
         }
-        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3_head1, &cp.rex3_head1) {
+        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3_head1, &cp.rex3_head1) {
             rex3.load_state(rex3_toml)?;
         }
 
         for (i, words) in cp.bank_words.iter().enumerate() {
-            self._phys.restore_bank_inmem(i, words);
+            self.board.phys.restore_bank_inmem(i, words);
         }
-        if let (Some(rex3), Some((rgb, aux))) = (&self._phys.rex3, &cp.framebuffers) {
+        if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &cp.framebuffers) {
             rex3.restore_framebuffers_inmem(rgb, aux);
         }
 
@@ -1737,20 +1619,23 @@ impl Machine {
         Ok(())
     }
 
-    /// Restart peripherals (MC, HPC3, REX3) without restarting the monitor server.
+    /// Restart everything `stop` stopped, less the CPU, without restarting the
+    /// monitor server.
     fn restart_peripherals(&mut self) {
         self.mc.start();
         self.hpc3.start();
-        if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
-        if let Some(rex3) = &self._phys.rex3_head1 { rex3.start(); }
-        if let Some(gr2) = &self._phys.gr2 { gr2.start(); }
+        if let Some(rex3) = &self.board.rex3 { rex3.start(); }
+        if let Some(mgras) = &self.board.mgras { mgras.start_display(); }
+        if let Some(rex3) = &self.board.rex3_head1 { rex3.start(); }
+        if let Some(gr2) = &self.board.gr2 { gr2.start(); }
+        if let Some(u64) = &self.board.ultra64 { u64.start(); }
     }
 
     /// Helper to power-on reset all devices.
     /// Must be called with threads stopped.
     fn power_on_devices(&mut self) {
         self.cpu.power_on();
-        self._phys.reset_memory();
+        self.board.phys.reset_memory();
         self.mc.power_on();
         self.hpc3.ioc().power_on();
         // SCC: clears channel regs; backend socket kept alive so console survives.
@@ -1771,10 +1656,10 @@ impl Machine {
         // HAL2: reset all audio registers and channel state (timers already stopped).
         if let Some(hal2) = self.hpc3.hal2() { hal2.power_on(); }
         self.hpc3.power_on();
-        if let Some(rex3) = &self._phys.rex3 { rex3.power_on(); }
-        if let Some(rex3) = &self._phys.rex3_head1 { rex3.power_on(); }
-        if let Some(gr2) = &self._phys.gr2 { gr2.power_on(); }
-        if let Some(td) = &self._phys.testdev { td.power_on(); }
+        if let Some(rex3) = &self.board.rex3 { rex3.power_on(); }
+        if let Some(rex3) = &self.board.rex3_head1 { rex3.power_on(); }
+        if let Some(gr2) = &self.board.gr2 { gr2.power_on(); }
+        if let Some(td) = &self.board.testdev { td.power_on(); }
         self.apply_host_display_resolution();
     }
 
@@ -1833,26 +1718,26 @@ impl Machine {
         // REX3 (optional — absent in headless config). Framebuffers are
         // included in the chunks manifest below for v3+; v2 wrote them as
         // standalone .bin files.
-        if let Some(rex3) = &self._phys.rex3 {
+        if let Some(rex3) = &self.board.rex3 {
             snap.write_state("rex3", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
             if sv < 3 {
                 rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
             }
         }
-        if let Some(td) = &self._phys.testdev {
+        if let Some(td) = &self.board.testdev {
             snap.write_state("testdev", &td.save_state(), sv).map_err(|e| e.to_string())?;
         }
-        if let Some(rex3) = &self._phys.rex3_head1 {
+        if let Some(rex3) = &self.board.rex3_head1 {
             snap.write_state("rex3_head1", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
             if sv < 3 {
                 let dir = &snap.dir;
                 rex3.save_framebuffers_named(dir, "rex3_head1").map_err(|e| e.to_string())?;
             }
         }
-        if let Some(gr2) = &self._phys.gr2 {
+        if let Some(gr2) = &self.board.gr2 {
             snap.write_state("gr2", &gr2.save_state(), sv).map_err(|e| e.to_string())?;
         }
-        if let Some(mgras) = &self._phys.mgras {
+        if let Some(mgras) = &self.board.mgras {
             snap.write_state("mgras", &mgras.save_state(), sv).map_err(|e| e.to_string())?;
         }
 
@@ -1864,11 +1749,11 @@ impl Machine {
             let store = ChunkStore::new("saves");
             let mut chunks = ChunksManifest::default();
             for i in 0..4 {
-                let words = self._phys.snapshot_bank_inmem(i);
+                let words = self.board.phys.snapshot_bank_inmem(i);
                 chunks.bank_chunks[i] = put_words_as_chunks(&store, &words)
                     .map_err(|e| format!("CAS bank{} put: {}", i, e))?;
             }
-            if let Some(rex3) = &self._phys.rex3 {
+            if let Some(rex3) = &self.board.rex3 {
                 let (rgb, aux) = rex3.snapshot_framebuffers_inmem();
                 let rgb_chunks = put_words_as_chunks(&store, &rgb)
                     .map_err(|e| format!("CAS rex3 rgb put: {}", e))?;
@@ -1879,7 +1764,7 @@ impl Machine {
             snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
         } else {
             for i in 0..4 {
-                self._phys.save_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+                self.board.phys.save_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
             }
         }
 
@@ -1929,9 +1814,9 @@ impl Machine {
         // load_snapshot_inner restarted peripherals; stop them again.
         self.hpc3.stop();
         self.mc.stop();
-        if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
-        if let Some(rex3) = &self._phys.rex3_head1 { rex3.stop(); }
-        if let Some(gr2) = &self._phys.gr2 { gr2.stop(); }
+        if let Some(rex3) = &self.board.rex3 { rex3.stop(); }
+        if let Some(rex3) = &self.board.rex3_head1 { rex3.stop(); }
+        if let Some(gr2) = &self.board.gr2 { gr2.stop(); }
         Ok(())
     }
 
@@ -1963,6 +1848,9 @@ impl Machine {
         // don't have migration plumbing yet.
         let schema_version = match snap.read_manifest()? {
             Some(m) => {
+                if let Some(other) = &m.machine {
+                    return Err(format!("snapshot {name} is of another machine ({other})"));
+                }
                 if m.host_arch != std::env::consts::ARCH {
                     return Err(format!(
                         "snapshot host_arch '{}' does not match current host '{}'; cross-arch load is not supported",
@@ -2097,19 +1985,19 @@ impl Machine {
         let hpc3 = snap.read_state("hpc3", schema_version).map_err(|e| e.to_string())?;
         self.hpc3.load_state(&hpc3)?;
 
-        if let Some(rex3) = &self._phys.rex3 {
+        if let Some(rex3) = &self.board.rex3 {
             let rex3_v = snap.read_state("rex3", schema_version).map_err(|e| e.to_string())?;
             rex3.load_state(&rex3_v)?;
             if schema_version < 3 {
                 rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
             }
         }
-        if let Some(td) = &self._phys.testdev {
+        if let Some(td) = &self.board.testdev {
             if let Ok(v) = snap.read_state("testdev", schema_version) {
                 td.load_state(&v)?;
             }
         }
-        if let Some(rex3) = &self._phys.rex3_head1 {
+        if let Some(rex3) = &self.board.rex3_head1 {
             if let Ok(rex3_v) = snap.read_state("rex3_head1", schema_version) {
                 rex3.load_state(&rex3_v)?;
                 if schema_version < 3 {
@@ -2117,12 +2005,12 @@ impl Machine {
                 }
             }
         }
-        if let Some(gr2) = &self._phys.gr2 {
+        if let Some(gr2) = &self.board.gr2 {
             if let Ok(gr2_v) = snap.read_state("gr2", schema_version) {
                 gr2.load_state(&gr2_v)?;
             }
         }
-        if let Some(mgras) = &self._phys.mgras {
+        if let Some(mgras) = &self.board.mgras {
             if let Ok(mgras_v) = snap.read_state("mgras", schema_version) {
                 mgras.load_state(&mgras_v)?;
             }
@@ -2138,9 +2026,9 @@ impl Machine {
                 if hashes.is_empty() { continue; }
                 let words = get_chunks_as_words(&store, hashes)
                     .map_err(|e| format!("CAS bank{} get: {}", i, e))?;
-                self._phys.restore_bank_inmem(i, &words);
+                self.board.phys.restore_bank_inmem(i, &words);
             }
-            if let (Some(rex3), Some((rgb_h, aux_h))) = (&self._phys.rex3, &chunks.framebuffer_chunks) {
+            if let (Some(rex3), Some((rgb_h, aux_h))) = (&self.board.rex3, &chunks.framebuffer_chunks) {
                 let rgb = get_chunks_as_words(&store, rgb_h)
                     .map_err(|e| format!("CAS rex3 rgb get: {}", e))?;
                 let aux = get_chunks_as_words(&store, aux_h)
@@ -2149,7 +2037,7 @@ impl Machine {
             }
         } else {
             for i in 0..4 {
-                self._phys.load_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+                self.board.phys.load_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
             }
         }
 
@@ -2175,33 +2063,6 @@ impl Machine {
     }
 }
 
-// ---- SystemController — registers reset/save/load with the monitor ----
-
-/// A raw pointer to a live `Machine`, or null once that Machine is dropped.
-pub(crate) struct MachineRef(*mut Machine);
-
-// SAFETY: only dereferenced under the slot's Mutex, while non-null; `Drop for
-// Machine` nulls it under that same Mutex before any field is torn down.
-unsafe impl Send for MachineRef {}
-unsafe impl Sync for MachineRef {}
-
-pub(crate) type MachineSlot = Arc<Mutex<MachineRef>>;
-
-/// Run `f` against the Machine behind `slot`, or fail if it has been dropped.
-pub(crate) fn with_machine_slot<R>(slot: &MachineSlot, f: impl FnOnce(&mut Machine) -> R) -> Result<R, String> {
-    let guard = slot.lock();
-    let ptr = guard.0;
-    if ptr.is_null() {
-        return Err("machine is not running".to_string());
-    }
-    // SAFETY: non-null only while the Machine is alive. Drop nulls it while
-    // holding this lock, and `guard` is held until `f` returns, so the Machine
-    // cannot be freed while `f` runs.
-    let result = f(unsafe { &mut *ptr });
-    drop(guard);
-    Ok(result)
-}
-
 impl Drop for Machine {
     fn drop(&mut self) {
         // Runs before any field is dropped. Taking the lock waits for an
@@ -2209,7 +2070,7 @@ impl Drop for Machine {
         // a half-destroyed Machine. No controller command drops the Machine, so
         // this never waits on a lock its own thread holds.
         if let Some(slot) = self.controller_slot.take() {
-            slot.lock().0 = std::ptr::null_mut();
+            slot.lock().0 = MachineRef::null();
         }
         // The guest clock points into this Machine's CPU core.
         #[cfg(feature = "perfetto")]
@@ -2220,105 +2081,102 @@ impl Drop for Machine {
     }
 }
 
-/// A thin monitor device that wraps the machine behind a Mutex so the monitor
-/// thread can issue system-level commands (reset, save, load).
-pub struct SystemController {
-    machine: MachineSlot,
-}
+/// The Indy and Indigo2 family as the front ends see it: each method is the
+/// inherent one of the same name.
+impl Workstation for Machine {
+    fn start(&mut self) { Machine::start(self) }
+    fn stop(&mut self) { Machine::stop(self) }
+    fn reset(&mut self) { Machine::reset(self) }
+    fn restart_peripherals(&mut self) { Machine::restart_peripherals(self) }
+    fn cpu_start(&self) { Machine::cpu_start(self) }
+    fn cpu_is_running(&self) -> bool { Machine::cpu_is_running(self) }
+    fn machine_slot(&mut self) -> MachineSlot { Machine::machine_slot(self) }
+    fn register_system_controller(&mut self) { Machine::register_system_controller(self) }
+    fn monitor_addr(&self) -> Option<std::net::SocketAddr> { Machine::monitor_addr(self) }
+    fn lifecycle(&self) -> GuestState { self.lifecycle }
+    fn set_lifecycle(&mut self, state: GuestState) { self.lifecycle = state; }
 
+    fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::get_display(self) }
+    fn get_display_head1(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::get_display_head1(self) }
+    fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> { Machine::get_ps2(self) }
+    fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>) { self.monitor.register_device(device); }
+    fn get_timer_manager(&self) -> Arc<TimerManager> { Machine::get_timer_manager(self) }
+    fn get_cpu_debug(&self) -> Arc<dyn CpuDebug> { Machine::get_cpu_debug(self) }
+    fn fasttick_count(&self) -> Arc<AtomicU64> { Machine::fasttick_count(self) }
+    fn get_ci_serial(&self) -> Option<Arc<crate::dev::z85c30::CiSerialBackend>> { Machine::get_ci_serial(self) }
+    fn inject_serial_console(&self, bytes: &[u8]) { Machine::inject_serial_console(self, bytes) }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 
-impl SystemController {
-    fn with_machine<F: FnOnce(&mut Machine) -> Result<(), String>>(&self, f: F) -> Result<(), String> {
-        with_machine_slot(&self.machine, f)?
+    fn load_elf(&self, path: &str) -> Result<String, String> { Machine::load_elf(self, path) }
+    fn save_snapshot(&mut self, name: &str) -> Result<(), String> { Machine::save_snapshot(self, name) }
+    fn load_snapshot(&mut self, name: &str) -> Result<(), String> { Machine::load_snapshot(self, name) }
+    fn ci_restore(&mut self, name: &str) -> Result<(), String> { Machine::ci_restore(self, name) }
+    fn ci_rollback(&mut self) -> Result<(), String> { Machine::ci_rollback(self) }
+
+    fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {
+        let rtc = self.hpc3.rtc();
+        let path = path.unwrap_or_else(|| rtc.nvram_path()).to_string();
+        rtc.save_nvram(&path).map(|_| path).map_err(|e| e.to_string())
+    }
+    fn scratch_path(&self) -> Option<&std::path::Path> { Machine::scratch_path(self) }
+    fn disc_changer(&self) -> Option<Arc<dyn crate::workstation::DiscChanger>> {
+        Some(self.hpc3.scsi().clone())
+    }
+    fn remount_cdrom_guest(&self, scsi_id: u8) { Machine::remount_cdrom_guest(self, scsi_id) }
+    fn pending_chd_sync_count(&self) -> usize { Machine::pending_chd_sync_count(self) }
+    fn sync_chd_disks(
+        &self,
+        only: Option<usize>,
+        progress: &mut dyn FnMut(usize, usize, f32),
+        cancel: &dyn Fn() -> bool,
+    ) -> std::io::Result<usize> {
+        Machine::sync_chd_disks(self, only, progress, cancel)
+    }
+    fn nat_control(&self) -> Option<Arc<crate::net::NatControl>> {
+        Some(self.hpc3.seeq().nat_control())
+    }
+    fn nat_expected(&self) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+        Some(self.hpc3.seeq().gateway_addrs())
     }
 }
 
-impl Device for SystemController {
-    fn step(&self, _cycles: u64) {}
-    fn stop(&self) {}
-    fn start(&self) {}
-    fn is_running(&self) -> bool { false }
-    fn get_clock(&self) -> u64 { 0 }
+#[cfg(test)]
+mod emulator_name_tests {
+    use super::*;
 
-    fn register_commands(&self) -> Vec<(String, String)> {
-        vec![
-            ("machine-stop".to_string(),  "Stop CPU and all peripherals".to_string()),
-            ("machine-start".to_string(), "Start CPU and all peripherals".to_string()),
-            ("reset".to_string(),         "Reset all hardware to power-on state".to_string()),
-            ("save".to_string(),          "save <name> — Save snapshot to saves/<name>/".to_string()),
-            ("load".to_string(),          "load <name> — Load snapshot from saves/<name>/".to_string()),
-            #[cfg(all(feature = "jitv2", feature = "developer"))]
-            ("jitcheck".to_string(), "jitcheck <n> [skip] — capture live state, run n instructions interpreter-only vs real JIT dispatch, reconverge past the first `skip` divergences and stop at the next one [DEV]".to_string()),
-        ]
-    }
-
-    fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {
-        match cmd {
-            "machine-stop" => {
-                let _ = writeln!(writer, "Stopping machine...");
-                self.with_machine(|m| { m.stop(); Ok(()) })
+    /// No profile's expansion may name another machine: an Indigo2 is never
+    /// an "Indy", an Indy never "IP22", and the O2 is only ever "IP32".
+    #[test]
+    fn thirds_name_only_the_configured_machine() {
+        let foreign = |p: Option<MachineProfile>| -> &'static [&'static str] {
+            match p {
+                Some(MachineProfile::IndyIp24) => &["Indigo2", "IP22", "IP28", "IP32", "O2"],
+                Some(MachineProfile::Indigo2Ip22) => &["Indy", "IP24", "IP28", "IP32", "O2"],
+                Some(MachineProfile::Indigo2Ip28) => &["Indy", "IP24", "IP22", "IP32", "O2"],
+                Some(MachineProfile::O2Ip32) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "O2"],
+                Some(MachineProfile::OctaneIp30) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP32", "O2"],
+                None => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
             }
-            "machine-start" => {
-                let _ = writeln!(writer, "Starting machine...");
-                self.with_machine(|m| {
-                    m.restart_peripherals();
-                    m.cpu.start();
-                    Ok(())
-                })
+        };
+        for p in [None, Some(MachineProfile::IndyIp24), Some(MachineProfile::Indigo2Ip22),
+                  Some(MachineProfile::Indigo2Ip28), Some(MachineProfile::O2Ip32), Some(MachineProfile::OctaneIp30)] {
+            let thirds = emulator_name_thirds(p);
+            assert!(!thirds.is_empty());
+            for w in thirds {
+                assert!(w.starts_with('I'), "{p:?}: {w} breaks the acronym");
+                assert!(!foreign(p).contains(w), "{p:?}: {w} names another machine");
             }
-            "reset" => {
-                let _ = writeln!(writer, "Resetting machine...");
-                self.with_machine(|m| { m.reset(); Ok(()) })
-            }
-            "save" => {
-                let name = args.first().ok_or_else(|| "Usage: save <name>".to_string())?;
-                let _ = writeln!(writer, "Saving snapshot '{}'...", name);
-                self.with_machine(|m| m.save_snapshot(name))
-            }
-            "load" => {
-                let name = args.first().ok_or_else(|| "Usage: load <name>".to_string())?;
-                let _ = writeln!(writer, "Loading snapshot '{}'...", name);
-                self.with_machine(|m| m.load_snapshot(name))
-            }
-            #[cfg(all(feature = "jitv2", feature = "developer"))]
-            "jitcheck" => {
-                let n: u64 = args.first()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or("Usage: jitcheck <n> [skip]".to_string())?;
-                let skip: u64 = args.get(1)
-                    .map(|s| s.parse().map_err(|_| "Usage: jitcheck <n> [skip]".to_string()))
-                    .transpose()?
-                    .unwrap_or(0);
-                let _ = writeln!(writer, "jitcheck: capturing live state, running {} instructions interpreter-only then with real JIT dispatch (skipping first {} divergence(s))...", n, skip);
-                self.with_machine(|m| {
-                    let report = crate::validate::validate_jit_determinism(m, n, skip)
-                        .map_err(|e| format!("jitcheck failed: {}", e))?;
-                    for (i, d) in report.skipped.iter().enumerate() {
-                        let _ = writeln!(writer, "jitcheck: SKIPPED divergence #{} at instruction {} of {} (pc={:#018x}), reconverged and continued", i + 1, d.instruction, n, d.replay_pc);
-                        for (field, a, b) in &d.diffs {
-                            let _ = writeln!(writer, "  {}: interp={} jit={}", field, a, b);
-                        }
-                    }
-                    let next_divergence_number = report.skipped.len() + 1;
-                    match &report.stopped_at {
-                        None => {
-                            let _ = writeln!(writer, "jitcheck: no further divergence across {} instructions", n);
-                            let _ = writeln!(writer, "jitcheck: CPU left stopped (peripherals still running) with the replay (JIT-dispatch) pass's final state loaded — 'start' to resume the CPU");
-                        }
-                        Some(d) => {
-                            let _ = writeln!(writer, "jitcheck: DIVERGED (divergence #{}) at instruction {} of {} (pc={:#018x})", next_divergence_number, d.instruction, n, d.replay_pc);
-                            for (field, a, b) in &d.diffs {
-                                let _ = writeln!(writer, "  {}: interp={} jit={}", field, a, b);
-                            }
-                            let _ = writeln!(writer, "jitcheck: rerun with skip={} to reconverge past this one too", next_divergence_number);
-                            let _ = writeln!(writer, "jitcheck: stopped immediately at the divergence — CPU left stopped exactly as the JIT-dispatch pass left it (peripherals still running, console stays live) — 'start' to resume the CPU");
-                        }
-                    }
-                    Ok(())
-                })
-            }
-            _ => Err(format!("Unknown command: {}", cmd)),
         }
+    }
+
+    #[test]
+    fn profile_round_trips_through_the_global() {
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
+            set_emulator_profile(p);
+            assert_eq!(emulator_profile(), Some(p));
+        }
+        let name = emulator_name();
+        assert!(name.starts_with('I') && name.contains(" Rust "), "{name}");
     }
 }
 
@@ -2335,6 +2193,36 @@ mod controller_lifetime_tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    /// #102: `machine-start`'s acknowledgement names the transition it
+    /// performed, from a never-started machine through `Starting` to
+    /// `Running`. A second start is a no-op, and a start after `machine-stop`
+    /// takes the same route from `Halted`. The process-level test in
+    /// `tests/monitor_ready.rs` covers the monitor command and readiness.
+    #[test]
+    fn start_guest_acknowledges_the_lifecycle_transition() {
+        let mut machine = build_machine();
+        assert_eq!(machine.status().state, GuestState::Idle);
+        assert!(!machine.status().monitor_ready(), "no monitor before Machine::start");
+
+        let ack = machine.start_guest().expect("start from idle");
+        assert_eq!(ack.text(), "idle -> starting -> running");
+        assert_eq!(machine.status().state, GuestState::Running);
+        assert!(machine.status().cpu_running);
+
+        // Duplicate start: no second start and no error.
+        let ack = machine.start_guest().expect("duplicate start");
+        assert!(!ack.changed());
+        assert_eq!(ack.text(), "running (no change)");
+
+        let ack = machine.stop_guest();
+        assert_eq!(ack.text(), "running -> halted");
+        assert_eq!(machine.status().state, GuestState::Halted);
+
+        let ack = machine.start_guest().expect("start after halt");
+        assert_eq!(ack.text(), "halted -> starting -> running");
+        machine.stop();
     }
 
     /// iris-gui drops a Machine on Stop while the monitor keeps its

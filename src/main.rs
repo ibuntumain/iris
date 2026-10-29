@@ -44,24 +44,32 @@ fn main() {
     let ci_display = cfg.ci_display;
     let ci_socket_path = cfg.ci_socket.clone();
     let load_elf = cfg.load_elf.clone();
+    let vnc = cfg.vnc.clone();
     let perfetto = (cfg.perfetto.clone(), cfg.perfetto_cats.clone(), cfg.perfetto_clock.clone());
 
     // Apply [debug] and [jitv2] from TOML (env vars still override if set externally).
     cfg.debug.apply_env();
     cfg.jitv2.apply_env();
 
-    // Machine::new() allocates >1MB on the stack (Physical device_map), which overflows
-    // the default stack on Windows (1MB). We spawn a thread with a larger stack to create it.
+    // Machine::new() has several large temporaries on the stack, which
+    // overflows the default stack on Windows (1MB). We spawn a thread with a
+    // larger stack to create it.
     let mut machine = std::thread::Builder::new()
         // Rex3Context embeds the HOSTRW data-port array (HOSTRW_BUF_QWORDS u64s,
-            // 1 MiB), and construction has several context-sized temporaries in
-            // flight before the machine is boxed. This is virtual address space,
-            // lazily committed, so the large reservation has no real cost.
-            .stack_size(64 * 1024 * 1024)
-        .spawn(move || Box::new(Machine::new(cfg)))
+        // 1 MiB), and construction has several context-sized temporaries in
+        // flight before the machine is boxed. (The physical decode table used
+        // to be another 1 MB here; it is host-mapped now.) This is virtual
+        // address space, lazily committed, so the large reservation has no
+        // real cost.
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || iris::workstation::build(cfg))
         .unwrap()
         .join()
-        .unwrap();
+        .unwrap()
+        .unwrap_or_else(|e| {
+            eprintln!("iris: {e}");
+            std::process::exit(1);
+        });
     machine.register_system_controller();
 
     // --load-elf: load before the CPU starts, so the binary runs instead of the
@@ -77,21 +85,6 @@ fn main() {
             }
         }
     }
-
-    // CI control socket: started after Machine::new so it can hand out the
-    // machine pointer + CiSerialBackend to command handlers.
-    let _ci_server = if ci_enabled {
-        let mptr: *mut iris::machine::Machine = &mut *machine;
-        match iris::ci::start_server(mptr, &ci_socket_path) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("iris: failed to start CI server: {}", e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        None
-    };
 
     // DIAG: optionally enable verbose logging from startup via IRIS_DEBUG_LOG.
     // IRIS_DEBUG_LOG="mc,mips" enables those modules. "all" enables everything.
@@ -128,6 +121,35 @@ fn main() {
     start_perfetto(perfetto);
 
     machine.start();
+
+    // CI control socket: started after the machine so a successful connection
+    // means the monitor has already bound its port. That makes "the CI socket
+    // answers" a reliable readiness signal for a harness — no fixed sleep —
+    // and keeps CI commands from racing the half-started Machine. The CPU
+    // itself stays parked in `--ci` mode (see Machine::start).
+    let _ci_server = if ci_enabled {
+        match iris::ci::start_server(&mut *machine, &ci_socket_path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("iris: failed to start CI server: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // The monitor's `screen`, `ptr` and `key` commands, and the VNC server's
+    // hands on the guest.
+    let host_input = iris::hostinput::HostInput::attach(&*machine);
+    let _vnc_server = vnc.listen.as_deref().map(|listen| {
+        iris::vnc::VncServer::start(host_input.clone(), listen, vnc.max_fps, "IRIS")
+            .unwrap_or_else(|e| {
+                eprintln!("iris: {e}");
+                std::process::exit(1);
+            })
+    });
+
     // The terminal console talks to this process's own monitor only. Without
     // one (its port taken by another iris), there is no console: attached to
     // the other iris's monitor, it would exit along with that iris.
@@ -139,10 +161,15 @@ fn main() {
         }
     }
 
-    let show_window = !headless && !(ci_enabled && !ci_display);
+    // A machine with no graphics board (an Octane without one) runs on its
+    // serial console, as headless does.
+    let no_board = machine.get_display().is_none();
+    let show_window = !headless && !no_board && !(ci_enabled && !ci_display);
     if !show_window {
         if headless {
             eprintln!("iris: running headless (no REX3, no window)");
+        } else if no_board {
+            eprintln!("iris: no graphics board fitted: running on the serial console, no window");
         } else if ci_enabled {
             eprintln!("iris: --ci mode (REX3 rendering to offscreen buffer, no window)");
         }
@@ -155,8 +182,7 @@ fn main() {
         use winit::event_loop::EventLoop;
         let event_loop = EventLoop::new().unwrap();
         let display = machine.get_display().expect("a graphics board must be present in non-headless mode");
-        let scsi = machine.hpc3().scsi().clone();
-        let ui = Ui::new(machine.get_ps2(), display, scsi, machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio);
+        let ui = Ui::new(machine.get_ps2(), display, machine.disc_changer(), machine.get_timer_manager(), &event_loop, scale, scroll_pixels_per_line, lock_aspect_ratio);
         ui.run(event_loop);
     }
 

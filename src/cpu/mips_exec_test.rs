@@ -62,16 +62,16 @@ mod tests {
     }
 
     impl BusDevice for MockMemory {
-        fn read8(&self, addr: u32) -> BusRead8 {
+        fn read8(&self, addr: u64) -> BusRead8 {
             BusRead8::ok(self.get_byte(addr as u64))
         }
 
-        fn write8(&self, addr: u32, val: u8) -> u32 {
+        fn write8(&self, addr: u64, val: u8) -> u32 {
             self.set_byte(addr as u64, val);
             BUS_OK
         }
 
-        fn read16(&self, addr: u32) -> BusRead16 {
+        fn read16(&self, addr: u64) -> BusRead16 {
             let aligned_addr = (addr & !1) as u64;
             let mut bytes = [0u8; 2];
             for i in 0..2 {
@@ -80,7 +80,7 @@ mod tests {
             BusRead16::ok(u16::from_be_bytes(bytes))
         }
 
-        fn write16(&self, addr: u32, val: u16) -> u32 {
+        fn write16(&self, addr: u64, val: u16) -> u32 {
             let aligned_addr = (addr & !1) as u64;
             let bytes = val.to_be_bytes();
             for i in 0..2 {
@@ -89,23 +89,23 @@ mod tests {
             BUS_OK
         }
 
-        fn read32(&self, addr: u32) -> BusRead32 {
+        fn read32(&self, addr: u64) -> BusRead32 {
             let aligned_addr = (addr & !3) as u64;
             BusRead32::ok(self.get_word(aligned_addr))
         }
 
-        fn write32(&self, addr: u32, val: u32) -> u32 {
+        fn write32(&self, addr: u64, val: u32) -> u32 {
             let aligned_addr = (addr & !3) as u64;
             self.set_word(aligned_addr, val);
             BUS_OK
         }
 
-        fn read64(&self, addr: u32) -> BusRead64 {
+        fn read64(&self, addr: u64) -> BusRead64 {
             let aligned_addr = (addr & !7) as u64;
             BusRead64::ok(self.get_double(aligned_addr))
         }
 
-        fn write64(&self, addr: u32, val: u64) -> u32 {
+        fn write64(&self, addr: u64, val: u64) -> u32 {
             let aligned_addr = (addr & !7) as u64;
             self.set_double(aligned_addr, val);
             BUS_OK
@@ -124,7 +124,7 @@ mod tests {
         // this helper's `MockMemory`/`create_executor_with_r4000cache`.
         // Without disabling both gates, a jitv2 gate variant that runs
         // unconditionally (jitv2_lockstep's lockstep_check, in particular —
-        // see rules/jitv2/codegen-gotchas.md) can compile and run a function
+        // see clanker/jitv2/codegen-gotchas.md) can compile and run a function
         // against an executor whose `core.handle_exception_fn` was never
         // installed, aborting the whole process the moment that function
         // raises an exception (`jit_hooks_not_installed_exception`,
@@ -138,7 +138,7 @@ mod tests {
         // staying null here is still fine (and simplest — no per-page
         // counter storage needed in this basic MockMemory at all).
         #[cfg(feature = "jitv2")]
-        fn gen_ptr(&self, _addr: u32) -> *const std::sync::atomic::AtomicU64 {
+        fn gen_ptr(&self, _addr: u64) -> *const std::sync::atomic::AtomicU64 {
             std::ptr::null()
         }
     }
@@ -277,6 +277,22 @@ mod tests {
         let instr = make_r(OP_SPECIAL, 1, 2, 3, 0, FUNCT_ADDU);
         assert_eq!(exec.exec(instr), EXEC_COMPLETE);
         assert_eq!(exec.core.read_gpr(3), 0); // 32-bit wrapping add, result sign extended (0 -> 0)
+    }
+
+    /// IRIX 6.5.22's IP32 `mte_set_tlb` (n32, 32-bit kernel, Status 0)
+    /// builds a CRIME linear-TLB pair `(1<<31|page) << 32 | (1<<31|page+1)`
+    /// with these exact words; the O2 recorded 0xffffffff80042041 instead.
+    #[test]
+    fn irix_crime_tlb_pair_builds_in_32bit_kernel_mode() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status = 0;
+        exec.core.write_gpr(16, 0x42040);
+        exec.core.write_gpr(4, 0x42041);
+        for w in [0x3c09_8000u32, 0x0130_7025, 0x000e_703c, 0x0124_6025, 0x000c_603c, 0x000c_603e, 0x018e_6025] {
+            assert_eq!(exec.exec(w), EXEC_COMPLETE, "{w:08x}");
+        }
+        assert_eq!(exec.core.read_gpr(14), 0x8004_2040_0000_0000);
+        assert_eq!(exec.core.read_gpr(12), 0x8004_2040_8004_2041);
     }
 
     #[test]
@@ -913,6 +929,43 @@ mod tests {
                    "setup: ASID 10 should see PFN 0x50");
     }
 
+    /// A machine's physical alias (the O2's no-ECC view of memory at
+    /// 0x8000_0000) reaches memory at its target through both a TLB mapping
+    /// and XKPHYS; without one the address goes to the bus unchanged.
+    #[test]
+    fn a_physical_alias_reaches_its_target() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(a_physical_alias_reaches_its_target_inner)
+            .unwrap().join().unwrap();
+    }
+    fn a_physical_alias_reaches_its_target_inner() {
+        use crate::cpu::mips_tlb::MipsTlb;
+        let read = |alias: Option<(u64, u64, u64)>| {
+            let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
+            exec.phys_alias = alias;
+            exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+            exec.update_translate_fn();
+            // VA 0x1000, the odd page of VPN2 0, uncached at PFN 0x80001.
+            exec.core.cp0_index = 3;
+            exec.core.cp0_pagemask = 0;
+            exec.core.cp0_entryhi = 0;
+            exec.core.cp0_entrylo0 = 0;
+            exec.core.cp0_entrylo1 = (0x80001 << 6) | (2 << 3) | (1 << 2) | (1 << 1) | 1;
+            let tlbwi = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
+            assert_eq!(exec.exec(tlbwi), EXEC_COMPLETE);
+            mem.set_word(0x4000_1000, 0x1234_5678);
+            mem.set_word(0x8000_1000, 0xdead_beef);
+            let mapped = exec.read_data::<4>(0x1000).unwrap();
+            exec.core.cp0_status |= crate::cpu::mips_core::STATUS_KX;
+            exec.update_translate_fn();
+            let xkphys = exec.read_data::<4>(0x9000_0000_8000_1000).unwrap();
+            (mapped, xkphys)
+        };
+        assert_eq!(read(Some((0x8000_0000, 0x4000_0000, 0x4000_0000))), (0x1234_5678, 0x1234_5678), "the alias reaches memory");
+        assert_eq!(read(None), (0xdead_beef, 0xdead_beef), "no alias: the address as it is");
+    }
+
     #[test]
     fn test_mtc0_entryhi_asid_change_invalidates_nanotlb() {
         std::thread::Builder::new()
@@ -1035,7 +1088,7 @@ mod tests {
     /// Historical note: the superseded self-describing-tag design *failed*
     /// this test, because its permission AND shared a set-in-every-tag guard
     /// bit with the mode mask and so never rejected anything. See
-    /// rules/testing/nutlb-erl-guard-defeats-permission-test.md.
+    /// clanker/cpu/nutlb-erl-guard-defeats-permission-test.md.
     #[test]
     fn test_nutlb_kernel_entry_unreachable_from_user() {
         std::thread::Builder::new()
@@ -1225,7 +1278,7 @@ mod tests {
     }
 
     // Regression test for a real vmap bug tlbcheck surfaced (now fixed via
-    // MipsTlb::vmap_replace, see rules/testing/tlbcheck-vmap-dangling-slot-bug.md):
+    // MipsTlb::vmap_replace, see clanker/cpu/tlbcheck-vmap-dangling-slot-bug.md):
     // when two entries transiently share a VPN2 (e.g. mid TLBWR churn picks a
     // colliding victim index) and the later one then moves to a new VPN2,
     // the vmap must NOT simply blank the shared slot — it needs to re-derive
@@ -2635,7 +2688,7 @@ mod tests {
     /// R4000/VR5000 manuals: a denormalized operand to a computational
     /// instruction is Unimplemented Operation (Cause.E) — the hardware never
     /// computes an answer, so the destination is left untouched. See
-    /// rules/testing/fpu-exception-model-vs-r4400.md.
+    /// clanker/cpu/fpu-exception-model-vs-r4400.md.
     #[test]
     fn test_fpu_denorm_operand_is_unimplemented() {
         let (mut exec, _) = create_executor();
@@ -3621,6 +3674,54 @@ mod tests {
         assert!(!exec.cache.get_llbit(), "a successful SC clears the reservation");
     }
 
+    /// LLAddr holds PA[PA_BITS-1:4]: 32 bits on the R4400, 36 on the R10000,
+    /// whose physical addresses are 40 bits wide. LL records the whole field,
+    /// and a DMTC0 keeps only the bits that exist.
+    #[test]
+    fn lladdr_holds_the_models_physical_address_width() {
+        fn check<C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>>(want: u64) {
+            let mem = Arc::new(MockMemory::new());
+            let bus: Arc<dyn BusDevice> = mem.clone();
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(
+                bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            assert_eq!(C::LLADDR_MASK, want);
+
+            // DMTC0 $1, LLAddr with every bit set.
+            exec.core.write_gpr(1, u64::MAX);
+            assert_eq!(exec.exec((0x10 << 26) | (5 << 21) | (1 << 16) | (17 << 11)), EXEC_COMPLETE);
+            assert_eq!(exec.core.read_cp0(17), want);
+
+            // LL through uncached xkphys, from just below the top of the
+            // model's physical space.
+            let pa = (want << 4) & !0xFFF;
+            mem.set_word(pa, 0x1234_5678);
+            exec.core.cp0_status |= crate::cpu::mips_core::STATUS_KX;
+            exec.resync_privilege_state();
+            exec.core.write_gpr(1, 0x9000_0000_0000_0000 | pa);
+            assert_eq!(exec.exec(make_i(OP_LL, 1, 2, 0)), EXEC_COMPLETE);
+            assert_eq!(exec.core.read_gpr(2), 0x1234_5678);
+            assert_eq!(exec.core.read_cp0(17), pa >> 4);
+        }
+        check::<PassthroughCache>(0xFFFF_FFFF);
+        check::<crate::cpu::mips_cache_v2::R10000Cache>(0xF_FFFF_FFFF);
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(0xF_FFFF_FFFF);
+    }
+
+    /// The Indy, Indigo2 and O2 decode 32 physical bits, and IRIX relies on
+    /// it: on the IP28 the kernel stack's wired entry carries PTE software
+    /// bits as PA[34:33]. `phys_mask` must fold them away before the bus.
+    #[test]
+    fn phys_mask_folds_physical_bits_the_board_ignores() {
+        let (mut exec, _mem) = create_executor();
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_KX;
+        exec.resync_privilege_state();
+        let va = 0x9000_0006_2040_44d4;
+        assert_eq!(exec.debug_translate(va).phys, 0x6_2040_44d4, "no fold by default");
+        exec.phys_mask = u32::MAX as u64;
+        assert_eq!(exec.debug_translate(va).phys, 0x2040_44d4);
+    }
+
     /// The other half: SC must still FAIL when the LLbit is clear (an
     /// intervening exception/ERET, or no LL at all). Guards against "fixing"
     /// the LLAddr check by making SC unconditionally succeed.
@@ -4598,31 +4699,31 @@ mod tests {
 
     #[cfg(feature = "jitv2")]
     impl BusDevice for JitCapableMockMemory {
-        fn read8(&self, addr: u32) -> BusRead8 {
+        fn read8(&self, addr: u64) -> BusRead8 {
             BusRead8::ok(*self.data.lock().unwrap().get(&(addr as u64)).unwrap_or(&0))
         }
-        fn write8(&self, addr: u32, val: u8) -> u32 { self.data.lock().unwrap().insert(addr as u64, val); BUS_OK }
-        fn read16(&self, addr: u32) -> BusRead16 {
+        fn write8(&self, addr: u64, val: u8) -> u32 { self.data.lock().unwrap().insert(addr as u64, val); BUS_OK }
+        fn read16(&self, addr: u64) -> BusRead16 {
             let a = (addr & !1) as u64;
             let mut b = [0u8; 2];
             for i in 0..2 { b[i] = *self.data.lock().unwrap().get(&(a + i as u64)).unwrap_or(&0); }
             BusRead16::ok(u16::from_be_bytes(b))
         }
-        fn write16(&self, addr: u32, val: u16) -> u32 {
+        fn write16(&self, addr: u64, val: u16) -> u32 {
             let a = (addr & !1) as u64;
             for (i, b) in val.to_be_bytes().iter().enumerate() { self.data.lock().unwrap().insert(a + i as u64, *b); }
             BUS_OK
         }
-        fn read32(&self, addr: u32) -> BusRead32 { BusRead32::ok(self.get_word((addr & !3) as u64)) }
-        fn write32(&self, addr: u32, val: u32) -> u32 {
+        fn read32(&self, addr: u64) -> BusRead32 { BusRead32::ok(self.get_word((addr & !3) as u64)) }
+        fn write32(&self, addr: u64, val: u32) -> u32 {
             let a = (addr & !3) as u64;
             for (i, b) in val.to_be_bytes().iter().enumerate() { self.data.lock().unwrap().insert(a + i as u64, *b); }
             BUS_OK
         }
-        fn read64(&self, addr: u32) -> BusRead64 { BusRead64::ok(self.get_double((addr & !7) as u64)) }
-        fn write64(&self, addr: u32, val: u64) -> u32 { self.set_double((addr & !7) as u64, val); BUS_OK }
-        fn gen_ptr(&self, addr: u32) -> *const std::sync::atomic::AtomicU64 {
-            let page = addr / crate::cpu::jitv2::PAGE_SIZE;
+        fn read64(&self, addr: u64) -> BusRead64 { BusRead64::ok(self.get_double((addr & !7) as u64)) }
+        fn write64(&self, addr: u64, val: u64) -> u32 { self.set_double((addr & !7) as u64, val); BUS_OK }
+        fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
+            let page = (addr / crate::cpu::jitv2::PAGE_SIZE as u64) as u32;
             let mut gens = self.gens.lock().unwrap();
             let counter = gens.entry(page).or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
             counter.as_ref() as *const std::sync::atomic::AtomicU64
@@ -5686,6 +5787,80 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_cache_attr_matches_the_r10000_table() {
+        type E = MipsExecutor<PassthroughTlb, crate::cpu::mips_cache_shadow::R10000ShadowCache>;
+        // R10000 UM Table 4-1: MIPS IV, but 4/5 are the coherent algorithms
+        // (the O2's IRIX runs KSEG0 with K0=5) and 0/1 are reserved.
+        for (c, want) in [(0u32, crate::cpu::mips_exec::TR_UNCACHED),
+                          (1, crate::cpu::mips_exec::TR_UNCACHED),
+                          (2, crate::cpu::mips_exec::TR_UNCACHED),
+                          (3, crate::cpu::mips_exec::TR_CACHEABLE),
+                          (4, crate::cpu::mips_exec::TR_CACHEABLE_COH),
+                          (5, crate::cpu::mips_exec::TR_CACHEABLE_COH),
+                          (6, crate::cpu::mips_exec::TR_UNCACHED),
+                          (7, crate::cpu::mips_exec::TR_UNCACHED)] {
+            assert_eq!(E::decode_cache_attr(c), want, "R10000 C={c} per UM Table 4-1");
+        }
+    }
+
+    /// A mapped page decodes its C field with the model's table, as KSEG0
+    /// does. The Octane's IRIX maps every user page C=4; when the TLB read
+    /// that as uncached, each user fetch, load and store went to the bus.
+    #[test]
+    fn test_a_mapped_page_uses_the_models_cache_attr_table() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+                use crate::cpu::mips_tlb::MipsTlb;
+                fn cached<C: CpuModel + From<Arc<dyn BusDevice>>>(c: u64) -> bool {
+                    let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+                    let mut exec = MipsExecutor::<MipsTlb, C>::new(mem, MipsTlb::default(), &MipsCpuConfig::indy());
+                    disable_jitv2(&mut exec);
+                    // Out of reset ERL makes kuseg an uncached identity window.
+                    exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+                    exec.resync_privilege_state();
+                    exec.core.cp0_index = 3;
+                    exec.core.cp0_pagemask = 0;
+                    exec.core.cp0_entryhi = 0x100 << 13;
+                    exec.core.cp0_entrylo0 = (0x50 << 6) | (c << 3) | (1 << 2) | (1 << 1);
+                    exec.core.cp0_entrylo1 = 0;
+                    assert_eq!(exec.exec((OP_COP0 << 26) | (0x10 << 21) | 0x02), EXEC_COMPLETE);
+                    let tr = exec.debug_translate(0x100 << 13);
+                    assert!(!tr.is_exception(), "C={c}: the page must translate");
+                    assert_eq!(tr.phys, 0x50000, "C={c}: through the TLB");
+                    tr.is_cached()
+                }
+                assert!(cached::<R10000ShadowCache>(4), "R10000 C=4 is coherent, cached");
+                assert!(cached::<R10000ShadowCache>(5), "R10000 C=5 is coherent, cached");
+                assert!(!cached::<R10000ShadowCache>(6), "R10000 C=6 is reserved");
+                assert!(cached::<R4400Cache>(6), "R4400 C=6 is coherent update-on-write");
+                assert!(cached::<PassthroughCacheM4>(0), "R5000 C=0 is write-through, cached");
+                assert!(!cached::<PassthroughCacheM4>(4), "R5000 C=4 is reserved");
+            })
+            .unwrap().join().unwrap();
+    }
+
+    /// xkphys takes its C field from address bits 61:59 with the same table.
+    #[test]
+    fn test_xkphys_uses_the_models_cache_attr_table() {
+        type E = MipsExecutor<PassthroughTlb, crate::cpu::mips_cache_shadow::R10000ShadowCache>;
+        let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+        let mut exec = E::new(mem, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        disable_jitv2(&mut exec);
+        exec.core.cp0_status |= STATUS_KX;
+        exec.resync_privilege_state();
+        for (va, want) in [(0x9000_0000_2000_0000u64, false), (0x9800_0000_2000_0000, true),
+                           (0xa000_0000_2000_0000, true), (0xa800_0000_2000_0000, true),
+                           (0xb800_0000_2000_0000, false)] {
+            let tr = exec.debug_translate(va);
+            assert!(!tr.is_exception(), "{va:#x} must translate");
+            assert_eq!(tr.is_cached(), want, "{va:#x}");
+            assert_eq!(tr.phys, 0x2000_0000, "{va:#x}");
+        }
+    }
+
+    #[test]
     fn test_decode_cache_attr_matches_the_vr5000_table() {
         let (exec, _mem) = create_executor_m4(); // PassthroughCacheM4 => MIPS4 = true
         type E = MipsExecutor<PassthroughTlb, PassthroughCacheM4>;
@@ -5964,6 +6139,9 @@ mod tests {
         crate::cpu::mips_exec::MipsCpu::new(exec)
     }
 
+    // `lightning` compiles breakpoint checks out of the run loop, so nothing
+    // would ever stop the CPU at the breakpoint.
+    #[cfg(not(feature = "lightning"))]
     #[test]
     fn breakpoints_can_be_set_while_running_and_report_their_hit() {
         let cpu = nop_cpu();
@@ -6010,5 +6188,138 @@ mod tests {
         assert!(list.contains("if (c0_badvaddr & 0xc0000000) == 0x80000000"), "{}", list);
         assert!(list.contains("write disabled"), "{}", list);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The kernel pattern that hung a real IRIX 6.5.22 boot after hours:
+    /// a loop that raises the spl (`splhi`: only IP6, the bus error, left
+    /// unmasked on IP22), spins a while, drops it again (`splx`) and tests a
+    /// flag that an interrupt handler sets. Most of each pass is masked, so
+    /// the idle detector sees the repeated state there and parks; the
+    /// timer's interrupt then arrives *masked*. `park` used to wait for
+    /// `ip & im`, which a masked line never satisfies, so the CPU slept
+    /// through the interrupt that would have been taken a few instructions
+    /// later at `splx` - for good. This runs the guest, the 1000-step
+    /// batches and the park exactly as `MipsCpu::start`'s loop does, raises
+    /// IP4 from another thread the way a device does, and requires the loop
+    /// to finish. See clanker/perf/idle-pause-masked-interrupt-must-wake.md.
+    #[cfg(feature = "idle-pause")]
+    #[test]
+    fn idle_park_wakes_for_an_interrupt_masked_by_a_raised_spl() {
+        use crate::cpu::idle_park::{parked, wake, IdleParkState, PARK_TEST_LOCK};
+        use crate::cpu::mips_core::{CAUSE_IP4, STATUS_EXL, STATUS_IE, STATUS_IM_SHIFT};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        const T0: u32 = 8; // flag's address
+        const T1: u32 = 9; // splhi: IE | IM6
+        const T2: u32 = 10; // splx: IE | every IM bit
+        const T3: u32 = 11; // the flag, read
+        const T4: u32 = 12; // 1, for the handler to store
+        const T5: u32 = 13; // the handler's Status: EXL | IE | IM6
+        const STATUS: u32 = 12;
+        // A pass is NOPS + 6 = 197 instructions. The PC-cluster detector
+        // samples every 32 instructions, so the loop length must not share a
+        // factor with the sample interval in a way that aliases to one PC;
+        // 197 is coprime with 32 and with the 1000-instruction batch.
+        const NOPS: u32 = 191;
+        let mtc0 = |rt: u32, rd: u32| (OP_COP0 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11);
+        let lw = |rt: u32, base: u32| (OP_LW << 26) | (base << 21) | (rt << 16);
+        let sw = |rt: u32, base: u32| (OP_SW << 26) | (base << 21) | (rt << 16);
+        let beq = |rs: u32, rt: u32, off: i32| (OP_BEQ << 26) | (rs << 21) | (rt << 16) | (off as u32 & 0xFFFF);
+        let eret = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_ERET;
+        let im6 = 1u32 << (STATUS_IM_SHIFT + 6);
+        let loop_pa = 0x1000u64;
+        let done_pa = loop_pa + 4 * (NOPS as u64 + 6);
+        let kseg0 = |pa: u64| 0xFFFF_FFFF_8000_0000u64 | pa;
+
+        struct Ptr(*const AtomicU64);
+        unsafe impl Send for Ptr {}
+
+        let _one = PARK_TEST_LOCK.lock(); // (one parker at a time)
+        let running = std::sync::Arc::new(AtomicBool::new(true));
+        let (ptr_tx, ptr_rx) = channel::<Ptr>();
+        let (done_tx, done_rx) = channel::<Result<u32, u64>>();
+        let run = running.clone();
+        let cpu = std::thread::spawn(move || {
+            let (mut exec, mem) = create_executor();
+            // the loop
+            let mut a = loop_pa;
+            let mut put = |w: u32| { mem.set_word(a, w); a += 4; };
+            put(mtc0(T1, STATUS)); // splhi
+            for _ in 0..NOPS {
+                put(0); // masked: nothing changes, so the state repeats
+            }
+            put(mtc0(T2, STATUS)); // splx: a pending interrupt is taken here
+            put(0);
+            put(lw(T3, T0));
+            put(beq(T3, 0, -(NOPS as i32 + 5)));
+            put(0);
+            put(beq(0, 0, -1)); // done: spin here
+            put(0);
+            // the handler: the flag set, IP4 left masked, back
+            for (k, w) in [sw(T4, T0), mtc0(T5, STATUS), 0, 0, eret, 0].iter().enumerate() {
+                mem.set_word(0x180 + 4 * k as u64, *w);
+            }
+            exec.core.gpr[T0 as usize] = kseg0(0x2000);
+            exec.core.gpr[T1 as usize] = (STATUS_IE | im6) as u64;
+            exec.core.gpr[T2 as usize] = (STATUS_IE | (0xFF << STATUS_IM_SHIFT)) as u64;
+            exec.core.gpr[T4 as usize] = 1;
+            exec.core.gpr[T5 as usize] = (STATUS_EXL | STATUS_IE | im6) as u64;
+            // mid-pass, masked, as a batch would leave it
+            exec.core.cp0_status = STATUS_IE | im6;
+            exec.core.pc = kseg0(loop_pa + 4 * 100);
+            exec.core.cp0_compare = 1; // (park only once a deadline is armed)
+            ptr_tx.send(Ptr(&exec.core.hot.interrupts as *const AtomicU64)).unwrap();
+
+            let mut idle = IdleParkState::ready();
+            let mut parks = 0u32;
+            while run.load(Ordering::Relaxed) {
+                for _ in 0..1000 {
+                    exec.step_int();
+                    idle.sample(&exec.core);
+                }
+                if exec.core.pc == kseg0(done_pa) || exec.core.pc == kseg0(done_pa + 4) {
+                    done_tx.send(Ok(parks)).unwrap();
+                    return;
+                }
+                match idle.update(&exec.core) {
+                    crate::cpu::idle_park::IdleDecision::Park => {
+                        parks += 1;
+                        idle.park(&mut exec.core, &run);
+                    }
+                    crate::cpu::idle_park::IdleDecision::Pace => {
+                        parks += 1;
+                        idle.pace(&mut exec.core, &run);
+                    }
+                    crate::cpu::idle_park::IdleDecision::None => {}
+                }
+            }
+            done_tx.send(Err(exec.core.pc)).unwrap();
+        });
+
+        let p = ptr_rx.recv().unwrap();
+        // the guest parked in the masked stretch: now the timer
+        let t0 = std::time::Instant::now();
+        while !parked() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
+        unsafe { &*p.0 }.fetch_or(CAUSE_IP4 as u64, Ordering::SeqCst);
+        wake();
+        let got = match done_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(r) => r,
+            Err(_) => {
+                running.store(false, Ordering::SeqCst); // let `park` go
+                done_rx.recv_timeout(Duration::from_secs(5)).expect("CPU thread")
+            }
+        };
+        cpu.join().unwrap();
+        match got {
+            Ok(parks) => assert!(parks > 0,
+                "the masked stretch should have been parked in before IP4 came: \
+                 the test isn't exercising the park"),
+            Err(pc) => panic!("still at {pc:#x} 5 s after IP4 was raised: the CPU \
+                               parked through an interrupt masked only by the spl"),
+        }
     }
 }

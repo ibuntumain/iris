@@ -65,20 +65,20 @@ pub enum Signal {
 /// Unimplemented widths return `BusReadN::err()` / `BUS_ERR` by default.
 pub trait BusDevice: Send + Sync {
     // 8-bit access
-    fn read8  (&self, _addr: u32) -> BusRead8  { BusRead8::err()  }
-    fn write8 (&self, _addr: u32, _val: u8)  -> u32 { BUS_ERR }
+    fn read8  (&self, _addr: u64) -> BusRead8  { BusRead8::err()  }
+    fn write8 (&self, _addr: u64, _val: u8)  -> u32 { BUS_ERR }
 
     // 16-bit access
-    fn read16 (&self, _addr: u32) -> BusRead16 { BusRead16::err() }
-    fn write16(&self, _addr: u32, _val: u16) -> u32 { BUS_ERR }
+    fn read16 (&self, _addr: u64) -> BusRead16 { BusRead16::err() }
+    fn write16(&self, _addr: u64, _val: u16) -> u32 { BUS_ERR }
 
     // 32-bit access
-    fn read32 (&self, _addr: u32) -> BusRead32 { BusRead32::err() }
-    fn write32(&self, _addr: u32, _val: u32) -> u32 { BUS_ERR }
+    fn read32 (&self, _addr: u64) -> BusRead32 { BusRead32::err() }
+    fn write32(&self, _addr: u64, _val: u32) -> u32 { BUS_ERR }
 
     // 64-bit access
-    fn read64 (&self, _addr: u32) -> BusRead64 { BusRead64::err() }
-    fn write64(&self, _addr: u32, _val: u64) -> u32 { BUS_ERR }
+    fn read64 (&self, _addr: u64) -> BusRead64 { BusRead64::err() }
+    fn write64(&self, _addr: u64, _val: u64) -> u32 { BUS_ERR }
 
     /// 64-bit access issued by a DMA engine (e.g. MC's VDMA), as opposed to
     /// CPU-driven PIO. Defaults to plain `read64`/`write64` — most devices don't
@@ -87,8 +87,8 @@ pub trait BusDevice: Send + Sync {
     /// AND arms the next one) can override these to implement the DMA-specific
     /// sequencing real hardware uses instead, without forcing every other
     /// BusDevice to care about the distinction.
-    fn dma_read64 (&self, addr: u32) -> BusRead64 { self.read64(addr) }
-    fn dma_write64(&self, addr: u32, val: u64) -> u32 { self.write64(addr, val) }
+    fn dma_read64 (&self, addr: u64) -> BusRead64 { self.read64(addr) }
+    fn dma_write64(&self, addr: u64, val: u64) -> u32 { self.write64(addr, val) }
 
     /// Bulk form of [`dma_write64`](Self::dma_write64): hand the device a whole
     /// run of qwords destined for `addr` in one call.
@@ -115,7 +115,7 @@ pub trait BusDevice: Send + Sync {
     /// per word before batching existed, and it keeps the default honest. A
     /// device that wants real back-pressure must override this and check
     /// capacity for the whole slice up front, the way REX3 does.
-    fn dma_write64_bulk(&self, addr: u32, vals: &[u64]) -> u32 {
+    fn dma_write64_bulk(&self, addr: u64, vals: &[u64]) -> u32 {
         for &v in vals.iter() {
             loop {
                 let st = self.dma_write64(addr, v);
@@ -137,7 +137,7 @@ pub trait BusDevice: Send + Sync {
     ///
     /// Returns `BUS_OK` on success. On any other status the contents of `out`
     /// are unspecified and the caller must not use them.
-    fn dma_read64_bulk(&self, addr: u32, out: &mut [u64]) -> u32 {
+    fn dma_read64_bulk(&self, addr: u64, out: &mut [u64]) -> u32 {
         for slot in out.iter_mut() {
             let r = self.dma_read64(addr);
             if !r.is_ok() {
@@ -153,7 +153,7 @@ pub trait BusDevice: Send + Sync {
     /// Returns `None` for devices that do not support direct pointer access (default).
     /// Data at the pointer is in the same layout as `read64` returns (host u64 chunks
     /// with the two u32 halves swapped relative to native order — `rotate_left(32)`).
-    fn mem_ptr(&self, _addr: u32) -> Option<*const u64> {
+    fn mem_ptr(&self, _addr: u64) -> Option<*const u64> {
         None
     }
 
@@ -163,7 +163,7 @@ pub trait BusDevice: Send + Sync {
     /// `buf[i] = (read32(addr + i*8) as u64) << 32 | read32(addr + i*8 + 4) as u64`.
     /// Returns BUS_OK on success or the first error status encountered.
     /// Default: pairs of `read32` calls so devices that only implement 32-bit access work.
-    fn read_block(&self, addr: u32, buf: &mut [u64]) -> u32 {
+    fn read_block(&self, addr: u64, buf: &mut [u64]) -> u32 {
         let mut a = addr;
         for slot in buf.iter_mut() {
             let hi = self.read32(a);
@@ -181,7 +181,7 @@ pub trait BusDevice: Send + Sync {
     /// in big-endian (MIPS) word order: high word first, then low word.
     /// Returns BUS_OK on success or the first error status encountered.
     /// Default: pairs of `write32` calls so devices that only implement 32-bit access work.
-    fn write_block(&self, addr: u32, buf: &[u64]) -> u32 {
+    fn write_block(&self, addr: u64, buf: &[u64]) -> u32 {
         let mut a = addr;
         for &val in buf.iter() {
             let s = self.write32(a, (val >> 32) as u32);
@@ -196,27 +196,27 @@ pub trait BusDevice: Send + Sync {
     /// Masked 64-bit write: only bytes where the corresponding mask byte is 0xFF are written.
     /// `addr` must be 8-byte aligned; `val` and `mask` are in big-endian (MIPS) byte order.
     /// Default: decompose into individual write8 calls for set bytes.
-    fn write64_masked(&self, addr: u32, val: u64, mask: u64) -> u32 {
+    fn write64_masked(&self, addr: u64, val: u64, mask: u64) -> u32 {
         for i in 0..8usize {
             let bit = 7 - i;
             let byte_mask = (mask >> (bit * 8)) & 0xFF;
             if byte_mask != 0 {
                 let byte_val = (val >> (bit * 8)) as u8;
-                let ws = self.write8(addr + i as u32, byte_val);
+                let ws = self.write8(addr + i as u64, byte_val);
                 if ws != BUS_OK { return ws; }
             }
         }
         BUS_OK
     }
 
-    /// JIT v2 (rules/jitv2/jit-v2-design.md §2.4): pointer to the generation counter
+    /// JIT v2 (clanker/jitv2/jit-v2-design.md §2.4): pointer to the generation counter
     /// for the 4KB physical page containing `addr`, or null if this device doesn't
     /// back JIT-compilable memory (MMIO, etc). RAM devices return one counter per
     /// page, bumped on every mutation to that page; ROM devices may point every
     /// page at a single counter that is never bumped (content is immutable).
     /// The pointer is valid for the lifetime of the device.
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, _addr: u32) -> *const std::sync::atomic::AtomicU64 {
+    fn gen_ptr(&self, _addr: u64) -> *const std::sync::atomic::AtomicU64 {
         std::ptr::null()
     }
 }

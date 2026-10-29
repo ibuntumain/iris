@@ -342,7 +342,7 @@ pub fn dump_json(core: &MipsCore, tag: u32) -> String {
         ("EPC",      hex64(core.cp0_epc)),
         ("PRId",     hex32(core.cp0_prid)),
         ("Config",   hex32(core.cp0_config)),
-        ("LLAddr",   hex32(core.cp0_lladdr)),
+        ("LLAddr",   hex32(core.cp0_lladdr as u32)),
         ("WatchLo",  hex32(core.cp0_watchlo)),
         ("WatchHi",  hex32(core.cp0_watchhi)),
         ("XContext", hex64(core.cp0_xcontext)),
@@ -395,13 +395,19 @@ impl TestDevice {
     }
 }
 
+/// Bus address to the register offset within the repeating window.
+#[inline]
+fn reg_off(addr: u64) -> u32 {
+    (addr - TEST_DEV_BASE as u64) as u32 & (REG_WINDOW - 1)
+}
+
 impl BusDevice for TestDevice {
-    fn read32(&self, addr: u32) -> BusRead32 {
-        BusRead32::ok(self.read_reg((addr - TEST_DEV_BASE) & (REG_WINDOW - 1) & !3))
+    fn read32(&self, addr: u64) -> BusRead32 {
+        BusRead32::ok(self.read_reg(reg_off(addr) & !3))
     }
 
-    fn write32(&self, addr: u32, val: u32) -> u32 {
-        match (addr - TEST_DEV_BASE) & (REG_WINDOW - 1) & !3 {
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        match reg_off(addr) & !3 {
             REG_PUTC => self.putc(val as u8),
             REG_DUMP => self.dump(val),
             REG_EXIT => self.exit(val),
@@ -410,19 +416,19 @@ impl BusDevice for TestDevice {
         BUS_OK
     }
 
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn read8(&self, addr: u64) -> BusRead8 {
         // Big-endian lane select within the containing word: byte 0 is the high
         // byte. Reading the low byte of a latching register still latches, since
         // the whole word is materialized to pick the lane out of.
-        let off = (addr - TEST_DEV_BASE) & (REG_WINDOW - 1);
+        let off = reg_off(addr);
         let word = self.read_reg(off & !3);
         BusRead8::ok((word >> (8 * (3 - (off & 3)))) as u8)
     }
 
-    fn write8(&self, addr: u32, val: u8) -> u32 {
+    fn write8(&self, addr: u64, val: u8) -> u32 {
         // A byte store to any lane of a register acts on that register, so
         // `sb` to PUTC works without the guest building a whole word.
-        match (addr - TEST_DEV_BASE) & (REG_WINDOW - 1) & !3 {
+        match reg_off(addr) & !3 {
             REG_PUTC => self.putc(val),
             REG_DUMP => self.dump(val as u32),
             REG_EXIT => self.exit(val as u32),
@@ -494,18 +500,18 @@ mod tests {
     #[test]
     fn signature_reads_back_word_and_byte_wise() {
         let d = TestDevice::new("unused");
-        assert_eq!(d.read32(TEST_DEV_BASE).data, SIGNATURE);
+        assert_eq!(d.read32(TEST_DEV_BASE as u64).data, SIGNATURE);
         // Repeats every REG_WINDOW bytes across the decoded window. (It was
         // every 16 until the clock/icount registers claimed 0x10..0x20.)
-        assert_eq!(d.read32(TEST_DEV_BASE + REG_WINDOW).data, SIGNATURE);
-        let bytes: Vec<u8> = (0..4).map(|i| d.read8(TEST_DEV_BASE + i).data).collect();
+        assert_eq!(d.read32((TEST_DEV_BASE + REG_WINDOW) as u64).data, SIGNATURE);
+        let bytes: Vec<u8> = (0..4).map(|i| d.read8((TEST_DEV_BASE + i) as u64).data).collect();
         assert_eq!(&bytes, b"IRIS", "signature is big-endian ASCII");
     }
 
     #[test]
     fn caps_advertises_the_timebase() {
         let d = TestDevice::new("unused");
-        assert_eq!(d.read32(TEST_DEV_BASE + REG_CAPS).data & CAP_TIMEBASE, CAP_TIMEBASE);
+        assert_eq!(d.read32((TEST_DEV_BASE + REG_CAPS) as u64).data & CAP_TIMEBASE, CAP_TIMEBASE);
     }
 
     #[test]
@@ -536,8 +542,8 @@ mod tests {
             Box::new(|_| {}),
             want,
         );
-        assert_eq!(d.read32(TEST_DEV_BASE + REG_CAPS).data & CAP_RUN_CONFIG, CAP_RUN_CONFIG);
-        assert_eq!(RunConfig::from_word(d.read32(TEST_DEV_BASE + REG_RUN_CONFIG).data), want);
+        assert_eq!(d.read32((TEST_DEV_BASE + REG_CAPS) as u64).data & CAP_RUN_CONFIG, CAP_RUN_CONFIG);
+        assert_eq!(RunConfig::from_word(d.read32((TEST_DEV_BASE + REG_RUN_CONFIG) as u64).data), want);
     }
 
     #[test]
@@ -553,35 +559,35 @@ mod tests {
             )
         };
 
-        for b in b"hi\n" { d.write32(TEST_DEV_BASE + REG_PUTC, *b as u32); }
+        for b in b"hi\n" { d.write32((TEST_DEV_BASE + REG_PUTC) as u64, *b as u32); }
         assert_eq!(&*sink.lock(), b"hi\n");
 
         // DUMP has nowhere to go and must not try: still counted, no file, and
         // above all no panic on a device with no dump path.
-        d.write32(TEST_DEV_BASE + REG_DUMP, 3);
+        d.write32((TEST_DEV_BASE + REG_DUMP) as u64, 3);
         assert_eq!(d.dumps_written(), 1);
         assert!(d.dump_path().is_none());
 
         // The point of the whole exercise: EXIT returns instead of ending the
         // host process, so this test can observe it at all.
-        d.write32(TEST_DEV_BASE + REG_EXIT, 7);
+        d.write32((TEST_DEV_BASE + REG_EXIT) as u64, 7);
         assert_eq!(seen.load(Ordering::Relaxed), 7);
     }
 
     #[test]
     fn host_ns_latches_so_lo_then_hi_cannot_tear() {
         let d = TestDevice::new("unused");
-        let lo = d.read32(TEST_DEV_BASE + REG_HOST_NS_LO).data;
-        let hi = d.read32(TEST_DEV_BASE + REG_HOST_NS_HI).data;
+        let lo = d.read32((TEST_DEV_BASE + REG_HOST_NS_LO) as u64).data;
+        let hi = d.read32((TEST_DEV_BASE + REG_HOST_NS_HI) as u64).data;
         let first = ((hi as u64) << 32) | lo as u64;
         // HI on its own never re-samples: read it again and it is the same half
         // of the same latch, however much time has passed in between.
-        assert_eq!(d.read32(TEST_DEV_BASE + REG_HOST_NS_HI).data, hi);
+        assert_eq!(d.read32((TEST_DEV_BASE + REG_HOST_NS_HI) as u64).data, hi);
 
         // A fresh LO read advances (the clock is monotonic and this is not
         // instantaneous, but do not assume it ticked — assert non-regression).
-        let lo2 = d.read32(TEST_DEV_BASE + REG_HOST_NS_LO).data;
-        let hi2 = d.read32(TEST_DEV_BASE + REG_HOST_NS_HI).data;
+        let lo2 = d.read32((TEST_DEV_BASE + REG_HOST_NS_LO) as u64).data;
+        let hi2 = d.read32((TEST_DEV_BASE + REG_HOST_NS_HI) as u64).data;
         let second = ((hi2 as u64) << 32) | lo2 as u64;
         assert!(second >= first, "host clock went backwards: {} -> {}", first, second);
     }
@@ -590,14 +596,14 @@ mod tests {
     fn icount_reports_retired_instructions_and_zero_with_no_core() {
         let d = TestDevice::new("unused");
         // No core attached: a flat zero, not a plausible-looking wrong number.
-        assert_eq!(d.read32(TEST_DEV_BASE + REG_ICOUNT_LO).data, 0);
-        assert_eq!(d.read32(TEST_DEV_BASE + REG_ICOUNT_HI).data, 0);
+        assert_eq!(d.read32((TEST_DEV_BASE + REG_ICOUNT_LO) as u64).data, 0);
+        assert_eq!(d.read32((TEST_DEV_BASE + REG_ICOUNT_HI) as u64).data, 0);
 
         let mut core = MipsCore::new();
         core.hot.cycles = 0x1_2345_6789;
         d.attach_core(&core as *const MipsCore);
-        let lo = d.read32(TEST_DEV_BASE + REG_ICOUNT_LO).data;
-        let hi = d.read32(TEST_DEV_BASE + REG_ICOUNT_HI).data;
+        let lo = d.read32((TEST_DEV_BASE + REG_ICOUNT_LO) as u64).data;
+        let hi = d.read32((TEST_DEV_BASE + REG_ICOUNT_HI) as u64).data;
         assert_eq!(((hi as u64) << 32) | lo as u64, 0x1_2345_6789);
     }
 
@@ -608,7 +614,7 @@ mod tests {
         core.hot.cycles = 0x0000_0000_AABB_CCDD;
         d.attach_core(&core as *const MipsCore);
         let bytes: Vec<u8> = (0..4)
-            .map(|i| d.read8(TEST_DEV_BASE + REG_ICOUNT_LO + i).data)
+            .map(|i| d.read8((TEST_DEV_BASE + REG_ICOUNT_LO + i) as u64).data)
             .collect();
         assert_eq!(&bytes, &[0xAA, 0xBB, 0xCC, 0xDD]);
     }
@@ -651,7 +657,7 @@ mod tests {
         let d = TestDevice::new(&path);
         d.attach_core(&core as *const MipsCore);
 
-        d.write32(TEST_DEV_BASE + REG_DUMP, 7);
+        d.write32((TEST_DEV_BASE + REG_DUMP) as u64, 7);
         assert_eq!(d.dumps_written(), 1);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"tag\": 7"));
@@ -663,7 +669,7 @@ mod tests {
         let core = MipsCore::new();
         let a = TestDevice::new("unused");
         a.attach_core(&core as *const MipsCore);
-        a.write32(TEST_DEV_BASE + REG_PUTC, b'x' as u32);
+        a.write32((TEST_DEV_BASE + REG_PUTC) as u64, b'x' as u32);
         a.last_tag.store(3, Ordering::Relaxed);
         a.dumps.store(2, Ordering::Relaxed);
 

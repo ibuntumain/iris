@@ -17,13 +17,13 @@ pub use crate::dev::ng1::rex3_profile as profile;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 
 #[cfg(feature = "developer")]
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
 
 use crate::dev::ng1::rex3::Rex3Context;
+use crate::dev::ng1::rex3_jit_queue::{CompileQueue, CompileRequest};
 use compiler::ShaderCompiler;
 
 /// A compiled draw shader and its housekeeping metadata.
@@ -74,7 +74,7 @@ pub enum ShaderState {
     Disabled(CompiledShader),
     /// Cranelift declined this shape. Never retried. Not an error: the line
     /// emitter has no host-pixel support, for instance — see
-    /// rules/rex3/line-plus-host-not-jittable.md.
+    /// clanker/rex3/line-plus-host-not-jittable.md.
     Failed,
 }
 
@@ -127,13 +127,11 @@ pub type PublishMap =
 
 pub struct RexJit {
     store: Arc<ShaderStore>,
-    compile_tx: SyncSender<CompileRequest>,
+    /// Hot/cold priority queue. The draw path uses the hot lane (never dropped
+    /// for a full queue); warm-up and prefetch use the cold lane (drop-on-full
+    /// with a `Queued`-marker retry).
+    queue: Arc<CompileQueue>,
     _compiler_thread: thread::JoinHandle<()>,
-}
-
-enum CompileRequest {
-    Compile(u32, u32, u32),
-    Shutdown,
 }
 
 impl RexJit {
@@ -144,57 +142,53 @@ impl RexJit {
         let store_clone = Arc::clone(&store);
         let publish_clone = Arc::clone(&publish);
 
-        // Bounded channel: if the queue fills (many unique draw modes on first boot),
-        // request_compile() drops new requests rather than blocking the draw thread.
-        let (tx, rx) = mpsc::sync_channel::<CompileRequest>(256);
+        // Two-lane priority queue: the draw path is hot and never dropped for a
+        // full queue, warm-up/prefetch is cold and may be. See rex3_jit_queue.
+        let queue = Arc::new(CompileQueue::new());
+        let queue_worker = Arc::clone(&queue);
 
         let compiler_thread = thread::Builder::new()
             .name("rex3-jit".into())
             .spawn(move || {
                 let mut compiler = ShaderCompiler::new();
-                for req in rx {
-                    match req {
-                        CompileRequest::Compile(dm0, dm1, cm) => {
-                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                compiler.compile_shader(dm0, dm1, cm)
-                            }));
-                            let result = match result {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    let msg = if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
-                                              else if let Some(s) = e.downcast_ref::<String>() { s.clone() }
-                                              else { "(unknown panic)".to_string() };
-                                    eprintln!("REX JIT: compile_shader panicked for dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}: {msg}");
-                                    None
-                                }
-                            };
-                            match result {
-                                Some((entry, code_bytes)) => {
-                                    let shader = CompiledShader::new(entry, code_bytes);
-                                    let count = {
-                                        let mut map = store_clone.shaders.write().unwrap();
-                                        // Publish into the dispatch map too: that is
-                                        // what execute_go reads, and it is shared with
-                                        // the generated LLVM shaders.
-                                        publish_clone.write().insert((dm0, dm1, cm), entry);
-                                        map.insert((dm0, dm1, cm), ShaderState::Compiled(shader));
-                                        map.len()
-                                    };
-                                    crate::dlog!(
-                                        crate::devlog::LogModule::Rex3,
-                                        "REX JIT: compiled dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x} ({code_bytes}B, total: {count})"
-                                    );
-                                }
-                                None => {
-                                    store_clone
-                                        .shaders
-                                        .write()
-                                        .unwrap()
-                                        .insert((dm0, dm1, cm), ShaderState::Failed);
-                                }
-                            }
+                while let Some(CompileRequest { dm0, dm1, cm }) = queue_worker.recv() {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        compiler.compile_shader(dm0, dm1, cm)
+                    }));
+                    let result = match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let msg = if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+                                      else if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+                                      else { "(unknown panic)".to_string() };
+                            eprintln!("REX JIT: compile_shader panicked for dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}: {msg}");
+                            None
                         }
-                        CompileRequest::Shutdown => break,
+                    };
+                    match result {
+                        Some((entry, code_bytes)) => {
+                            let shader = CompiledShader::new(entry, code_bytes);
+                            let count = {
+                                let mut map = store_clone.shaders.write().unwrap();
+                                // Publish into the dispatch map too: that is
+                                // what execute_go reads, and it is shared with
+                                // the generated LLVM shaders.
+                                publish_clone.write().insert((dm0, dm1, cm), entry);
+                                map.insert((dm0, dm1, cm), ShaderState::Compiled(shader));
+                                map.len()
+                            };
+                            crate::dlog!(
+                                crate::devlog::LogModule::Rex3,
+                                "REX JIT: compiled dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x} ({code_bytes}B, total: {count})"
+                            );
+                        }
+                        None => {
+                            store_clone
+                                .shaders
+                                .write()
+                                .unwrap()
+                                .insert((dm0, dm1, cm), ShaderState::Failed);
+                        }
                     }
                 }
                 eprintln!("REX JIT: compiler thread exiting");
@@ -203,7 +197,7 @@ impl RexJit {
 
         let jit = Self {
             store,
-            compile_tx: tx,
+            queue,
             _compiler_thread: compiler_thread,
         };
 
@@ -223,13 +217,14 @@ impl RexJit {
         // and the corpus bled away across runs (observed: 160 entries decaying
         // to 48). Seeding here makes the round-trip lossless: a key that was
         // ever seen stays in the corpus even if this run never compiled it.
-        // Feed the queue from a thread: `request_compile_blocking` waits when the
-        // channel is full, and `RexJit::new` runs inside `Rex3::new`, so doing
-        // this inline would stall emulator startup behind the whole profile.
+        // Feed the queue from a thread: `send_cold_blocking` waits when the cold
+        // lane is full, and `RexJit::new` runs inside `Rex3::new`, so doing this
+        // inline would stall emulator startup behind the whole profile.
         // Off-thread, a profile of any size is queued in full without dropping
-        // entries and without delaying boot.
+        // entries and without delaying boot. Warm-up is cold: the hot lane is
+        // reserved for draws the guest makes while this backlog is draining.
         {
-            let tx = jit.compile_tx.clone();
+            let queue = Arc::clone(&jit.queue);
             let store = Arc::clone(&jit.store);
             let to_queue = profile.clone();
             thread::Builder::new()
@@ -253,9 +248,9 @@ impl RexJit {
                             }
                             map.insert((dm0, dm1, cm), ShaderState::Queued);
                         }
-                        if tx.send(CompileRequest::Compile(dm0, dm1, cm)).is_err() {
+                        if queue.send_cold_blocking(CompileRequest { dm0, dm1, cm }).is_err() {
                             store.shaders.write().unwrap().remove(&(dm0, dm1, cm));
-                            break; // receiver gone: shutting down
+                            break; // queue closed: shutting down
                         }
                     }
                 })
@@ -348,9 +343,46 @@ impl RexJit {
             .collect()
     }
 
-    /// Request background compilation for the given (dm0, dm1, clipmode_key) triple.
-    /// No-op if already compiled, permanently failed, or already queued.
+    /// Request a **hot** background compile: a shape the draw path is asking
+    /// for right now. No-op if already compiled, permanently failed, or already
+    /// queued.
+    ///
+    /// Hot requests go to the priority lane the worker drains first and are
+    /// never rejected for a full queue, so a live draw cannot be starved by
+    /// warm-up/prefetch backlog. This path must not block (it runs on the GFIFO
+    /// consumer thread); the hot lane is non-blocking.
     pub fn request_compile(&self, dm0: u32, dm1: u32, cm: u32) {
+        self.enqueue_compile(dm0, dm1, cm, |q, req| q.send_hot(req));
+    }
+
+    /// Request a **cold** background compile: best-effort prefetch. No-op if
+    /// already known. A full cold lane rejects the request, the `Queued` marker
+    /// is dropped, and a later draw retries — the drop-and-retry contract of
+    /// `clanker/rex3/rex-jit-queue-retry.md`.
+    pub fn request_compile_cold(&self, dm0: u32, dm1: u32, cm: u32) {
+        self.enqueue_compile(dm0, dm1, cm, |q, req| q.send_cold(req));
+    }
+
+    /// Queue a compile, waiting for room if the cold lane is full.
+    ///
+    /// Only for warm-up, which runs on its own thread before the guest is
+    /// drawing: blocking there costs nothing and means a profile larger than the
+    /// cold lane is fully compiled instead of silently truncated. The draw path
+    /// must keep using [`Self::request_compile`].
+    pub fn request_compile_blocking(&self, dm0: u32, dm1: u32, cm: u32) {
+        self.enqueue_compile(dm0, dm1, cm, |q, req| q.send_cold_blocking(req));
+    }
+
+    /// Mark the shape `Queued` and hand it to the queue via `send`. On rejection
+    /// remove the marker so a later draw can retry instead of seeing a phantom
+    /// entry that suppresses every future request.
+    fn enqueue_compile(
+        &self,
+        dm0: u32,
+        dm1: u32,
+        cm: u32,
+        send: impl Fn(&CompileQueue, CompileRequest) -> Result<(), CompileRequest>,
+    ) {
         // One lock, one lookup. Any existing entry — compiled, disabled, queued
         // or failed — means there is nothing to request; the four-set version
         // needed three probes in a fixed order to establish the same thing.
@@ -361,36 +393,7 @@ impl RexJit {
             }
             map.insert((dm0, dm1, cm), ShaderState::Queued);
         }
-        if self.compile_tx.try_send(CompileRequest::Compile(dm0, dm1, cm)).is_err() {
-            // A full channel did not accept this shader. Drop the Queued marker
-            // so a later draw retries, rather than leaving a phantom entry that
-            // suppresses every future request (see
-            // rules/testing/rex-jit-queue-retry.md).
-            //
-            // This path must not block: it runs on the GFIFO consumer thread,
-            // and stalling there stalls the guest. Warm-up uses
-            // `request_compile_blocking` instead, which can afford to wait.
-            self.store.shaders.write().unwrap().remove(&(dm0, dm1, cm));
-        }
-    }
-
-    /// Queue a compile, waiting for room if the channel is full.
-    ///
-    /// Only for warm-up, which runs on its own thread before the guest is
-    /// drawing: blocking there costs nothing and means a profile larger than the
-    /// 256-slot channel is fully compiled instead of silently truncated. The
-    /// draw path must keep using [`Self::request_compile`].
-    pub fn request_compile_blocking(&self, dm0: u32, dm1: u32, cm: u32) {
-        {
-            let mut map = self.store.shaders.write().unwrap();
-            if map.contains_key(&(dm0, dm1, cm)) {
-                return;
-            }
-            map.insert((dm0, dm1, cm), ShaderState::Queued);
-        }
-        // `send` blocks until the compiler thread drains a slot. It only fails
-        // if the receiver is gone, i.e. we are shutting down.
-        if self.compile_tx.send(CompileRequest::Compile(dm0, dm1, cm)).is_err() {
+        if send(&self.queue, CompileRequest { dm0, dm1, cm }).is_err() {
             self.store.shaders.write().unwrap().remove(&(dm0, dm1, cm));
         }
     }
@@ -472,27 +475,45 @@ pub struct ShaderInfo {
 
 impl Drop for RexJit {
     fn drop(&mut self) {
-        let _ = self.compile_tx.try_send(CompileRequest::Shutdown);
+        self.queue.close();
     }
 }
 
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+    use crate::dev::ng1::rex3_jit_queue::COLD_QUEUE_CAPACITY;
 
-    #[test]
-    fn full_compile_queue_allows_retry() {
-        let (tx, rx) = mpsc::sync_channel(1);
-        assert!(tx.try_send(CompileRequest::Compile(1, 2, 3)).is_ok());
-        let jit = RexJit {
-            store: Arc::new(ShaderStore::new()), compile_tx: tx,
+    fn rex_jit_with_queue() -> RexJit {
+        RexJit {
+            store: Arc::new(ShaderStore::new()),
+            queue: Arc::new(CompileQueue::new()),
             _compiler_thread: thread::spawn(|| {}),
-        };
-        jit.request_compile(4, 5, 6);
-        assert_eq!(jit.queued_count(), 0);
-        rx.recv().unwrap();
-        jit.request_compile(4, 5, 6);
-        assert_eq!(jit.queued_count(), 1);
-        assert!(matches!(rx.recv().unwrap(), CompileRequest::Compile(4, 5, 6)));
+        }
+    }
+
+    /// The draw path (`request_compile`) is the hot lane: a cold backlog filling
+    /// its lane to capacity must not stop a drawn shape being admitted, and the
+    /// worker must pop it first.
+    #[test]
+    fn hot_draw_request_jumps_a_full_cold_queue() {
+        let jit = rex_jit_with_queue();
+        for i in 0..COLD_QUEUE_CAPACITY as u32 {
+            jit.request_compile_cold(0, i, 0);
+        }
+
+        // The cold lane is full: another cold request is dropped and its Queued
+        // marker removed, so a later draw retries it (the queue-retry rule).
+        jit.request_compile_cold(0, 0xDEAD, 0);
+        assert!(!jit.store.shaders.read().unwrap().contains_key(&(0, 0xDEAD, 0)));
+        assert_eq!(jit.queued_count(), COLD_QUEUE_CAPACITY);
+
+        // A draw (hot) request is admitted anyway, and drained first.
+        jit.request_compile(1, 0xBEEF, 0);
+        assert_eq!(jit.queued_count(), COLD_QUEUE_CAPACITY + 1);
+        assert_eq!(
+            jit.queue.try_pop(),
+            Some(CompileRequest { dm0: 1, dm1: 0xBEEF, cm: 0 }),
+        );
     }
 }

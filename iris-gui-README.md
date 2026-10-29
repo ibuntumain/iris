@@ -1,6 +1,6 @@
 # iris-gui
 
-An optional egui front-end for the IRIS SGI Indy / Indigo2 emulator. It runs the
+An optional egui front-end for the IRIS SGI Indy / Indigo2 / Octane emulator. It runs the
 emulator in-process, draws the framebuffer in its own window, and adds
 named-machine storage with autosave, a configuration editor, disk and CD-ROM
 management, networking diagnostics, an in-app serial console, and the benchmark.
@@ -12,6 +12,12 @@ build when you ask for `-p iris-gui`.
 
 Pre-built installers (Windows, macOS, Linux AppImage/deb/rpm) come out of the
 Release workflow, and a sandboxed build ships on the Mac App Store.
+
+The platform list has the Indy, Indigo2 (IP22), Indigo2 IMPACT (IP28) and Octane
+(IP30). The Octane needs the IP30 PROM image (no built-in PROM), is fixed to the
+R10000, takes Solid IMPACT or no graphics board and 64 to 512 MB banks from
+bank 0, and keeps its PROM records in an optional flash file; see
+[docs/octane-ip30.md](docs/octane-ip30.md). The O2 is not selectable here yet.
 
 ---
 
@@ -156,7 +162,7 @@ IRIX with a media-change Unit Attention, no restart needed.
 | --- | --- |
 | **General** | Platform, CPU, cache model (auto/full/shadow), CP0 Count clock, JIT compile threads and persistent code cache (jitv2 builds), RTC offset, graphics board (Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum), Newport heads/resolution, PROM, NVRAM, motherboard EEPROM, ttyd1 serial log, monitor and serial ports |
 | **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, second controller (IP22) |
-| **Networking** | Ethernet address (`eaddr`, written to NVRAM on Indy or the NVRAM EEPROM on Indigo2/IP28 while stopped), NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), TFTP boot folder (NAT mode), NFS share, PCAP interface, **Check networking** diagnostics |
+| **Networking** | Ethernet address (`eaddr`, written to NVRAM on Indy or the NVRAM EEPROM on Indigo2/IP28 while stopped), NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), TFTP boot folder and rsh install folder (NAT mode), NFS share, PCAP interface, **Check networking** diagnostics |
 | **Memory** | RAM banks and the resulting total |
 | **Display** | Display resolution, window scale, headless, audio on/off and buffering, keyboard shape (ANSI/ISO/JIS) |
 | **Video-In** | VINO source: **off** (default), **test_pattern**, **camera** (with a Test Camera preview), **black**; standard; camera index |
@@ -241,7 +247,7 @@ New disk images default to `disks/scsiN.raw`. External images stay in place;
 the TOML keeps them as absolute paths (`/Volumes/Media/root.chd`), exactly as
 selected or typed. A hand-written relative path such as `../../media/root.chd`
 is also preserved as written.
-The same resolution applies to disc changers, NFS shares, TFTP folders, serial
+The same resolution applies to disc changers, NFS shares, TFTP and rsh folders, serial
 logs, ELF binaries, test dumps, filesystem CI sockets, and JIT cache folders.
 TCP CI addresses and network interface names retain their original spelling.
 
@@ -372,14 +378,14 @@ Normal **Stop**, **Quit**, and guest power-off save the DS1386 NVRAM and, on
 Indigo2, the motherboard EEPROM. Writes use a temporary file and replacement
 so a failed save preserves the previous image. Forced process termination
 bypasses Stop; use `rtc save` / `nveeprom save` before terminating a process.
-See [Battery-backed state on Stop](rules/irix/nvram-persistence.md).
+See [Battery-backed state on Stop](clanker/devices/nvram-persistence.md).
 
 ### Disk synchronization on exit
 
 CHD diffs are folded back into their base images when you quit ("Synchronizing
 disks…", with per-disk progress). Under the macOS App Sandbox the fold needs
 write access to the *folder* holding the CHD, which is why the App Store build
-asks for folder grants (`rules/macos/chd-fold-needs-folder-grant-not-file-grant.md`).
+asks for folder grants (`clanker/macos/chd-fold-needs-folder-grant-not-file-grant.md`).
 
 ### Stop timeout for a wedged machine
 
@@ -454,8 +460,8 @@ iris/
 - Window operations (resize, fullscreen, surface creation) must run on the
   main/event-loop thread; other threads send requests to it. Calling them from
   elsewhere crashed on Windows and macOS
-  (`rules/gui/winit-window-calls-must-be-on-event-thread.md`,
-  `rules/macos/winit-030-window-handle-main-thread-only.md`).
+  (`clanker/gui/winit-window-calls-must-be-on-event-thread.md`,
+  `clanker/macos/winit-030-window-handle-main-thread-only.md`).
 - A dedicated worker thread (64 MB stack — machine construction builds large
   objects on the stack) owns the `Machine` when one exists. Commands go over a
   `crossbeam_channel::Sender<Cmd>`; events come back over a `Receiver<Evt>`
@@ -500,6 +506,6 @@ a build feature — read `MachineConfig::machine.cpu`.
 - `crossbeam-channel` for cross-thread messaging.
 - `parking_lot::Mutex` where sharing is needed.
 
-`rules/gui/` collects the hard-won findings (drop order of `CyclesPtr`, GL
+`clanker/gui/` collects the hard-won findings (drop order of `CyclesPtr`, GL
 teardown on the refresh thread, keyboard capture, layouts, mouse integration,
-Windows silent exits); `rules/macos/` covers the App Store and sandbox.
+Windows silent exits); `clanker/macos/` covers the App Store and sandbox.

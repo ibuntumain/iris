@@ -29,8 +29,13 @@ pub(crate) struct NfsVirtualHost {
 impl NfsVirtualHost {
     pub(crate) fn new(ip: Ipv4Addr, nfs_cfg: NfsConfig) -> Self {
         // Locally administered, distinct from the NAT gateway's, so the guest
-        // keeps the virtual NFS host as its own ARP entry. (0xBF53 ≈ "BF-NFS".)
-        let mac = [0x02, 0x00, 0xDE, 0xAD, 0xBF, 0x53];
+        // keeps the virtual NFS host as its own ARP entry. Fold all four
+        // octets into the last two so two bridged instances with different
+        // NFS addresses never share an L2 address — a fixed suffix collided.
+        let o = ip.octets();
+        let fold = (u16::from(o[0]) << 8 | u16::from(o[1]))
+            ^ (u16::from(o[2]) << 8 | u16::from(o[3]));
+        let mac = [0x02, 0x00, 0xDE, 0xAD, (fold >> 8) as u8, fold as u8];
         let server = super::nfsudp::NfsServer::new(nfs_cfg.shared_dir.clone(), nfs_cfg.version);
         Self { ip, mac, server, ip_id: 1, reasm: Reassembler::default() }
     }
@@ -77,6 +82,23 @@ impl NfsVirtualHost {
 mod tests {
     use super::*;
     use crate::net::portmap::{getport_call, PROG_MOUNTD, PROG_NFS};
+    /// Two virtual NFS hosts must not share an L2 address: bridged instances
+    /// with distinct NFS subnets used to collide on one fixed MAC. The
+    /// derivation is stable for the same address and separates subnets even
+    /// when only the first two octets differ.
+    #[test]
+    fn distinct_nfs_hosts_get_distinct_macs() {
+        let a = host(Ipv4Addr::new(192, 168, 10, 1));
+        let b = host(Ipv4Addr::new(192, 168, 11, 1));
+        let c = host(Ipv4Addr::new(10, 0, 1, 1));
+        let d = host(Ipv4Addr::new(10, 1, 1, 1));
+        assert_ne!(a.mac, b.mac);
+        assert_ne!(c.mac, d.mac);
+        assert_eq!(a.mac, host(Ipv4Addr::new(192, 168, 10, 1)).mac, "the same address derives the same MAC");
+        assert_eq!(&a.mac[..4], &[0x02, 0x00, 0xDE, 0xAD]);
+        assert_eq!(a.mac[0] & 0x03, 0x02, "locally administered, unicast");
+    }
+
 
     fn host(ip: Ipv4Addr) -> NfsVirtualHost {
         NfsVirtualHost::new(ip, NfsConfig { shared_dir: "/nonexistent".into(),

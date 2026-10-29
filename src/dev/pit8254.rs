@@ -16,6 +16,7 @@ struct Channel {
     count: u16, // Current count value (simulated)
     reload: u16, // Reload value
     latched_count: Option<u16>,
+    latched_status: Option<u8>,
 
     // Configuration
     mode: u8,
@@ -39,6 +40,7 @@ impl Channel {
             count: 0,
             reload: 0,
             latched_count: None,
+            latched_status: None,
             mode: 0,
             rw_mode: 1, // Default LSB
             bcd: false,
@@ -136,36 +138,70 @@ impl Pit8254 {
         chan.period_duration = None;
     }
 
+    /// The counter's value right now: a pending latch wins, otherwise the
+    /// reload scaled by the time left in the current period.
+    fn current_count(chan: &Channel) -> u16 {
+        if let Some(latched) = chan.latched_count {
+            return latched;
+        }
+        if let (Some(start), Some(duration)) = (chan.period_start, chan.period_duration) {
+            if chan.input_freq > 0 {
+                let elapsed = start.elapsed();
+                if elapsed < duration {
+                    let remaining = duration - elapsed;
+                    let ns_per_tick = 1_000_000_000 / chan.input_freq as u128;
+                    return (remaining.as_nanos() / ns_per_tick) as u16;
+                }
+                return 0;
+            }
+        }
+        chan.count
+    }
+
+    /// The 8254 status byte: OUT, null count, RW, mode, BCD.
+    ///
+    /// OUT is high while a channel is armed. Null count is not modelled: this
+    /// PIT always has a value to read, so that bit stays clear.
+    fn status_byte(chan: &Channel) -> u8 {
+        let out = if chan.timer_id.is_some() { 0x80 } else { 0 };
+        out | ((chan.rw_mode & 0x3) << 4) | ((chan.mode & 0x7) << 1) | chan.bcd as u8
+    }
+
+    /// Control word `11`: latch the selected counters' status and/or count.
+    /// D5/D4 are active low; a latch already pending is left alone until read.
+    fn readback_command(&self, val: u8) {
+        let latch_count = (val & 0x20) == 0;
+        let latch_status = (val & 0x10) == 0;
+        if !latch_count && !latch_status {
+            return;
+        }
+        for idx in 0..self.channels.len() {
+            if (val & (1 << (idx + 1))) == 0 {
+                continue;
+            }
+            let mut chan = self.channels[idx].lock();
+            if latch_count && chan.latched_count.is_none() {
+                chan.latched_count = Some(Self::current_count(&chan));
+            }
+            if latch_status && chan.latched_status.is_none() {
+                chan.latched_status = Some(Self::status_byte(&chan));
+            }
+        }
+    }
+
     fn read_channel(&self, idx: usize) -> u8 {
         let mut chan = self.channels[idx].lock();
 
-        // If latched, read from latched value
-        let val = if let Some(latched) = chan.latched_count {
-            latched
-        } else {
-            // Calculate current count based on elapsed time
-            if let (Some(start), Some(duration)) = (chan.period_start, chan.period_duration) {
-                if chan.input_freq > 0 {
-                    let elapsed = start.elapsed();
-                    if elapsed < duration {
-                        let remaining = duration - elapsed;
-                        let ns_per_tick = 1_000_000_000 / chan.input_freq as u128;
-                        let ticks = (remaining.as_nanos() / ns_per_tick) as u16;
-                        ticks
-                    } else {
-                        0
-                    }
-                } else {
-                    chan.count
-                }
-            } else {
-                chan.count
-            }
-        };
+        // A status latch is served before the count latch, as on the chip.
+        if let Some(status) = chan.latched_status.take() {
+            return status;
+        }
+
+        let val = Self::current_count(&chan);
 
         match chan.rw_mode {
-            1 => (val & 0xFF) as u8, // LSB
-            2 => (val >> 8) as u8,   // MSB
+            1 => { chan.latched_count = None; (val & 0xFF) as u8 }
+            2 => { chan.latched_count = None; (val >> 8) as u8 }
             3 => { // LSB then MSB
                 if chan.rw_state == 0 {
                     chan.rw_state = 1;
@@ -230,7 +266,7 @@ impl Pit8254 {
         let bcd = (val & 1) != 0;
 
         if sc == 3 {
-            // Read-Back Command (ignored for now)
+            self.readback_command(val);
             return;
         }
 
@@ -242,20 +278,7 @@ impl Pit8254 {
             if rw == 0 {
                 // Counter Latch Command
                 if chan.latched_count.is_none() {
-                    // Calculate current count
-                    let current = if let (Some(start), Some(duration)) = (chan.period_start, chan.period_duration) {
-                        let elapsed = start.elapsed();
-                        if elapsed < duration {
-                            let remaining = duration - elapsed;
-                            let ns_per_tick = 1_000_000_000 / self.base_frequency as u128;
-                            (remaining.as_nanos() / ns_per_tick) as u16
-                        } else {
-                            0
-                        }
-                    } else {
-                        chan.count
-                    };
-                    chan.latched_count = Some(current);
+                    chan.latched_count = Some(Self::current_count(&chan));
                 }
             } else {
                 // Mode/RW setup
@@ -264,6 +287,7 @@ impl Pit8254 {
                 chan.bcd = bcd;
                 chan.rw_state = 0;
                 chan.latched_count = None;
+                chan.latched_status = None;
                 if idx == 2 {
                     update_chain = true;
                 }
@@ -411,6 +435,7 @@ impl Resettable for Pit8254 {
             chan.count = 0;
             chan.reload = 0;
             chan.latched_count = None;
+            chan.latched_status = None;
             chan.mode = 0;
             chan.rw_mode = 1; // default LSB
             chan.bcd = false;
@@ -444,6 +469,7 @@ fn chan_from_toml(v: &toml::Value, chan: &mut Channel) {
     if let Some(x) = get_field(v, "input_freq") { if let Some(n) = toml_u32(x) { chan.input_freq = n; } }
     // Transient state cleared on load.
     chan.latched_count = None;
+    chan.latched_status = None;
     chan.rw_state = 0;
     chan.period_start = None;
     chan.period_duration = None;
@@ -521,6 +547,57 @@ mod tests {
         program_mode2(&pit, 2, reload);
         thread::sleep(Duration::from_millis(2));
         pit
+    }
+
+    /// The read-back command (control word `11`) latches the selected counter's
+    /// status and/or count. When both are latched the status is returned first.
+    #[test]
+    fn readback_latches_status_before_count() {
+        let _lock = SERIAL.lock().unwrap();
+        let pit = make_pit(1_000_000);
+        // Channel 0: LSB+MSB, mode 3, BCD off.
+        pit.write(3, (3 << 4) | (3 << 1));
+        pit.write(0, 0x34);
+        pit.write(0, 0x12);
+        // D5=0 (latch count), D4=0 (latch status), D1=1 (channel 0).
+        pit.write(3, 0xC0 | (1 << 1));
+        let status = pit.read(0).data;
+        let lo = pit.read(0).data;
+        let hi = pit.read(0).data;
+        assert_eq!(status, (3 << 4) | (3 << 1), "status carries RW, mode and BCD");
+        assert_eq!((hi as u16) << 8 | lo as u16, 0x1234, "the latched count follows the status");
+    }
+
+    /// A status-only read-back latches no count, so the next data read is the
+    /// counter, not another status byte.
+    #[test]
+    fn readback_status_only_then_count() {
+        let _lock = SERIAL.lock().unwrap();
+        let pit = make_pit(1_000_000);
+        // Channel 0: LSB only, mode 2.
+        pit.write(3, (1 << 4) | (2 << 1));
+        pit.write(0, 0x40);
+        // D5=1 (status only), D4=0, D1=1 (channel 0).
+        pit.write(3, 0xC0 | 0x20 | (1 << 1));
+        assert_eq!(pit.read(0).data, (1 << 4) | (2 << 1));
+        assert_eq!(pit.read(0).data, 0x40);
+    }
+
+    /// A single-byte latch is released by its one read; the next read sees the
+    /// live counter (here: the new reload written while it was latched).
+    #[test]
+    fn single_byte_latch_releases_after_one_read() {
+        let _lock = SERIAL.lock().unwrap();
+        let pit = make_pit(1_000_000);
+        // Channel 0: LSB only, mode 0.
+        pit.write(3, (1 << 4));
+        pit.write(0, 0x34);
+        // Counter latch command for channel 0.
+        pit.write(3, 0x00);
+        // Change the reload while the latch is pending (data write, RW stays LSB).
+        pit.write(0, 0x78);
+        assert_eq!(pit.read(0).data, 0x34, "the latched value");
+        assert_eq!(pit.read(0).data, 0x78, "the latch released; this is the live count");
     }
 
     /// Channel 2 at 1 MHz, reload=100: one period = 100 µs wall-clock.

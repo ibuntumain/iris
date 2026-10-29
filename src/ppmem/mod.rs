@@ -4,14 +4,17 @@
 //! (`BusDevice`, `Resettable`, and `Memory`'s inherent methods) but backs the
 //! guest's physical address space with real host virtual memory, so that
 //! SIMM mirroring and the low-512KB alias become *mappings* rather than
-//! address arithmetic on every access.
+//! address arithmetic on every access. `devmap` applies the same idea to
+//! the physical address decode table itself.
 //!
 //! Full design and rationale: `docs/ppmem-design.md`.
-//! Verified platform findings: `rules/build/mmap-rs-fixed-address-aliasing.md`.
+//! Verified platform findings: `clanker/build/mmap-rs-fixed-address-aliasing.md`.
 
+pub mod devmap;
 pub mod map;
 #[allow(clippy::module_inception)]
 pub mod ppmem;
 
 pub use map::{align_up, granularity, is_aligned, AddrSpace, Prot, SharedMem};
-pub use ppmem::{MappedMemory, PpMemSpace, PpMemory, BITMAP_SHIFT, WINDOW_SIZE};
+pub use devmap::SparseDeviceMap;
+pub use ppmem::{bitmap_maps, MappedMemory, PpMemSpace, PpMemory, BITMAP_SHIFT, WINDOW_SIZE};

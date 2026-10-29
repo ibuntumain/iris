@@ -1,4 +1,5 @@
 use std::fs::OpenOptions;
+use crate::irq::IrqLine;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::thread;
@@ -273,7 +274,9 @@ struct Wd33c93aState {
     // interrupt line low. This allows SELECT_ATN to push 0x11 then 0x8E as two
     // separate interrupts, matching real hardware behaviour.
     irq_fifo: VecDeque<(u8, Option<u8>, bool)>, // (status, phase, deferred) — deferred=true: worker drops lock before delivery
-    callback: Option<Arc<dyn ScsiCallback>>,
+    /// The chip's INT, as the board wires it. On the HPC3, dropping it also
+    /// settles the paired PDMA channel's half of the shared SCSI line.
+    irq: Option<IrqLine>,
     // Debug tracking: last values returned for register reads
     last_read_asr: Option<u8>,
     last_read_reg: Option<(u8, u8)>, // (register, value)
@@ -284,11 +287,6 @@ struct Wd33c93aState {
     deferred_int: Arc<AtomicBool>,
 }
 
-pub trait ScsiCallback: Send + Sync {
-    /// Set the SCSI interrupt line. Calling with false also clears any paired
-    /// PDMA completion bit (implementors handle this internally).
-    fn set_interrupt(&self, level: bool);
-}
 
 // Safety: `Cell<T>` is never `Sync` regardless of `T` (interior mutability
 // without synchronization) — needed here because `cpu_cycles` (a `Cell`,
@@ -299,6 +297,12 @@ pub trait ScsiCallback: Send + Sync {
 // `Arc` across threads. Every other field is already genuinely `Sync` on
 // its own.
 unsafe impl Sync for Wd33c93a {}
+
+/// What the Indy's targets report in INQUIRY. The CD-ROM matches the Sony
+/// CDU-76S the Indy shipped with: IRIX's mediad uses the vendor and product
+/// strings for feature detection (volume control, eject).
+pub const INDY_CDROM: crate::scsi::ScsiIdentity = crate::scsi::ScsiIdentity::new(b"Sony    ", b"CDU-76S         ", b"1.0 ");
+pub const INDY_DISK: crate::scsi::ScsiIdentity = crate::scsi::ScsiIdentity::new(b"SGI     ", b"IRIS EMUL DISK  ", b"1.0 ");
 
 pub struct Wd33c93a {
     state: Arc<Mutex<Wd33c93aState>>,
@@ -323,17 +327,17 @@ pub struct Wd33c93a {
 }
 
 impl Wd33c93a {
-    pub fn new(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::new_with_config(dma, callback, heartbeat, true)
+    pub fn new(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>) -> Self {
+        Self::new_with_config(dma, irq, heartbeat, true)
     }
 
-    pub fn new_with_config(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, deferred_int: bool) -> Self {
-        Self::new_with_id(dma, callback, heartbeat, deferred_int, 0)
+    pub fn new_with_config(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>, deferred_int: bool) -> Self {
+        Self::new_with_id(dma, irq, heartbeat, deferred_int, 0)
     }
 
     /// Same as `new_with_config`, but tags every log line with `id` (the
     /// HPC3 SCSI controller number) — see `Wd33c93aState.id`'s doc comment.
-    pub fn new_with_id(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, deferred_int: bool, id: u8) -> Self {
+    pub fn new_with_id(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>, deferred_int: bool, id: u8) -> Self {
         let deferred_int_arc = Arc::new(AtomicBool::new(deferred_int));
         Self {
             state: Arc::new(Mutex::new(Wd33c93aState {
@@ -356,7 +360,7 @@ impl Wd33c93a {
                 xfer_direction_in: false,
                 pending_cdb: Vec::new(),
                 irq_fifo: VecDeque::new(),
-                callback,
+                irq,
                 last_read_asr: None,
                 last_read_reg: None,
                 last_cmd: 0,
@@ -398,61 +402,10 @@ impl Wd33c93a {
         overlay: bool,
         overlay_path_override: Option<&str>,
     ) -> std::io::Result<()> {
-        use crate::cow_disk::CowDisk;
-        use crate::scsi::DiskBackend;
-
-        // Empty CD-ROM (drive present, tray empty). Stored backend=None so
-        // TEST UNIT READY / READ CAPACITY / READ return MEDIUM NOT PRESENT,
-        // while INQUIRY still advertises the drive. Use insert_disc() to
-        // mount media later.
-        if is_cdrom && path.is_empty() {
-            let mut state = self.state.lock();
-            if id < 8 {
-                state.devices[id] = Some(crate::scsi::ScsiDevice::new_empty_cdrom());
-            }
-            return Ok(());
-        }
-        let is_chd_path = crate::chd_disk::is_chd(path);
-
-        let (backend, size) = if is_chd_path {
-            {
-                use crate::chd_disk::{ChdCd, ChdHd};
-                if is_cdrom {
-                    let cd = ChdCd::open(path)?;
-                    let sz = cd.size();
-                    (DiskBackend::ChdCd(cd), sz)
-                } else {
-                    // HD CHD. The `overlay` flag is the per-disk copy-on-write
-                    // toggle: COW on → always overlay (even an uncompressed base
-                    // gets a diff) and never auto-fold on exit (commit/roll back
-                    // manually); COW off → write in place (uncompressed) or a diff
-                    // that auto-folds on a clean exit (compressed).
-                    let hd = ChdHd::open(path, overlay)?;
-                    let sz = hd.size();
-                    (DiskBackend::ChdHd(hd), sz)
-                }
-            }
-        } else if overlay && !is_cdrom {
-            let overlay_path = overlay_path_override
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("{}.overlay", path));
-            let cow = CowDisk::new(path, &overlay_path)?;
-            let sz = cow.size();
-            (DiskBackend::Cow(cow), sz)
-        } else {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(!is_cdrom)
-                .open(path)?;
-            let sz = file.metadata()?.len();
-            (DiskBackend::Direct(file), sz)
-        };
-
-        let disc_list = if is_cdrom { discs } else { vec![] };
-
+        let dev = ScsiDevice::open(path, is_cdrom, discs, overlay, overlay_path_override, if is_cdrom { INDY_CDROM } else { INDY_DISK })?;
         let mut state = self.state.lock();
         if id < 8 {
-            state.devices[id] = Some(ScsiDevice::new(backend, size, is_cdrom, path.to_string(), disc_list));
+            state.devices[id] = Some(dev);
         }
         Ok(())
     }
@@ -477,95 +430,6 @@ impl Wd33c93a {
         let mut state = self.state.lock();
         state.devices[id] = Some(ScsiDevice::new_daynaport(dp));
         Ok(())
-    }
-
-    /// Mount media on a CD-ROM device (newly inserts or swaps existing).
-    /// Errors if the slot is empty, is not a CD-ROM, or the file can't open.
-    pub fn insert_disc(&self, id: usize, path: &str) -> Result<(), String> {
-        let mut state = self.state.lock();
-        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
-            None => Err(format!("No device at SCSI ID {}", id)),
-            Some(dev) if !dev.is_cdrom() => Err(format!("SCSI ID {} is not a CD-ROM", id)),
-            Some(dev) => dev.insert_media(path).map_err(|e| format!("insert_disc: {}", e)),
-        }
-    }
-
-    /// Unload media from a CD-ROM (leave the drive present but empty).
-    /// Use this when you want "drive present, no disc" rather than the
-    /// changer-cycle behaviour of `eject_disc`.
-    pub fn eject_to_empty(&self, id: usize) -> Result<(), String> {
-        let mut state = self.state.lock();
-        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
-            None => Err(format!("No device at SCSI ID {}", id)),
-            Some(dev) if !dev.is_cdrom() => Err(format!("SCSI ID {} is not a CD-ROM", id)),
-            Some(dev) => { dev.unload_media(); Ok(()) }
-        }
-    }
-
-    /// Eject the current disc on a CD-ROM device and advance to the next in
-    /// the changer list.  Returns the new active path, or an error string.
-    pub fn eject_disc(&self, id: usize) -> Result<String, String> {
-        let mut state = self.state.lock();
-        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
-            None => Err(format!("No device at SCSI ID {}", id)),
-            Some(dev) => dev.eject_next().ok_or_else(|| {
-                if !dev.is_cdrom() {
-                    format!("SCSI ID {} is not a CD-ROM", id)
-                } else {
-                    format!("SCSI ID {} has only one disc (nothing to eject to)", id)
-                }
-            }),
-        }
-    }
-
-    /// Load an arbitrary image path into a CD-ROM device and make it the active
-    /// disc immediately (medium change). Returns the loaded path.
-    pub fn load_disc(&self, id: usize, path: String) -> Result<String, String> {
-        let mut state = self.state.lock();
-        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
-            None => Err(format!("No device at SCSI ID {}", id)),
-            Some(dev) => dev.load_disc(path),
-        }
-    }
-
-    /// Add a disc path at position 1 (next-after-eject) for a CD-ROM device.
-    pub fn add_disc(&self, id: usize, path: String) -> Result<(), String> {
-        let mut state = self.state.lock();
-        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
-            None => Err(format!("No device at SCSI ID {}", id)),
-            Some(dev) => dev.add_disc(path),
-        }
-    }
-
-    /// Remove a disc by ordinal from a CD-ROM device's queue.
-    pub fn remove_disc(&self, id: usize, ordinal: usize) -> Result<String, String> {
-        let mut state = self.state.lock();
-        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
-            None => Err(format!("No device at SCSI ID {}", id)),
-            Some(dev) => dev.remove_disc(ordinal),
-        }
-    }
-
-    /// Move a disc by ordinal to position 1 (next-after-eject).
-    pub fn move_disc_next(&self, id: usize, ordinal: usize) -> Result<(), String> {
-        let mut state = self.state.lock();
-        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
-            None => Err(format!("No device at SCSI ID {}", id)),
-            Some(dev) => dev.move_disc_next(ordinal),
-        }
-    }
-
-    /// Return disc info for all attached CD-ROM devices.
-    pub fn disc_status(&self) -> Vec<(usize, String, Vec<String>, u64, u64)> {
-        let state = self.state.lock();
-        state.devices.iter().enumerate()
-            .filter_map(|(id, d)| {
-                let dev = d.as_ref()?;
-                if !dev.is_cdrom() { return None; }
-                let (phys, logical) = dev.block_sizes();
-                Some((id, dev.current_disc().to_string(), dev.disc_list().to_vec(), phys, logical))
-            })
-            .collect()
     }
 
     /// Reset the COW overlay on every attached device that's using COW.
@@ -1127,6 +991,10 @@ impl Device for Wd33c93a {
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
         if cmd == "scsi" || cmd == "scsi0" || cmd == "scsi1" {
+            // status, dayna and the changer subcommands are every controller's.
+            if let Some(done) = crate::scsi_monitor::scsi_subcommand(self, args, &mut *writer) {
+                return done;
+            }
             match args.first().copied() {
                 Some("wdt") => {
                     #[cfg(feature = "developer")] {
@@ -1244,171 +1112,22 @@ impl Device for Wd33c93a {
                     writeln!(writer, "SCSI deferred interrupts {}", if val { "enabled" } else { "disabled" }).unwrap();
                     return Ok(());
                 }
-                Some("dayna") => {
-                    {
-                        let state = self.state.lock();
-                        let mut found = false;
-                        for dev in state.devices.iter().flatten() {
-                            if let Some(dp) = dev.daynaport() {
-                                found = true;
-                                for line in dp.status_lines() {
-                                    writeln!(writer, "{}", line).unwrap();
-                                }
-                            }
-                        }
-                        if !found {
-                            writeln!(writer, "No DaynaPort targets attached").unwrap();
-                        }
-                    }
-                    return Ok(());
-                }
-                Some("status") => {
-                    {
-                        let state = self.state.lock();
-                        for dev in state.devices.iter().flatten() {
-                            if let Some(dp) = dev.daynaport() {
-                                writeln!(writer, "{}", dp.status_lines()[0]).unwrap();
-                            }
-                        }
-                    }
-                    let discs = self.disc_status();
-                    if discs.is_empty() {
-                        writeln!(writer, "No CD-ROM devices attached").unwrap();
-                    } else {
-                        for (id, active, list, phys, logical) in discs {
-                            writeln!(writer, "SCSI ID {}: {} ({} disc(s))  phys_block={} logical_block={}",
-                                id, active, list.len(), phys, logical).unwrap();
-                            for (i, d) in list.iter().enumerate() {
-                                let tag = if i == 0 { " <active>" } else if i == 1 { " <next>" } else { "" };
-                                writeln!(writer, "  [{}] {}{}", i, d, tag).unwrap();
-                            }
-                        }
-                    }
-                    return Ok(());
-                }
-                Some("eject") => {
-                    let id: usize = args.get(1)
-                        .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| "Usage: scsi eject <id>".to_string())?;
-                    match self.eject_disc(id) {
-                        Ok(path) => writeln!(writer, "SCSI ID {}: switched to {}", id, path).unwrap(),
-                        Err(e)   => writeln!(writer, "Error: {}", e).unwrap(),
-                    }
-                    return Ok(());
-                }
-                Some("add") => {
-                    let id: usize = args.get(1)
-                        .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| "Usage: scsi add <id> <path>".to_string())?;
-                    let path = args.get(2)
-                        .ok_or_else(|| "Usage: scsi add <id> <path>".to_string())?
-                        .to_string();
-                    match self.add_disc(id, path.clone()) {
-                        Ok(()) => writeln!(writer, "SCSI ID {}: added {} as next disc", id, path).unwrap(),
-                        Err(e) => writeln!(writer, "Error: {}", e).unwrap(),
-                    }
-                    return Ok(());
-                }
-                Some("list") => {
-                    let id: usize = args.get(1)
-                        .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| "Usage: scsi list <id>".to_string())?;
-                    let state = self.state.lock();
-                    match state.devices.get(id).and_then(|d| d.as_ref()) {
-                        None => writeln!(writer, "No device at SCSI ID {}", id).unwrap(),
-                        Some(dev) if !dev.is_cdrom() => writeln!(writer, "SCSI ID {} is not a CD-ROM", id).unwrap(),
-                        Some(dev) => {
-                            let list = dev.disc_list();
-                            writeln!(writer, "SCSI ID {} queue ({} disc(s)):", id, list.len()).unwrap();
-                            for (i, d) in list.iter().enumerate() {
-                                writeln!(writer, "  [{}] {}{}", i, d,
-                                    if i == 0 { " <active>" } else if i == 1 { " <next>" } else { "" }).unwrap();
-                            }
-                        }
-                    }
-                    return Ok(());
-                }
-                Some("del") => {
-                    let id: usize = args.get(1)
-                        .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| "Usage: scsi del <id> <ordinal>".to_string())?;
-                    let ordinal: usize = args.get(2)
-                        .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| "Usage: scsi del <id> <ordinal>".to_string())?;
-                    match self.remove_disc(id, ordinal) {
-                        Ok(path) => writeln!(writer, "SCSI ID {}: removed [{}] {}", id, ordinal, path).unwrap(),
-                        Err(e)   => writeln!(writer, "Error: {}", e).unwrap(),
-                    }
-                    return Ok(());
-                }
-                Some("next") => {
-                    let id: usize = args.get(1)
-                        .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| "Usage: scsi next <id> <ordinal>".to_string())?;
-                    let ordinal: usize = args.get(2)
-                        .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| "Usage: scsi next <id> <ordinal>".to_string())?;
-                    match self.move_disc_next(id, ordinal) {
-                        Ok(()) => writeln!(writer, "SCSI ID {}: [{}] moved to next position", id, ordinal).unwrap(),
-                        Err(e) => writeln!(writer, "Error: {}", e).unwrap(),
-                    }
-                    return Ok(());
-                }
-                _ => return Err("Usage: scsi status | scsi dayna | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off>".to_string()),
+                _ => return Err(format!("Usage: {} | scsi regs | scsi wdt [N] | scsi defer <on|off> | scsi debug <on|off>", crate::scsi_monitor::SCSI_USAGE)),
             }
         }
         if cmd == "cow" {
-            let mut state = self.state.lock();
-            match args.first().copied() {
-                Some("status") => {
-                    for (id, dev) in state.devices.iter().enumerate() {
-                        if let Some(d) = dev {
-                            if d.is_cow() {
-                                writeln!(writer, "SCSI {}: COW overlay, {} dirty sectors", id, d.cow_dirty_count()).unwrap();
-                            } else {
-                                writeln!(writer, "SCSI {}: direct (no overlay)", id).unwrap();
-                            }
-                        }
-                    }
-                    return Ok(());
-                }
-                Some("commit") => {
-                    let ids: Vec<usize> = if let Some(id_str) = args.get(1) {
-                        vec![id_str.parse().map_err(|_| "invalid SCSI ID".to_string())?]
-                    } else {
-                        (0..8).filter(|&i| state.devices[i].as_ref().map(|d| d.is_cow()).unwrap_or(false)).collect()
-                    };
-                    for id in ids {
-                        if let Some(dev) = &mut state.devices[id] {
-                            match dev.cow_commit() {
-                                Ok(n) if n > 0 => writeln!(writer, "SCSI {}: committed {} sectors to base image", id, n).unwrap(),
-                                Ok(_) => writeln!(writer, "SCSI {}: nothing to commit", id).unwrap(),
-                                Err(e) => writeln!(writer, "SCSI {}: commit failed: {}", id, e).unwrap(),
-                            }
-                        }
-                    }
-                    return Ok(());
-                }
-                Some("reset") => {
-                    let ids: Vec<usize> = if let Some(id_str) = args.get(1) {
-                        vec![id_str.parse().map_err(|_| "invalid SCSI ID".to_string())?]
-                    } else {
-                        (0..8).filter(|&i| state.devices[i].as_ref().map(|d| d.is_cow()).unwrap_or(false)).collect()
-                    };
-                    for id in ids {
-                        if let Some(dev) = &mut state.devices[id] {
-                            match dev.cow_reset() {
-                                Ok(()) => writeln!(writer, "SCSI {}: overlay reset (all writes discarded)", id).unwrap(),
-                                Err(e) => writeln!(writer, "SCSI {}: reset failed: {}", id, e).unwrap(),
-                            }
-                        }
-                    }
-                    return Ok(());
-                }
-                _ => return Err("Usage: cow status | cow commit [id] | cow reset [id]".to_string()),
-            }
+            return crate::scsi_monitor::cow_command(self, args, &mut *writer);
         }
         Err("Command not found".to_string())
+    }
+}
+
+/// The monitor's `scsi`/`cow` subcommands and the run-time disc changes
+/// come from `scsi_monitor` through this.
+impl crate::scsi_monitor::ScsiTargets for Wd33c93a {
+    fn with_targets<R>(&self, f: impl FnOnce(&mut [Option<ScsiDevice>]) -> R) -> R {
+        let mut state = self.state.lock();
+        f(&mut state.devices[..])
     }
 }
 
@@ -1538,7 +1257,7 @@ impl Wd33c93aState {
         if new_int != old_int {
             wdt!("INT_LINE {} (asr={:02x})",
                 if new_int != 0 { "ASSERT" } else { "DEASSERT" }, self.asr);
-            if let Some(cb) = &self.callback { cb.set_interrupt(new_int != 0); }
+            if let Some(irq) = &self.irq { irq.set(new_int != 0); }
         }
     }
 
@@ -2011,7 +1730,8 @@ impl Wd33c93aState {
 
         // Determine data_len based on command
         let data_len = match cdb[0] {
-            scsi_cmd::INQUIRY | scsi_cmd::REQUEST_SENSE | scsi_cmd::MODE_SENSE_6 => {
+            scsi_cmd::REQUEST_SENSE => ScsiDataLength::Fixed(crate::scsi::request_sense_alloc_len(&cdb)),
+            scsi_cmd::INQUIRY | scsi_cmd::MODE_SENSE_6 => {
                 ScsiDataLength::Fixed(cdb[4] as usize)
             }
             scsi_cmd::READ_BUFFER => {
@@ -2194,19 +1914,20 @@ impl Wd33c93aState {
             while i < total {
                 let is_last = i == last_idx;
                 let (mut st, _) = dma_dev.write(data[i] as u32, is_last);
-                // On first byte, if channel not yet active (driver calls wdsc_dmago after
-                // issuing TRANSFER_INFO), spin up to 1ms for it to become ready.
                 if i == 0 && st.not_active() {
                     // Driver calls wdsc_dmago *after* writing TRANSFER_INFO, so the channel
-                    // may not be active yet. Spin up to 100ms to let the CPU thread arm it.
+                    // may not be active yet. Wait up to 100ms for the CPU thread to arm it.
+                    // Sleep between attempts rather than yield_now(): a tight yield loop
+                    // pins this thread's core and hammers the channel lock the CPU thread
+                    // needs, which on few-core hosts delays the very arming it waits for.
+                    // 100 µs is far below the command timescales SCSI runs at.
                     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
                     while st.not_active() && std::time::Instant::now() < deadline {
-                        std::thread::yield_now();
+                        std::thread::sleep(std::time::Duration::from_micros(100));
                         (st, _) = dma_dev.write(data[i] as u32, is_last);
                     }
                     if st.not_active() {
-                        dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 1ms — pausing", self.id);
-                        //eprintln!("WD33C93A: DMA channel still not active after 1ms — pausing");
+                        dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 100ms — pausing", self.id);
                     }
                 }
                 // On refused: byte was not accepted, do not advance or decrement.
@@ -2274,12 +1995,14 @@ impl Wd33c93aState {
                             if data.is_empty() {
                                 // Channel not yet active — driver issues TRANSFER_INFO before dmago
                                 // (NetBSD: SET_SBIC_cmd then sc_dmago on same CPU thread).
-                                // Spin up to 100ms for the CPU thread to call dmago.
+                                // Wait up to 100ms for the CPU thread to call dmago, sleeping
+                                // between attempts: a yield_now() hot loop steals the core the
+                                // CPU thread needs to arm the channel (see send_data_chunked).
                                 wdt!("DMA_IN spin-wait: channel not yet active");
                                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
                                 let mut got = false;
                                 while std::time::Instant::now() < deadline {
-                                    std::thread::yield_now();
+                                    std::thread::sleep(std::time::Duration::from_micros(100));
                                     if let Some((val, st, _)) = dma_dev.read() {
                                         data.push(val as u8);
                                         self.decrement_transfer_count();
@@ -2512,7 +2235,8 @@ mod data_out_phase_tests {
         {
             let mut s = dev.state.lock();
             s.devices[2] = Some(ScsiDevice::new(
-                scsi::DiskBackend::Direct(file), 1 << 20, false, path.display().to_string(), Vec::new()));
+                Box::new(crate::block_node::RawNode::from_file(file, 1 << 20)),
+                1 << 20, false, path.display().to_string(), Vec::new(), INDY_DISK));
             s.advanced_mode = true;
             s.target_id = 2;
             s.regs[regs::DESTINATION_ID as usize] = 2;

@@ -71,6 +71,9 @@ pub struct Rex3Screen {
     /// board's own compositor (GR2's `gr2comp`). The renderer's compositor
     /// then presents it as-is instead of decoding Newport state.
     pub prebuilt: bool,
+    /// Bumped each time `rgba` is rewritten with a composed frame, so frame
+    /// consumers (VNC) can skip unchanged ones without comparing pixels.
+    pub frame_seq: u64,
 }
 
 impl Rex3Screen {
@@ -95,6 +98,7 @@ impl Rex3Screen {
             status_bar_only:  false,
             fb_borrowed:      false,
             prebuilt:         false,
+            frame_seq:        0,
         }
     }
 
@@ -829,6 +833,21 @@ impl StatusBar {
             }
         }
     }
+}
+
+/// Save `px` (R, G, B, A bytes, `w` x `h`, tightly packed) as a PNG, written
+/// to a temporary name and renamed, so a reader never sees half a file.
+pub fn save_png_rgba8(path: &str, px: &[u8], w: u32, h: u32) -> Result<(), String> {
+    let tmp = format!("{path}.tmp");
+    {
+        let f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut wr = enc.write_header().map_err(|e| e.to_string())?;
+        wr.write_image_data(px).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 /// Save the composited rgba buffer as a PNG file.

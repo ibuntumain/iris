@@ -16,7 +16,7 @@ use crate::ram::{ram_summary, ram_presets};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MemoryUiContext {
     pub running: bool,
-    pub started_banks: Option<[u32; 4]>,
+    pub started_banks: Option<[u32; iris::config::MAX_BANKS]>,
     /// The CPU the running guest actually booted on, so a pending change is
     /// shown as pending rather than as fact. `None` when nothing is running.
     pub started_cpu: Option<CpuModel>,
@@ -210,6 +210,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     let mut action = ConfigAction::None;
     ui.heading(t!("config-tab-general"));
     ui.label(t!("config-platform", platform = cfg.machine.profile.label()));
+    let profile_before = cfg.machine.profile;
     ComboBox::from_id_salt("machine_profile")
         .selected_text(cfg.machine.profile.label())
         .show_ui(ui, |ui| {
@@ -217,14 +218,20 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
                 ui.selectable_value(&mut cfg.machine.profile, p, p.label());
             }
         });
-    // GR2 Extreme is Indigo2-only; moving to Indy keeps the closest board
-    // rather than leaving a config `validate()` would reject at Start.
-    if !cfg.graphics.board.supports(cfg.machine.profile) {
-        cfg.graphics.board = GraphicsBoard::Xz;
+    if cfg.machine.profile == MachineProfile::OctaneIp30 && profile_before != MachineProfile::OctaneIp30 {
+        octane_defaults(cfg);
+    }
+    let octane = cfg.machine.profile == MachineProfile::OctaneIp30;
+    // A board the new machine does not take would fail `validate()` at
+    // Start: GR2 Extreme moving to Indy keeps the closest board (XZ); any
+    // other falls back to the machine's default.
+    let board = cfg.graphics_board();
+    if !board.supports(cfg.machine.profile) {
+        cfg.graphics.board = (board == GraphicsBoard::Extreme && !octane).then_some(GraphicsBoard::Xz);
     }
     // Only IP28 can express 256/512 MB banks. Clamp them when switching to
     // IP22/IP24 so the new profile passes `validate()` at Start.
-    if cfg.machine.profile != MachineProfile::Indigo2Ip28 {
+    if !matches!(cfg.machine.profile, MachineProfile::Indigo2Ip28 | MachineProfile::OctaneIp30) {
         for bank in &mut cfg.banks {
             if *bank > 128 { *bank = 128; }
         }
@@ -233,6 +240,9 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     subtitle(ui, t!("config-viewport-subtitle"));
     if cfg.machine.profile == MachineProfile::Indigo2Ip22 {
         subtitle(ui, t!("config-indigo2-subtitle"));
+    }
+    if octane {
+        subtitle(ui, t!("config-octane-subtitle"));
     }
     if cfg.machine.profile == MachineProfile::Indigo2Ip28 {
         subtitle(ui, t!("config-ip28-subtitle"));
@@ -249,7 +259,8 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // CPU models are compiled in and `Machine::new` picks between them at
         // construction, so the choice belongs to the machine's config the same
         // way its RAM does.
-        ui.add_enabled_ui(!mem_ctx.running, |ui| {
+        // The Octane has one CPU option, the 195 MHz R10000.
+        ui.add_enabled_ui(!mem_ctx.running && !octane, |ui| {
             ComboBox::from_id_salt("cpu_model")
                 .selected_text(cfg.machine.cpu.label())
                 .show_ui(ui, |ui| {
@@ -280,7 +291,8 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
 
         ui.label(t!("config-clock"));
         ui.horizontal(|ui| {
-            let auto_default = if cfg.machine.profile.ip28() { 97.5 } else { 33.0 };
+            // CP0 Count: half the CPU clock on the R10000 machines (the Octane's is 195 MHz).
+            let auto_default = if cfg.machine.profile.ip28() || octane { 97.5 } else { 33.0 };
             let mut mhz = cfg.clock.fixed_mhz.unwrap_or(auto_default);
             let changed = ui.add(DragValue::new(&mut mhz).range(0.1..=1000.0).suffix(" MHz")).changed();
             if changed { cfg.clock.fixed_mhz = Some(mhz); }
@@ -336,8 +348,12 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     }
     ui.separator();
 
-    show_board_picker(ui, cfg, mem_ctx.running);
-    if cfg.graphics.board == GraphicsBoard::Newport {
+    if octane {
+        show_octane_graphics_picker(ui, cfg, mem_ctx.running);
+    } else {
+        show_board_picker(ui, cfg, mem_ctx.running);
+    }
+    if !octane && cfg.graphics_board() == GraphicsBoard::Newport {
         ui.horizontal(|ui| {
             ui.label(t!("config-newport-heads"));
             ui.add(egui::DragValue::new(&mut cfg.graphics.heads).range(1..=2).speed(0.1));
@@ -346,7 +362,9 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             }
         });
     }
-    show_resolution_picker(ui, cfg, false);
+    if !octane {
+        show_resolution_picker(ui, cfg, false);
+    }
     ui.add_space(4.0);
     Grid::new("general_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label(t!("config-prom"));
@@ -358,6 +376,8 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // is discoverable instead of "delete the text by hand". Disabled when
         // already empty, so the confirm prompt only ever appears when a custom
         // PROM is selected.
+        // The Octane has no built-in PROM: it needs the IP30 PROM image.
+        if !octane {
         ui.label("");
         ui.horizontal(|ui| {
             let custom = !cfg.prom.is_empty();
@@ -372,15 +392,25 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             }
         });
         ui.end_row();
+        }
 
         ui.label(t!("config-nvram"));
         path_row(ui, "nvram", &mut cfg.nvram, Pick::SaveFile, &nvram_filters());
         ui.end_row();
 
-        ui.label(t!("config-nveeprom"))
-            .tip(t!("config-nveeprom-tip"));
-        path_row(ui, "nveeprom", &mut cfg.nveeprom, Pick::SaveFile, &nvram_filters());
-        ui.end_row();
+        if octane {
+            // `[octane] flash`: the boot flash the PROM writes its records to.
+            ui.label(t!("config-octane-flash")).tip(t!("config-octane-flash-tip"));
+            let mut flash = cfg.octane.flash.clone().unwrap_or_default();
+            path_row(ui, "octane_flash", &mut flash, Pick::SaveFile, &nvram_filters());
+            cfg.octane.flash = if flash.is_empty() { None } else { Some(flash) };
+            ui.end_row();
+        } else {
+            ui.label(t!("config-nveeprom"))
+                .tip(t!("config-nveeprom-tip"));
+            path_row(ui, "nveeprom", &mut cfg.nveeprom, Pick::SaveFile, &nvram_filters());
+            ui.end_row();
+        }
 
         ui.label(t!("config-serial-log"));
         path_row_opt(ui, "serial_log", &mut cfg.serial_log, Pick::SaveFile, &any_filters());
@@ -518,7 +548,7 @@ fn show_rtc_offset(ui: &mut Ui, off: &mut RtcOffset, running: bool) {
 }
 
 fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let before = cfg.graphics.board;
+    let before = cfg.graphics_board();
     let mut choice = before;
     ui.horizontal(|ui| {
         ui.label(t!("config-graphics-board"));
@@ -538,7 +568,7 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     // Every non-Newport choice is single-head with no VC2 presets;
     // clear those so the config still passes `validate()`.
     if choice != before {
-        cfg.graphics.board = choice;
+        cfg.graphics.board = Some(choice);
         if choice != GraphicsBoard::Newport {
             cfg.graphics.heads = 1;
             cfg.graphics.resolution = NewportResolution::Guest;
@@ -563,8 +593,64 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     }
 }
 
+/// The Octane's graphics port holds an IMPACT board (Solid, High as the SI
+/// with texture option, Maximum as the MXI) or nothing (`[graphics] board
+/// = "none"`); the other boards are not modelled there.
+fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
+    let fitted = cfg.graphics_board();
+    let mut choice = fitted;
+    let name = |b: GraphicsBoard| if b == GraphicsBoard::None { t!("config-octane-graphics-none") } else { b.label().to_string() };
+    ui.horizontal(|ui| {
+        ui.label(t!("config-graphics-board"));
+        ui.add_enabled_ui(!running, |ui| {
+            ComboBox::from_id_salt("octane_graphics")
+                .selected_text(name(choice))
+                .show_ui(ui, |ui| {
+                    for b in [GraphicsBoard::SolidImpact, GraphicsBoard::HighImpact, GraphicsBoard::MaxImpact] {
+                        ui.selectable_value(&mut choice, b, b.label());
+                    }
+                    ui.selectable_value(&mut choice, GraphicsBoard::None, t!("config-octane-graphics-none"));
+                });
+        });
+    });
+    if choice != fitted {
+        cfg.graphics.board = Some(choice);
+        cfg.graphics.heads = 1;
+        cfg.graphics.resolution = NewportResolution::Guest;
+    }
+    if running {
+        ui.label(
+            RichText::new(t!("config-graphics-locked"))
+                .color(Color32::from_rgb(220, 170, 90))
+                .small(),
+        );
+    }
+    subtitle(ui, t!("config-octane-graphics-subtitle"));
+}
+
+/// What switching a machine to the Octane changes so it passes `validate()`:
+/// the R10000, a valid bank layout (bank 0 filled, 64 to 512 MB, no gaps)
+/// and a graphics board it models.
+fn octane_defaults(cfg: &mut MachineConfig) {
+    cfg.machine.cpu = CpuModel::R10000;
+    let sizes = MachineProfile::OctaneIp30.bank_sizes();
+    let banks = &cfg.banks[..MachineProfile::OctaneIp30.memory_banks()];
+    let filled = banks.iter().take_while(|&&b| b != 0).count();
+    let valid = filled > 0 && banks[filled..].iter().all(|&b| b == 0) && banks.iter().all(|b| sizes.contains(b));
+    if !valid {
+        let total: u32 = banks.iter().sum();
+        cfg.banks = crate::dialogs::new_machine::distribute_ram(total.clamp(64, 2048), MachineProfile::OctaneIp30);
+    }
+    if !cfg.graphics_board().supports(MachineProfile::OctaneIp30) {
+        cfg.graphics.board = None;
+    }
+    cfg.graphics.heads = 1;
+    cfg.graphics.resolution = NewportResolution::Guest;
+    cfg.octane.graphics = None;
+}
+
 fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let newport = cfg.graphics.board == GraphicsBoard::Newport && !cfg.headless;
+    let newport = cfg.graphics_board() == GraphicsBoard::Newport && !cfg.headless;
     ui.horizontal(|ui| {
         let label = ui.label(t!("config-resolution"));
         if !newport {
@@ -613,22 +699,24 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
         subtitle(ui, t!("config-ram-applies-subtitle"));
         subtitle(ui, t!("config-ram-subtitle"));
     }
-    let ip28_banks = cfg.machine.profile.ip28();
+    let profile = cfg.machine.profile;
     ui.add_space(4.0);
     ui.label(t!("config-ram-presets"));
     ui.horizontal_wrapped(|ui| {
-        for &p in ram_presets(ip28_banks) {
+        for &p in ram_presets(profile) {
             if ui
                 .add_enabled(!mem_ctx.running, egui::Button::new(t!("config-megabytes", size = p)))
                 .on_disabled_hover_text(t!("config-ram-locked"))
                 .clicked()
             {
-                cfg.banks = crate::dialogs::new_machine::distribute_ram(p, ip28_banks);
+                cfg.banks = crate::dialogs::new_machine::distribute_ram(p, profile);
             }
         }
     });
     ui.label(t!("config-ram-banks"));
-    subtitle(ui, if ip28_banks {
+    subtitle(ui, if profile == MachineProfile::OctaneIp30 {
+        t!("config-ram-banks-octane-subtitle")
+    } else if profile == MachineProfile::Indigo2Ip28 {
         t!("config-ram-banks-ip28-subtitle")
     } else {
         t!("config-ram-banks-subtitle")
@@ -641,9 +729,9 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
                 ComboBox::from_id_salt(("bank", i)).selected_text(t!("config-megabytes", size = cur))
                     .show_ui(ui, |ui| {
                         for &sz in VALID_BANK_SIZES {
-                            ui.add_enabled_ui(sz <= 128 || ip28_banks, |ui| {
+                            ui.add_enabled_ui(profile.bank_sizes().contains(&sz), |ui| {
                                 ui.selectable_value(&mut cfg.banks[i], sz, t!("config-megabytes", size = sz))
-                                    .on_disabled_hover_text(t!("config-ram-bank-ip28-only"));
+                                    .on_disabled_hover_text(crate::ram::bank_size_tip(profile));
                             });
                         }
                     });
@@ -656,7 +744,9 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
 
 fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     ui.heading(t!("config-tab-display"));
-    show_resolution_picker(ui, cfg, running);
+    if cfg.machine.profile != MachineProfile::OctaneIp30 {
+        show_resolution_picker(ui, cfg, running);
+    }
     ui.add_space(6.0);
     Grid::new("disp_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label(t!("config-scale"));
@@ -922,7 +1012,11 @@ fn show_network(
     let mut out = NetworkOutcome::default();
     ui.heading(t!("config-tab-network"));
 
-    ethernet_address_row(ui, cfg, running);
+    // The Octane's address is not in its NVRAM; it comes from `[network] mac`
+    // or a generated default.
+    if cfg.machine.profile != MachineProfile::OctaneIp30 {
+        ethernet_address_row(ui, cfg, running);
+    }
     ui.add_space(4.0);
 
     // The backend selector (and the entire PCAP UI) is only shown when this
@@ -938,6 +1032,8 @@ fn show_network(
                 .selected_text(match cfg.network.mode {
                     NetMode::Nat  => t!("config-net-mode-nat"),
                     NetMode::Pcap => t!("config-net-mode-pcap"),
+                    // Only an O2 config can say this, and the GUI does not run one yet.
+                    NetMode::Off  => "off".to_string(),
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut cfg.network.mode, NetMode::Nat, t!("config-net-mode-nat"));
@@ -1212,6 +1308,8 @@ fn show_network(
 
     ui.separator();
     out.changed |= tftp_section(ui, cfg, host);
+    ui.separator();
+    out.changed |= rsh_section(ui, cfg, host);
     } // end: NAT-only section (hidden in PCAP mode)
 
     ui.separator();
@@ -1298,7 +1396,7 @@ fn show_network(
 
 /// The guest's Ethernet address (`eaddr`), which IRIX needs to attach `ec0`.
 /// It lives in the NVRAM on Indy and in the motherboard EEPROM (`nveeprom`) on
-/// Indigo2/IP28 (rules/irix/networking.md), so this reads and writes the chip
+/// Indigo2/IP28 (clanker/irix/networking.md), so this reads and writes the chip
 /// the profile boots from, the same bytes the Start pre-flight and Reset NVRAM
 /// patch. Only editable while stopped: a running machine saves its NVRAM on
 /// Stop, which would undo the edit.
@@ -1437,6 +1535,56 @@ fn tftp_section(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::Ho
     // A blank field means off, not "serve the working directory".
     if cfg.network.tftp_dir.as_deref().is_some_and(|d| d.trim().is_empty()) && !ui.memory(|m| m.focused().is_some()) {
         cfg.network.tftp_dir = None;
+        changed = true;
+    }
+    changed
+}
+
+/// NAT mode: the gateway's built-in read-only rsh server (`[network] rsh_dir`),
+/// a network installation source for IRIX `inst`. Unset turns the server off
+/// (rsh connections then go to the host). Read at Start. Returns true if the
+/// setting changed.
+fn rsh_section(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::HostIface]) -> bool {
+    let mut changed = false;
+    ui.strong(t!("config-rsh"));
+    subtitle(ui, t!("config-rsh-subtitle"));
+    let mut on = cfg.network.rsh_dir.is_some();
+    if ui.checkbox(&mut on, t!("config-rsh-enable")).changed() {
+        cfg.network.rsh_dir = if on {
+            // A bare relative name in this machine's own folder, like
+            // `tftpboot`; created now so an enabled server never serves an
+            // empty path.
+            let dir = "rshroot";
+            let _ = std::fs::create_dir_all(dir);
+            Some(dir.to_string())
+        } else {
+            None
+        };
+        changed = true;
+    }
+    if let Some(dir) = cfg.network.rsh_dir.as_mut() {
+        Grid::new("rsh_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label(t!("config-rsh-dir"));
+            changed |= path_row(ui, "rsh_dir", dir, Pick::Dir, &any_filters()).changed;
+            ui.end_row();
+        });
+        if dir.trim().is_empty() {
+            ui.label(RichText::new(t!("config-rsh-dir-empty")).weak().small());
+        } else if !Path::new(dir.trim()).is_dir() {
+            ui.label(RichText::new(t!("config-rsh-dir-missing"))
+                .color(Color32::from_rgb(0xd9, 0x9a, 0x3d)).small());
+        }
+        let (b, p) = crate::netplan::parse_cidr(cfg.nat_subnet.as_deref());
+        let gw = crate::netplan::classify(b, p, host).derived
+            .map(|d| d.gateway.to_string())
+            .unwrap_or_else(|| "192.168.0.1".into());
+        ui.label(RichText::new(t!("config-rsh-inst")).weak());
+        ui.code(format!("{gw}:/"));
+        ui.label(RichText::new(t!("config-rsh-readonly")).weak().small());
+    }
+    // A blank field means off, not "serve the working directory".
+    if cfg.network.rsh_dir.as_deref().is_some_and(|d| d.trim().is_empty()) && !ui.memory(|m| m.focused().is_some()) {
+        cfg.network.rsh_dir = None;
         changed = true;
     }
     changed

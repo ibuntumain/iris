@@ -153,9 +153,9 @@ struct TestMem {
 }
 
 impl BusDevice for TestMem {
-    fn read8(&self, addr: u32) -> BusRead8 { BusRead8::ok(self.bytes.lock().get(&addr).copied().unwrap_or(0)) }
-    fn write8(&self, addr: u32, val: u8) -> u32 { self.bytes.lock().insert(addr, val); BUS_OK }
-    fn read32(&self, addr: u32) -> BusRead32 { BusRead32::ok(self.words.lock().get(&addr).copied().unwrap_or(0)) }
+    fn read8(&self, addr: u64) -> BusRead8 { BusRead8::ok(self.bytes.lock().get(&(addr as u32)).copied().unwrap_or(0)) }
+    fn write8(&self, addr: u64, val: u8) -> u32 { self.bytes.lock().insert(addr as u32, val); BUS_OK }
+    fn read32(&self, addr: u64) -> BusRead32 { BusRead32::ok(self.words.lock().get(&(addr as u32)).copied().unwrap_or(0)) }
 }
 
 /// Memory with pool 0's page table at 0x1000 mapping logical page 0 to
@@ -3261,6 +3261,25 @@ fn gl_12_12_12_keeps_twelve_bits() {
     m.stop_engines();
 }
 
+/// The RGBA 12,12,12 visual has no alpha planes, so glReadPixels' alpha
+/// is full scale (GL's rule), in both component orders. Planes 31:24
+/// hold red's and green's low nibbles, which used to come back as alpha
+/// (a Solid IMPACT's deepest visual: pixtest failed most of its cases).
+#[test]
+fn gl_12_12_12_reads_alpha_as_full_scale() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x140 << 10, 0, 0, 0]);
+    fifo_token(&m, 0x9A, &[0x2300, 0x2300]);
+    fifo_token(&m, 0x49, &[1, 1, 0]);
+    gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    let rgba = gl_read_one(&m, 50, 50, 0, 0x0041_0080, 4);
+    assert_eq!(rgba, [0xFF, 0, 0, 0xFF], "RGBA order");
+    let abgr = gl_read_one(&m, 50, 50, 0, 0x0001_0080, 4);
+    assert_eq!(abgr, [0xFF, 0, 0, 0xFF], "ABGR order");
+    m.stop_engines();
+}
+
 /// The bank comes from the kernel (VALIDATE_BANKS), not from counting
 /// swaps: a swap the kernel did not pair with a bank (or one the GE never
 /// saw) leaves the drawing where the kernel last said.
@@ -3335,5 +3354,77 @@ fn gl_raster_color_query_is_latched() {
     fifo_token(&m, 0x02, &[f(0.0), f(0.0), f(0.0), f(0.0)]);
     let v: Vec<f32> = (0x2C5..=0x2C8).map(|a| f32::from_bits(gl_return_mode(&m, a))).collect();
     assert_eq!(v, [0.5, 0.25, 1.0, 0.75]);
+    m.stop_engines();
+}
+
+/// `bound_busy_status`: STATUS's idle bits read set once a busy stretch
+/// has outlasted the bound, and the stretch ends when the board goes idle.
+/// Without the option, nothing changes.
+#[test]
+fn bounded_busy_status_reads_idle_after_the_bound() {
+    use std::sync::atomic::Ordering;
+    let m = live_board();
+    assert!(!m.busy_overdue(false), "off by default");
+    m.bound_busy_status();
+    assert!(!m.busy_overdue(false), "a stretch starts");
+    assert!(!m.busy_overdue(false), "still inside the bound");
+    std::thread::sleep(super::BUSY_STATUS_BOUND + std::time::Duration::from_millis(50));
+    assert!(m.busy_overdue(false), "past the bound");
+    assert!(!m.busy_overdue(true), "idle ends the stretch");
+    assert_eq!(m.busy_since.load(Ordering::Relaxed), 0);
+    m.stop_engines();
+}
+
+/// A stretch that ended without a STATUS read seeing it must not leave the
+/// next one already overdue: the store that restarts work restarts the bound.
+#[test]
+fn a_new_busy_stretch_is_timed_from_its_first_store() {
+    let m = live_board();
+    m.bound_busy_status();
+    assert!(!m.busy_overdue(false), "a stretch starts");
+    std::thread::sleep(super::BUSY_STATUS_BOUND + std::time::Duration::from_millis(50));
+    assert!(m.busy_overdue(false), "that stretch is overdue");
+    // The board goes idle with no STATUS read to notice, then work arrives.
+    while !m.idle() {
+        std::thread::yield_now();
+    }
+    fifo_token(&m, 0x02, &[f(0.0), f(0.0), f(0.0), f(0.0)]);
+    assert!(!m.busy_overdue(false), "the new stretch starts at its store");
+    m.stop_engines();
+}
+
+/// glRenderMode(GL_SELECT) as libGLcore drives the GE (traced, glstate):
+/// SELECT_MODE, the name stack tokens, primitives (which draw nothing),
+/// RENDER_MODE, then the hit records read back with __MGR_RETURN_MODE's
+/// second word 0xFFFFFFFF. GL_NAME_STACK_DEPTH reads GE word 0xC59 and the
+/// records' length 0xC60. A record is [epoch, names, z min, z max, names].
+#[test]
+fn gl_select_mode_keeps_a_name_stack_and_records_hits() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    let ret = |a: u32, b: u32| {
+        write(&m, 32, 0x7000C, 1 << 17);
+        fifo_token(&m, 0xA2, &[a, b, 1]);
+        wait_flag(&m, 1 << 17);
+        read(&m, 32, 0x70014) as u32
+    };
+    fifo_token(&m, 0xCB, &[0]);
+    fifo_token(&m, 0xC4, &[]);
+    fifo_token(&m, 0xC7, &[3]);
+    fifo_token(&m, 0xC7, &[4]);
+    assert_eq!(ret(0xC59, 1), 2, "name stack depth");
+    // Inside the window: a hit. Outside it: none.
+    gl_tri(&m, [1.0, 0.0, 0.0], [[100.0, 50.0, 0.0], [300.0, 50.0, 0.0], [200.0, 250.0, 0.0]]);
+    fifo_token(&m, 0xC6, &[]);
+    gl_tri(&m, [1.0, 0.0, 0.0], [[-900.0, -900.0, 0.0], [-800.0, -900.0, 0.0], [-850.0, -800.0, 0.0]]);
+    fifo_token(&m, 0xC9, &[]);
+    assert_eq!(gl_px(&m, 200, 100), 0, "selection draws nothing");
+    let len = ret(0xC60, 1);
+    assert_eq!(len, 6, "one record of two names");
+    let rec: Vec<u32> = (0..len).map(|i| ret(i, 0xFFFF_FFFF)).collect();
+    assert_eq!(rec[1], 2);
+    assert!(f32::from_bits(rec[2]) <= f32::from_bits(rec[3]));
+    assert_eq!(rec[4..], [3, 4]);
+    fifo_token(&m, 0x62, &[]);
+    assert_eq!(ret(0xC60, 1), 0, "read out and emptied");
     m.stop_engines();
 }

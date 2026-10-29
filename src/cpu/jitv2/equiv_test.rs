@@ -112,7 +112,7 @@ mod tests {
         /// a later call, which would silently break that count once a real
         /// compile actually landed in time (previously only ever true by
         /// luck, since the async compile thread rarely won the race within
-        /// these short loops — see rules/jitv2/codegen-gotchas.md).
+        /// these short loops — see clanker/jitv2/codegen-gotchas.md).
         #[cfg(feature = "jitv2")]
         no_jitv2: bool,
     }
@@ -171,22 +171,22 @@ mod tests {
     }
 
     impl BusDevice for MockMemory {
-        fn read8(&self, addr: u32) -> BusRead8 {
+        fn read8(&self, addr: u64) -> BusRead8 {
             BusRead8::ok(self.get_byte(addr as u64))
         }
-        fn write8(&self, addr: u32, val: u8) -> u32 { self.set_byte(addr as u64, val); BUS_OK }
-        fn read16(&self, addr: u32) -> BusRead16 {
+        fn write8(&self, addr: u64, val: u8) -> u32 { self.set_byte(addr as u64, val); BUS_OK }
+        fn read16(&self, addr: u64) -> BusRead16 {
             let a = (addr & !1) as u64;
             let mut b = [0u8; 2];
             for i in 0..2 { b[i] = self.get_byte(a + i as u64); }
             BusRead16::ok(u16::from_be_bytes(b))
         }
-        fn write16(&self, addr: u32, val: u16) -> u32 {
+        fn write16(&self, addr: u64, val: u16) -> u32 {
             let a = (addr & !1) as u64;
             for (i, b) in val.to_be_bytes().iter().enumerate() { self.set_byte(a + i as u64, *b); }
             BUS_OK
         }
-        fn read32(&self, addr: u32) -> BusRead32 {
+        fn read32(&self, addr: u64) -> BusRead32 {
             let a = (addr & !3) as u64;
             if a == self.magic_addr {
                 let mut responses = self.magic_responses.lock().unwrap();
@@ -199,21 +199,21 @@ mod tests {
             }
             BusRead32::ok(self.get_word(a))
         }
-        fn write32(&self, addr: u32, val: u32) -> u32 { self.set_word((addr & !3) as u64, val); BUS_OK }
-        fn read64(&self, addr: u32) -> BusRead64 {
+        fn write32(&self, addr: u64, val: u32) -> u32 { self.set_word((addr & !3) as u64, val); BUS_OK }
+        fn read64(&self, addr: u64) -> BusRead64 {
             let a = (addr & !7) as u64;
             let hi = self.get_word(a) as u64;
             let lo = self.get_word(a + 4) as u64;
             BusRead64::ok((hi << 32) | lo)
         }
-        fn write64(&self, addr: u32, val: u64) -> u32 {
+        fn write64(&self, addr: u64, val: u64) -> u32 {
             let a = (addr & !7) as u64;
             self.set_word(a, (val >> 32) as u32);
             self.set_word(a + 4, val as u32);
             BUS_OK
         }
         #[cfg(feature = "jitv2")]
-        fn gen_ptr(&self, addr: u32) -> *const AtomicU64 {
+        fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
             // Real enforcement of no_jitv2 is seeded_executor_over's
             // denylist_all() call, not this null return (a null gen_ptr no
             // longer means "not dispatchable" — see the no_jitv2 field's own
@@ -222,7 +222,7 @@ mod tests {
             if self.no_jitv2 {
                 return std::ptr::null();
             }
-            let page = addr / PAGE_SIZE;
+            let page = (addr / PAGE_SIZE as u64) as u32;
             let mut gens = self.gens.lock().unwrap();
             let counter = gens.entry(page).or_insert_with(|| Box::new(AtomicU64::new(0)));
             counter.as_ref() as *const AtomicU64
@@ -382,7 +382,7 @@ mod tests {
         // codegen derives absolute virtual addresses from it (off-page
         // branch/jump targets, delay-slot exception EPC) — a fake all-zero
         // page silently produces wrong addresses for any test that exercises
-        // those paths (see rules/jitv2/codegen-gotchas.md).
+        // those paths (see clanker/jitv2/codegen-gotchas.md).
         let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
         let mut analyzer = Analyzer::new();
         let (walked, non_empty) = analyzer.walk_bounded(&page, word_offset, page_base, 1);
@@ -1249,7 +1249,7 @@ mod tests {
     /// plain `exec.exec()` call (as `jitv2_lockstep`'s `lockstep_check`
     /// already does unconditionally for ALU ops, with FPU ops a natural next
     /// target — see `add_overflow_traps_and_matches_interpreter`'s
-    /// pre-fix history in rules/jitv2/codegen-gotchas.md). Always
+    /// pre-fix history in clanker/jitv2/codegen-gotchas.md). Always
     /// denylisted, unconditionally, is simplest and safe for every caller
     /// here.
     fn fpu_seeded_executor(gpr: [u64; 32], fpr: [u64; 32], pc: u64, fr1: bool) -> (MipsExecutor<PassthroughTlb, PassthroughCache>, Arc<MockMemory>) {
@@ -1264,12 +1264,26 @@ mod tests {
     }
 
     fn run_interpreter_fpu(instr: u32, gpr: [u64; 32], fpr: [u64; 32], pc: u64, fr1: bool) -> CoreSnapshot {
+        run_interpreter_fpu_fcsr(instr, gpr, fpr, pc, fr1, None)
+    }
+
+    /// As above, with `core.fpu_fcsr` seeded to `fcsr` before the instruction
+    /// runs (or left at its initial value when `None`). Needed to test the
+    /// instruction's handling of pre-existing FCSR state — e.g. a Cause field
+    /// left set by an earlier instruction.
+    fn run_interpreter_fpu_fcsr(instr: u32, gpr: [u64; 32], fpr: [u64; 32], pc: u64, fr1: bool, fcsr: Option<u32>) -> CoreSnapshot {
         let (mut exec, _mem) = fpu_seeded_executor(gpr, fpr, pc, fr1);
+        if let Some(fcsr) = fcsr { exec.core.fpu_fcsr = fcsr; }
         exec.exec(instr);
         CoreSnapshot::capture(&exec.core)
     }
 
     fn run_jit_fpu(instr: u32, gpr: [u64; 32], fpr: [u64; 32], pc: u64, word_offset: u16, fr1: bool) -> Option<CoreSnapshot> {
+        run_jit_fpu_fcsr(instr, gpr, fpr, pc, word_offset, fr1, None)
+    }
+
+    /// `run_interpreter_fpu_fcsr`'s JIT counterpart.
+    fn run_jit_fpu_fcsr(instr: u32, gpr: [u64; 32], fpr: [u64; 32], pc: u64, word_offset: u16, fr1: bool, fcsr: Option<u32>) -> Option<CoreSnapshot> {
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[word_offset as usize] = instr;
 
@@ -1284,6 +1298,7 @@ mod tests {
         let (exec, _mem) = fpu_seeded_executor(gpr, fpr, pc, fr1);
         let mut exec = Box::new(exec);
         exec.install_jit_hooks();
+        if let Some(fcsr) = fcsr { exec.core.fpu_fcsr = fcsr; }
 
         unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
         std::mem::forget(codegen);
@@ -1292,12 +1307,20 @@ mod tests {
     }
 
     fn assert_fpu_matches_interpreter(instr: u32, gpr: [u64; 32], fpr: [u64; 32], fr1: bool) {
+        assert_fpu_matches_interpreter_fcsr(instr, gpr, fpr, fr1, None);
+    }
+
+    /// `assert_fpu_matches_interpreter` with `core.fpu_fcsr` seeded before both
+    /// engines run, returning the JIT's snapshot so a test can also pin the
+    /// absolute result rather than only JIT/interpreter agreement.
+    fn assert_fpu_matches_interpreter_fcsr(instr: u32, gpr: [u64; 32], fpr: [u64; 32], fr1: bool, fcsr: Option<u32>) -> CoreSnapshot {
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let word_offset = (pc as u16 / 4) & 0x3FF;
-        let interp = run_interpreter_fpu(instr, gpr, fpr, pc, fr1);
-        let jit = run_jit_fpu(instr, gpr, fpr, pc, word_offset, fr1)
+        let interp = run_interpreter_fpu_fcsr(instr, gpr, fpr, pc, fr1, fcsr);
+        let jit = run_jit_fpu_fcsr(instr, gpr, fpr, pc, word_offset, fr1, fcsr)
             .expect("FPU instruction must be compilable for this test to be meaningful");
         assert_eq!(jit, interp, "JIT and interpreter diverged for instr=0x{:08x} fr1={}", instr, fr1);
+        jit
     }
 
     /// `run_interpreter_fpu`/`run_jit_fpu`'s counterpart for LWC1/LDC1 —
@@ -3122,7 +3145,7 @@ mod tests {
     // (set core.pc back to its own address, return EXEC_COMPLETE), which
     // published and dispatched again would infinite-loop without ever
     // reaching the interpreter fallback it was meant to defer to (observed
-    // live on an IRIX boot, rules/jitv2/codegen-gotchas.md).
+    // live on an IRIX boot, clanker/jitv2/codegen-gotchas.md).
     //
     // Now that every exit already materializes core.pc/in_delay_slot/
     // delay_slot_target explicitly (the entry_offset==0 foreign-slot work,
@@ -3997,7 +4020,7 @@ mod tests {
         // compiled function runs the whole loop to convergence in one call
         // rather than one iteration per call. This is intentional per the
         // design (not a jitv2-verify-checkable shape — see
-        // rules/jitv2/codegen-gotchas.md's self-loop note) but must still
+        // clanker/jitv2/codegen-gotchas.md's self-loop note) but must still
         // produce the architecturally correct final state: same as running
         // the interpreter for the same number of iterations by hand.
         let word: u16 = 10;
@@ -5436,6 +5459,43 @@ mod tests {
         fbinop_case(crate::cpu::mips_isa::FUNCT_FDIV, crate::cpu::mips_isa::RS_D, 1.0, 0.0);
     }
 
+    /// An ordinary-operand arithmetic instruction must rewrite Cause to zero
+    /// even when it raises nothing itself ("the results of only one
+    /// instruction"), and must not disturb the sticky Flag field. Seeded with
+    /// Cause.V|Cause.Z and Flag.V|Flag.I already set and every Enable clear,
+    /// so the JIT takes its "Cause is already set, clear it" arm rather than
+    /// the skip-the-store one, and both engines must agree and deliver the
+    /// flags unchanged.
+    #[test]
+    fn arithmetic_clears_preexisting_cause_and_keeps_sticky_flags() {
+        const FCSR_CAUSE_VZ: u32 = 0x0001_8000;
+        const FCSR_FLAG_VI: u32 = 0x0000_0044;
+        const SEED: u32 = FCSR_CAUSE_VZ | FCSR_FLAG_VI;
+        for fmt in [crate::cpu::mips_isa::RS_S, crate::cpu::mips_isa::RS_D] {
+            for funct in [
+                crate::cpu::mips_isa::FUNCT_FADD,
+                crate::cpu::mips_isa::FUNCT_FSUB,
+                crate::cpu::mips_isa::FUNCT_FMUL,
+                crate::cpu::mips_isa::FUNCT_FDIV,
+            ] {
+                let mut fpr = [0u64; 32];
+                if fmt == crate::cpu::mips_isa::RS_S {
+                    fpr[1] = (1.5f32).to_bits() as u64;
+                    fpr[2] = (2.5f32).to_bits() as u64;
+                } else {
+                    fpr[1] = (1.5f64).to_bits();
+                    fpr[2] = (2.5f64).to_bits();
+                }
+                let instr = make_r(crate::cpu::mips_isa::OP_COP1, fmt, 2, 1, 3, funct);
+                let jit = assert_fpu_matches_interpreter_fcsr(
+                    instr, [0u64; 32], fpr, true, Some(SEED));
+                assert_eq!(jit.fpu_fcsr, FCSR_FLAG_VI,
+                    "ordinary-operand arithmetic must clear Cause and keep sticky Flags \
+                     (instr=0x{:08x} fmt={} funct={})", instr, fmt, funct);
+            }
+        }
+    }
+
     fn funop_case(funct: u32, fmt: u32, fs_val: f64) {
         let mut fpr = [0u64; 32];
         if fmt == crate::cpu::mips_isa::RS_S {
@@ -6028,7 +6088,7 @@ mod tests {
     /// (release-build interpreter, and trunc/ceil/floor in any profile)
     /// rather than chasing whichever the current interpreter build happens
     /// to produce for `.round()` specifically. See
-    /// rules/jitv2/codegen-gotchas.md.
+    /// clanker/jitv2/codegen-gotchas.md.
     const FCSR_INEXACT_MASK: u32 = (1 << 12) | (1 << 2);
 
     fn cvt_to_int_case(funct: u32, fmt: u32, fs_val: f64) {
@@ -6160,6 +6220,189 @@ mod tests {
         cvt_from_int_case(crate::cpu::mips_isa::FUNCT_FCVT_D, crate::cpu::mips_isa::RS_L, -123456789);
     }
 
+    // ---- CP1 conversions: inline fast-path edge and flag coverage ------
+    //
+    // The conversions used to be a callout into the interpreter's own
+    // `cvt_to_int_and_commit`/`cvt_int_to_float_and_commit`, so agreement was
+    // structural. `emit_fcvt_to_int`/`emit_fcvt_from_int` now inline the
+    // common path and keep the callout for what they cannot prove; these
+    // tests pin the *whole* core snapshot — `fpu_fcsr` included, with no
+    // flag mask — against the interpreter across the fast path, the callout
+    // fallbacks, both FR modes, all four FCSR rounding modes, and the
+    // enable-bit/trap paths.
+    //
+    // fs is rd=2 and fd is sa=4 in every encoding below, which addresses
+    // fpr[2]/fpr[4] identically in FR=0 (even slot, low word for W) and FR=1.
+
+    /// Values that bracket every branch of the to-int path: in range, the
+    /// four boundary values the identical range test turns on (including
+    /// +2^31, which `i32::MAX as f32` rounds up to and which the interpreter
+    /// therefore admits), values just outside them, subnormals, NaN and both
+    /// infinities.
+    const CVT_TO_INT_EDGES: &[f64] = &[
+        0.0, -0.0, 0.25, -0.25, 0.5, -0.5, 0.999_999_9, -0.999_999_9,
+        1.0, -1.0, 1.5, -1.5, 2.5, -2.5, 3.5, -3.5, 3.7, -3.7,
+        8_388_608.0, 8_388_609.0, 16_777_216.0, 16_777_217.0,
+        2_147_483_520.0, 2_147_483_647.0, 2_147_483_648.0,
+        -2_147_483_648.0, -2_147_483_649.0,
+        1.0e20, -1.0e20, 9_223_372_036_854_775_808.0, -9_223_372_036_854_775_808.0,
+        9_223_372_036_854_774_784.0, -9_223_372_036_854_774_784.0,
+        1.4e-45, -1.4e-45, f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+    ];
+
+    fn cvt_to_int_exact_case(funct: u32, fmt: u32, fs_val: f64, fr1: bool, fcsr: Option<u32>) {
+        let mut fpr = [0u64; 32];
+        fpr[2] = if fmt == crate::cpu::mips_isa::RS_S {
+            (fs_val as f32).to_bits() as u64
+        } else {
+            fs_val.to_bits()
+        };
+        // Pre-existing destination: a trapping conversion must leave it
+        // untouched, so it must not look like a computed result.
+        fpr[4] = 0xDEAD_BEEF_DEAD_BEEF;
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, fmt, 0, 2, 4, funct);
+        assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, fr1, fcsr);
+    }
+
+    #[test]
+    fn cvt_to_int_range_edges_match_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FCVT_L, FUNCT_FCVT_W, RS_D, RS_S};
+        for &v in CVT_TO_INT_EDGES {
+            for fr1 in [false, true] {
+                for fmt in [RS_S, RS_D] {
+                    cvt_to_int_exact_case(FUNCT_FCVT_W, fmt, v, fr1, None);
+                    cvt_to_int_exact_case(FUNCT_FCVT_L, fmt, v, fr1, None);
+                }
+            }
+        }
+    }
+
+    /// ROUND/TRUNC/CEIL/FLOOR pass a fixed rounding mode, so they share the
+    /// inline body but not the FCSR-dynamic mode selection; a half-way value
+    /// distinguishes all four.
+    #[test]
+    fn round_trunc_ceil_floor_edges_match_interpreter() {
+        use crate::cpu::mips_isa::*;
+        for &v in &[0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 3.7, -3.7, 0.0, -0.0, 1.0e20, -1.0e20, f64::NAN] {
+            for fr1 in [false, true] {
+                for fmt in [RS_S, RS_D] {
+                    for funct in [FUNCT_FROUND_W, FUNCT_FTRUNC_W, FUNCT_FCEIL_W, FUNCT_FFLOOR_W] {
+                        cvt_to_int_exact_case(funct, fmt, v, fr1, None);
+                    }
+                    for funct in [FUNCT_FROUND_L, FUNCT_FTRUNC_L, FUNCT_FCEIL_L, FUNCT_FFLOOR_L] {
+                        cvt_to_int_exact_case(funct, fmt, v, fr1, None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// FCSR.RM drives CVT.W/CVT.L directly; all four modes must produce the
+    /// interpreter's result and Cause/Flag bits from the inline rounding.
+    #[test]
+    fn cvt_to_int_all_rounding_modes_match_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FCVT_L, FUNCT_FCVT_W, RS_D, RS_S};
+        for rm in 0u32..4 {
+            for &v in &[0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 3.7, -3.7, -0.7, 1.0e10, -1.0e10] {
+                for fr1 in [false, true] {
+                    for fmt in [RS_S, RS_D] {
+                        cvt_to_int_exact_case(FUNCT_FCVT_W, fmt, v, fr1, Some(rm));
+                        cvt_to_int_exact_case(FUNCT_FCVT_L, fmt, v, fr1, Some(rm));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Invalid with the destination pre-set: Flag.V when EV is clear, a trap
+    /// with the destination untouched when EV is set. The latter is the
+    /// callout path, the former is too (NaN/inf/out-of-range never inline).
+    #[test]
+    fn cvt_to_int_invalid_enable_bits_match_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FCVT_L, FUNCT_FCVT_W, RS_D, RS_S};
+        for &v in &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.0e20, -1.0e20] {
+            for &fcsr in &[0x0000_0000u32, 0x0000_0800, 0x0000_0880, 0x0000_0004] {
+                for fmt in [RS_S, RS_D] {
+                    cvt_to_int_exact_case(FUNCT_FCVT_W, fmt, v, true, Some(fcsr));
+                    cvt_to_int_exact_case(FUNCT_FCVT_L, fmt, v, true, Some(fcsr));
+                }
+            }
+        }
+    }
+
+    /// The same snapshot comparison for the to-int fast path with a dirty
+    /// FCSR: a stale sticky Flag set and a stale Cause set must be handled
+    /// (Flag preserved, Cause rewritten) exactly as the interpreter does.
+    #[test]
+    fn cvt_to_int_dirty_fcsr_matches_interpreter() {
+        use crate::cpu::mips_isa::{FUNCT_FCVT_L, FUNCT_FCVT_W, RS_D, RS_S};
+        for &fcsr in &[0x0000_1004u32, 0x0000_007cu32, 0x0000_1000u32] {
+            for &v in &[1.5, -1.5, 42.0, -42.0] {
+                for fmt in [RS_S, RS_D] {
+                    cvt_to_int_exact_case(FUNCT_FCVT_W, fmt, v, true, Some(fcsr));
+                    cvt_to_int_exact_case(FUNCT_FCVT_L, fmt, v, true, Some(fcsr));
+                }
+            }
+        }
+    }
+
+    fn cvt_from_int_exact_case(funct: u32, fmt: u32, val: i64, fr1: bool, fcsr: Option<u32>) {
+        let mut fpr = [0u64; 32];
+        fpr[2] = if fmt == crate::cpu::mips_isa::RS_W {
+            (val as i32 as u32) as u64
+        } else {
+            val as u64
+        };
+        fpr[4] = 0xDEAD_BEEF_DEAD_BEEF;
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, fmt, 0, 2, 4, funct);
+        assert_fpu_matches_interpreter_fcsr(instr, [0u64; 32], fpr, fr1, fcsr);
+    }
+
+    /// Int→float: exact and inexact values in both widths, both FR modes, and
+    /// every FCSR rounding mode (non-RN takes the callout; RN-even is the
+    /// inline `fcvt_from_sint` path whose host `cvtsi2ss`/`cvtsi2sd` rounding
+    /// is only equivalent under MXCSR's RN-even mode).
+    #[test]
+    fn cvt_from_int_edges_match_interpreter() {
+        use crate::cpu::mips_isa::*;
+        let vals: &[i64] = &[
+            0, 1, -1, 42, -42, 16_777_215, 16_777_216, 16_777_217,
+            2_147_483_647, -2_147_483_648, 2_147_483_648,
+            9_007_199_254_740_991, 9_007_199_254_740_993,
+            i64::MAX, i64::MIN, 123_456_789, -123_456_789,
+        ];
+        for &v in vals {
+            for fr1 in [false, true] {
+                for rm in [0u32, 1, 2, 3] {
+                    for (funct, fmt) in [
+                        (FUNCT_FCVT_S, RS_W), (FUNCT_FCVT_D, RS_W),
+                        (FUNCT_FCVT_S, RS_L), (FUNCT_FCVT_D, RS_L),
+                    ] {
+                        cvt_from_int_exact_case(funct, fmt, v, fr1, Some(rm));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inexact with Enable.I set must trap with the destination already
+    /// written (unlike the to-int direction), and with it clear must set the
+    /// sticky Flag.I; a dirty Flag must be preserved either way.
+    #[test]
+    fn cvt_from_int_inexact_enable_bits_match_interpreter() {
+        use crate::cpu::mips_isa::*;
+        for &fcsr in &[0x0000_0000u32, 0x0000_0080, 0x0000_0100, 0x0000_1004, 0x0000_007c] {
+            for &v in &[9_007_199_254_740_993i64, i64::MAX, 2_147_483_647, -2_147_483_648] {
+                for fr1 in [false, true] {
+                    cvt_from_int_exact_case(FUNCT_FCVT_S, RS_W, v, fr1, Some(fcsr));
+                    cvt_from_int_exact_case(FUNCT_FCVT_D, RS_W, v, fr1, Some(fcsr));
+                    cvt_from_int_exact_case(FUNCT_FCVT_S, RS_L, v, fr1, Some(fcsr));
+                    cvt_from_int_exact_case(FUNCT_FCVT_D, RS_L, v, fr1, Some(fcsr));
+                }
+            }
+        }
+    }
+
     // ---- CP1: batch F4 compares — C.cond.fmt ------
 
     fn fcc_case(funct: u32, fmt: u32, cc: u32, fs_val: f64, ft_val: f64) {
@@ -6277,7 +6520,7 @@ mod tests {
     }
 
     /// Isolated repro for a live-boot divergence caught by
-    /// `MipsExecutor::lockstep_check_branch` (rules/jitv2/): `BNE $5,$0,+7`
+    /// `MipsExecutor::lockstep_check_branch` (clanker/jitv2/): `BNE $5,$0,+7`
     /// with `$5==0` (not taken) and a delay slot that's an ordinary ALU op
     /// (`LUI $1,0xc0`, not a NOP) — first seen at PROM pc=0xbfc00434 during a
     /// real boot. Drives the exact code path (`exec.exec(instr)` through
@@ -7549,5 +7792,91 @@ mod tests {
     fn bne_not_taken_with_busy_delay_slot_skips_to_fallthrough() {
         // bne zero, zero never taken: lands on word 2 after the slot.
         busy_slot_case(make_i(crate::cpu::mips_isa::OP_BNE, 0, 0, 0x40), [0u64; 32], 0xFFFF_FFFF_8000_0008);
+    }
+
+    // ---- CP1 conversion cost probe (diagnostic, not a correctness gate) ----
+    //
+    // Page layout and the compiled-region shape make the guest benchmark
+    // kernels noisy for one-instruction families, so the per-instruction cost
+    // is measured here instead: one region of `N` conversions (destination
+    // registers rotated so the chain is not a single store-forward), called
+    // `REPS` times through the real `JitFn`. The region-entry/exit cost is
+    // common to both builds and identical for every instruction below, so the
+    // A/B ratio is the instruction's own cost. `cargo test --release -p iris
+    // --features lightning,jitv2 --lib cvt_perf_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn cvt_perf_probe() {
+        use crate::cpu::mips_isa::*;
+        const N: usize = 128;
+        const REPS: usize = 20_000;
+
+        fn probe(instrs: &[u32], fr1: bool) -> f64 {
+            let mut page = [0u32; ENTRIES_PER_PAGE];
+            page[..instrs.len()].copy_from_slice(instrs);
+            let mut analyzer = Analyzer::new();
+            let (walked, non_empty) = analyzer.walk_bounded(&page, 0, 0, ENTRIES_PER_PAGE as usize);
+            assert!(non_empty, "probe region must not be empty");
+            let mut region = *walked;
+            let mut codegen = Codegen::new();
+            let jit_fn: JitFn = codegen
+                .compile_region(&mut region, 0, fr1, false)
+                .expect("probe instruction must be compilable");
+
+            let mut fpr = [0u64; 32];
+            for (i, slot) in fpr.iter_mut().enumerate() {
+                // Small integer bit patterns: as an L/W source they convert
+                // exactly (the common int->float case), and as an S/D source
+                // they are subnormals that still round to an in-range integer,
+                // so either direction stays on the fast path.
+                *slot = (i as u64) * 3;
+            }
+            let (mut exec, _mem) = fpu_seeded_executor([0u64; 32], fpr, 0xFFFF_FFFF_8000_1000, fr1);
+            exec.core.fpu_fcsr = 0;
+            exec.install_jit_hooks();
+            let core_ptr = &mut exec.core as *mut MipsCore;
+
+            // Warm up (first call faults in the code page).
+            for _ in 0..1_000 { unsafe { jit_fn(core_ptr) }; }
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..REPS { unsafe { jit_fn(core_ptr) }; }
+            let ns = t0.elapsed().as_secs_f64() * 1e9 / (REPS * instrs.len()) as f64;
+            std::mem::forget(codegen);
+            ns
+        }
+
+        fn fill(make: impl Fn(usize) -> u32) -> Vec<u32> {
+            (0..N).map(make).collect()
+        }
+
+        // fd rotated over four registers; fs fixed (to-int) or rotated too
+        // (from-int, so the source values differ).
+        let fds = [4u32, 6, 8, 10];
+        let cases: &[(&str, Vec<u32>)] = &[
+            ("cvt.s.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_S))),
+            ("cvt.d.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_D))),
+            ("cvt.w.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_W))),
+            ("cvt.l.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_L))),
+            ("cvt.w.d", fill(|i| make_r(OP_COP1, RS_D, 0, 2, fds[i % 4], FUNCT_FCVT_W))),
+            ("cvt.l.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FCVT_L))),
+            ("trunc.w.s", fill(|i| make_r(OP_COP1, RS_S, 0, 2, fds[i % 4], FUNCT_FTRUNC_W))),
+            ("cvt.s.w", fill(|i| make_r(OP_COP1, RS_W, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_S))),
+            ("cvt.d.w", fill(|i| make_r(OP_COP1, RS_W, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_D))),
+            ("cvt.s.l", fill(|i| make_r(OP_COP1, RS_L, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_S))),
+            ("cvt.d.l", fill(|i| make_r(OP_COP1, RS_L, 0, (2 + 2 * (i % 4)) as u32, 10, FUNCT_FCVT_D))),
+        ];
+
+        let mut best = std::collections::BTreeMap::new();
+        for _ in 0..3 {
+            for (name, instrs) in cases {
+                let ns = probe(instrs, true);
+                let e = best.entry(*name).or_insert(f64::MAX);
+                if ns < *e { *e = ns; }
+            }
+        }
+        for (name, ns) in &best {
+            println!("{:<12} {:8.3} ns/instruction", name, ns);
+        }
     }
 }

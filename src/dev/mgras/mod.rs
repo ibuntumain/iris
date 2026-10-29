@@ -28,7 +28,7 @@
 //! `IRIS_MGRAS_TRACE=<file>` logs every access to the board.
 
 //!
-//! Threads (rules/mgras/DESIGN.md): the CPU thread owns the host-side
+//! Threads (clanker/mgras/DESIGN.md): the CPU thread owns the host-side
 //! registers and the display control bus (`Front`). Command FIFO words and
 //! direct raster writes go into `hq_fifo`; the HQ3 thread runs the frontend
 //! and feeds raster writes into `rss_fifo`; the RSS thread draws. The display
@@ -42,6 +42,8 @@ mod frame;
 mod ge11;
 mod gl;
 mod hq3;
+pub mod hq4;
+pub mod microcode;
 mod pixmem;
 mod pixpipe;
 mod plain;
@@ -77,6 +79,8 @@ use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_BU
 
 use ge11::Ge11;
 use hq3::{host, Hq3Engine, Hq3Regs, Hq3Sink};
+pub use gl::Gl;
+pub use hq3::Hq3Board;
 use rss::Rss;
 
 /// The graphics slot the board decodes.
@@ -138,6 +142,9 @@ struct Front {
     hq: Hq3Regs,
     ge: Ge11,
     dcb: dcb::Dcb,
+    /// The GE revision a started engine reports; 0 for the Indigo2
+    /// boards' 1.
+    ge_revision: u32,
 }
 
 /// `Front` borrowed under its lock.
@@ -204,7 +211,9 @@ impl Front {
     fn write(&mut self, off: u32, bits: u32, val: u64, flags: &AtomicU32) -> bool {
         match off {
             host::UCODE..=0x45FFF => {
-                self.hq.ucode[((off - host::UCODE) / 4) as usize] = val as u32 & 0xFF_FFFF;
+                let i = ((off - host::UCODE) / 4) as usize;
+                self.hq.ucode[i] = val as u32 & 0xFF_FFFF;
+                self.hq.ucode_hash.word(i, val as u32 & 0xFF_FFFF);
                 false
             }
             0x60000..=0x67FFF => {
@@ -228,8 +237,8 @@ impl Front {
             off if Ge11::is_diag_port(off) => {
                 if self.ge.write(off, val as u32) {
                     // Started: the version program's answer is waiting
-                    // (revision 1).
-                    self.hq.ge_readback = [0, 1];
+                    // (revision 1 on the Indigo2 boards).
+                    self.hq.ge_readback = [0, self.ge_revision.max(1)];
                     flags.fetch_or(host::FLAG_GE_DATA, Ordering::AcqRel);
                 }
                 false
@@ -257,6 +266,14 @@ pub enum Line {
     Retrace,
 }
 
+/// How long `bound_busy_status` lets STATUS read busy: well inside the
+/// IP30 kernel's waits on its idle bits.
+const BUSY_STATUS_BOUND: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a STATUS or DMABUSY read waits for a busy board to go idle
+/// before it answers (`settle`).
+const POLL_SETTLE: std::time::Duration = std::time::Duration::from_micros(100);
+
 pub struct Mgras {
     kind: GraphicsBoard,
     /// Perfetto edge trackers (zero-valid, so `new`'s zeroed allocation
@@ -264,7 +281,9 @@ pub struct Mgras {
     /// a full FIFO.
     pf_wait: crate::PfLevel,
     pf_fifo_full: crate::PfLevel,
-    ioc: crate::dev::ioc::Ioc,
+    /// The board's three GIO interrupts, as the slot wires them: FIFO,
+    /// general, retrace (see [`Line`]).
+    irqs: [crate::irq::IrqLine; 3],
     /// Current level of the general interrupt line.
     general: AtomicBool,
     /// The FIFO interrupt's inputs, kept apart from `front` for the HQ3
@@ -280,6 +299,10 @@ pub struct Mgras {
     /// in ns since `epoch`: STATUS reads vertical blank for 1 ms after it.
     epoch: std::time::Instant,
     frame_start: AtomicU64,
+    /// The GE11 programs' fingerprints as a front-end that keeps its own
+    /// copy of the download (the Octane's HQ4) reports them; 0 when it
+    /// does not, and the GE11 diagnostic ports' copy is used.
+    ge_upload_fingerprint: [AtomicU64; 2],
     /// CPU-side state and its lock. The display thread reads it unlocked
     /// (plain data, tearing tolerated).
     front_lock: SpinLock<()>,
@@ -326,6 +349,12 @@ pub struct Mgras {
     /// must not wait on `submit`: its holder may be waiting for idle).
     mem_rec: SpinLock<Option<record::RecHandle>>,
     engines: AtomicBool,
+    /// `bound_busy_status`: STATUS reads idle once the board has been busy
+    /// for `BUSY_STATUS_BOUND` without a break.
+    busy_bound: AtomicBool,
+    /// When the current busy stretch began, in ns since `epoch` plus one;
+    /// zero while idle (or before anyone looked).
+    busy_since: AtomicU64,
     threads: SpinLock<Vec<thread::JoinHandle<()>>>,
     hq_thread: SpinLock<Option<thread::Thread>>,
     rss_thread: [SpinLock<Option<thread::Thread>>; MAX_ENGINES],
@@ -393,7 +422,14 @@ impl Hq3Sink for HqSink<'_> {
     fn gl_bracket(&mut self, enter: bool) {
         self.0.rss_push(if enter { tag::GL_ENTER } else { tag::GL_LEAVE }, 0);
     }
+    fn finish_raster(&mut self) {
+        if !self.0.rss_idle() {
+            crate::pf_scope!(crate::perfetto::events::MGRAS_SWAP_WAIT, self.0.rss_fifo.len());
+            self.0.drain_rss();
+        }
+    }
     fn set_flags(&mut self, bits: u32) {
+        crate::pf_instant!(crate::perfetto::events::MGRAS_FLAG_SET, (self.0.rss_fifo.len() as u64) << 32 | bits as u64);
         self.0.flags.fetch_or(bits, Ordering::AcqRel);
         self.0.refresh_general();
     }
@@ -456,14 +492,16 @@ impl Mgras {
     /// Build the board in place on the heap: its multi-megabyte state is
     /// zero-initialised without touching the stack, and only the fields that
     /// are not valid zeroed are written.
-    pub fn new(board: GraphicsBoard, ioc: crate::dev::ioc::Ioc, heartbeat: Arc<AtomicU64>, fasttick: Arc<AtomicU64>) -> Arc<Self> {
+    /// `irqs` are the FIFO, general and retrace interrupts, as the slot
+    /// wires them.
+    pub fn new(board: GraphicsBoard, irqs: [crate::irq::IrqLine; 3], heartbeat: Arc<AtomicU64>, fasttick: Arc<AtomicU64>) -> Arc<Self> {
         let mut a: Arc<MaybeUninit<Self>> = Arc::new_zeroed();
         let p = Arc::get_mut(&mut a).unwrap().as_mut_ptr();
         // SAFETY: `p` points at zeroed, exclusively owned memory. Every field
         // that is not valid zeroed is written below, before assume_init.
         let m = unsafe {
             addr_of_mut!((*p).kind).write(board);
-            addr_of_mut!((*p).ioc).write(ioc);
+            addr_of_mut!((*p).irqs).write(irqs);
             addr_of_mut!((*p).general).write(AtomicBool::new(false));
             addr_of_mut!((*p).fifo_cfg).write(AtomicU32::new(0));
             addr_of_mut!((*p).fifo_line).write(SpinLock::new(false));
@@ -564,6 +602,12 @@ impl Mgras {
         unsafe { &*self.front.get() }
     }
 
+    /// Whether a "not modelled yet" report containing `what` was made.
+    #[cfg(test)]
+    pub(crate) fn noted(&self, what: &str) -> bool {
+        self.unhandled.lock().iter().any(|n| n.contains(what))
+    }
+
     fn note(&self, what: String) {
         let mut u = self.unhandled.lock();
         if u.len() < 256 && u.insert(what.clone()) {
@@ -583,13 +627,17 @@ impl Mgras {
         }
     }
 
-    /// An engine thread with nothing to do: park for up to 2 ms, unless
-    /// `has_work` finds a push made before `asleep` was raised.
+    /// An engine thread with nothing to do: park for up to 50 ms, unless
+    /// `has_work` finds a push made before `asleep` was raised. The timeout
+    /// is only a backstop for a wake the fence protocol should never lose,
+    /// so it is long enough that an idle engine costs ~20 wakeups/s rather
+    /// than 500; a hypothetical missed wake would cost one interval of
+    /// latency, never correctness.
     fn sleep(asleep: &AtomicBool, has_work: impl FnOnce() -> bool) {
         asleep.store(true, Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::SeqCst);
         if !has_work() {
-            thread::park_timeout(std::time::Duration::from_millis(2));
+            thread::park_timeout(std::time::Duration::from_millis(50));
         }
         asleep.store(false, Ordering::Relaxed);
     }
@@ -647,6 +695,27 @@ impl Mgras {
     fn wait_idle(&self) {
         let backoff = crossbeam_utils::Backoff::new();
         while !self.idle() {
+            backoff.snooze();
+        }
+    }
+
+    /// A guest polling STATUS or DMABUSY for an idle board: give a busy
+    /// board up to `POLL_SETTLE` to finish first. The drivers' idle waits
+    /// count polls (a microsecond delay loop between them), not time, and
+    /// the model draws far slower than the board: a context switch's wait
+    /// (DMABUSY, 6 x 15000 polls 10 us apart, about 0.9 s) timed out
+    /// behind long drawing and the kernel killed the X server ("hq idle
+    /// wait timeout"). Under jitv2 the delay loop also runs about five
+    /// times short (clanker/irix/delay-loop-calibrated-cold.md). Waiting
+    /// here turns each poll into board time, so the budget is counted in
+    /// work done; an idle board answers at once.
+    fn settle(&self) {
+        if self.idle() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let backoff = crossbeam_utils::Backoff::new();
+        while !self.idle() && t.elapsed() < POLL_SETTLE {
             backoff.snooze();
         }
     }
@@ -847,20 +916,57 @@ impl Mgras {
         disp::save_png(path, &out, f.width, f.height)
     }
 
+    /// Identity for a board outside the Indigo2 (the Octane's XIO boards):
+    /// the two board-version bytes, the colormaps' revision registers and
+    /// the GE revision, which the readback registers hold from now until
+    /// the first state query or engine start replaces it.
+    pub fn set_identity(&self, bdvers: [u32; 2], cmap_rev: [u32; 2], ge_revision: u32) {
+        let mut f = self.front();
+        f.dcb.init(bdvers, cmap_rev);
+        f.ge_revision = ge_revision;
+        f.hq.ge_readback = [0, ge_revision];
+    }
+
+    /// Start board-to-host DMA in the Octane's HQ4 order (see
+    /// `Hq3Engine::kick_starts_read`). Call before the engines start.
+    pub fn start_reads_at_kick(&self) {
+        assert!(!self.engines.load(Ordering::Acquire), "set before the engines start");
+        // SAFETY: the HQ3 thread is not running.
+        unsafe { &mut *self.eng.get() }.kick_starts_read = true;
+    }
+
+    /// Let STATUS's idle bits read set once the board has been busy for
+    /// `BUSY_STATUS_BOUND` without a break. The model draws far slower than
+    /// the board, and the IP30 kernel gives up waiting on those bits after
+    /// about 2 to 3 s and kills the X server over its idle wait. A
+    /// read that then goes ahead still waits for the work at its data
+    /// register. An approximation: the board would be idle by then.
+    pub fn bound_busy_status(&self) {
+        self.busy_bound.store(true, Ordering::Relaxed);
+    }
+
+    /// Give a board outside the Indigo2 its hooks into the command
+    /// handling. Call before the engines start.
+    pub fn set_board(&self, board: Box<dyn Hq3Board>) {
+        assert!(!self.engines.load(Ordering::Acquire), "set before the engines start");
+        // SAFETY: the HQ3 thread is not running.
+        unsafe { &mut *self.eng.get() }.board = Some(board);
+    }
+
     /// Give the board its path to system memory, for DMA.
     pub fn set_phys(&self, mem: Arc<dyn BusDevice>) {
         *self.mem.lock() = Some(mem);
     }
 
-    /// Drive one of the board's interrupt lines (graphics slot wiring).
+    /// Drive one of the board's interrupt lines.
     fn set_line(&self, line: Line, active: bool) {
-        use crate::dev::ioc::IocInterrupt;
-        let src = match line {
-            Line::Fifo => IocInterrupt::GioSgFifo,
-            Line::General => IocInterrupt::GioSgGraphics,
-            Line::Retrace => IocInterrupt::GioSgRetrace,
+        let n = match line {
+            Line::Fifo => 0,
+            Line::General => 1,
+            Line::Retrace => 2,
         };
-        self.ioc.set_interrupt(src, active);
+        crate::pf_instant!(crate::perfetto::events::MGRAS_IRQ_LINE, n << 1 | active as usize);
+        self.irqs[n].set(active);
     }
 
     /// Wire up the CPU cycle counter for the status bar's MIPS figure.
@@ -868,9 +974,9 @@ impl Mgras {
         *self.cycles.lock() = ptr;
     }
 
-    fn offset(&self, addr: u32) -> Option<u32> {
-        let off = addr.wrapping_sub(MGRAS_SLOT_GFX_BASE);
-        (off < MAP_SIZE).then_some(off)
+    fn offset(&self, addr: u64) -> Option<u32> {
+        let off = addr.wrapping_sub(MGRAS_SLOT_GFX_BASE as u64);
+        (off < MAP_SIZE as u64).then_some(off as u32)
     }
 
     /// Flags as the host reads them.
@@ -903,6 +1009,26 @@ impl Mgras {
             | host::RASTER_IF_CONTEXT..=0x50228 | host::DMA_CONTEXT..=0x504FF => !self.hq_idle(),
             _ => false,
         }
+    }
+
+    /// With `bound_busy_status`, whether the board has been busy without a
+    /// break for longer than `BUSY_STATUS_BOUND`, timed from the store that
+    /// took it from idle to busy (or from the first STATUS read that saw it
+    /// busy, if none did).
+    fn busy_overdue(&self, idle: bool) -> bool {
+        if !self.busy_bound.load(Ordering::Relaxed) {
+            return false;
+        }
+        if idle {
+            self.busy_since.store(0, Ordering::Relaxed);
+            return false;
+        }
+        let now = self.epoch.elapsed().as_nanos() as u64 + 1;
+        let since = match self.busy_since.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => now,
+            Err(t) => t,
+        };
+        now.saturating_sub(since) > BUSY_STATUS_BOUND.as_nanos() as u64
     }
 
     /// The HQ3 has run every command it was given.
@@ -941,11 +1067,15 @@ impl Mgras {
         match off {
             host::STATUS => {
                 let mut v = host::STATUS_FIXED | self.vblank();
+                let idle = self.idle();
                 if self.hq_idle() {
                     v |= host::STATUS_HQ_IDLE;
                 }
-                if self.idle() {
+                if idle {
                     v |= host::STATUS_BOARD_IDLE;
+                }
+                if self.busy_overdue(idle) {
+                    v |= host::STATUS_HQ_IDLE | host::STATUS_BOARD_IDLE;
                 }
                 if Self::cfifo_high(cfg, level) {
                     v |= host::STATUS_CFIFO_HIGH;
@@ -953,6 +1083,7 @@ impl Mgras {
                 if Self::cfifo_low(cfg, level) {
                     v |= host::STATUS_CFIFO_LOW;
                 }
+                crate::pf_instant!(crate::perfetto::events::MGRAS_STATUS_READ, v);
                 v
             }
             host::FIFOSTATUS => level | (cfg & 0x7F) << host::FIFOSTATUS_HIGH_SHIFT,
@@ -971,6 +1102,26 @@ impl Mgras {
             }
             _ => 0,
         }
+    }
+
+    /// Fingerprints of the microcode the kernel loaded (see `microcode`),
+    /// read without the front lock: a download in progress gives a value
+    /// that does not repeat.
+    pub fn microcode_fingerprints(&self) -> microcode::Fingerprints {
+        let f = self.front_view();
+        let up = |ge: usize| self.ge_upload_fingerprint[ge].load(Ordering::Relaxed);
+        microcode::Fingerprints {
+            hq: f.hq.ucode_hash.get(),
+            ge: [0, 1].map(|ge| match up(ge) {
+                0 => f.ge.fingerprint(ge),
+                fp => fp,
+            }),
+        }
+    }
+
+    /// A front-end's own copy of GE11 program `ge` has this fingerprint.
+    pub fn set_ge_upload_fingerprint(&self, ge: usize, fp: u64) {
+        self.ge_upload_fingerprint[ge & 1].store(fp, Ordering::Relaxed);
     }
 
     /// STATUS's vertical blank bit: the first 1 ms of the refresh thread's
@@ -1125,9 +1276,11 @@ impl Mgras {
                 self.wake_hq();
             }
             host::SET_FLAGS | host::SET_FLAGS_PRIVILEGED => {
+                crate::pf_instant!(crate::perfetto::events::MGRAS_FLAG_SET, (self.rss_fifo.len() as u64) << 32 | lo as u64);
                 self.flags.fetch_or(lo, Ordering::AcqRel);
             }
             host::CLEAR_FLAGS | host::CLEAR_FLAGS_PRIVILEGED => {
+                crate::pf_instant!(crate::perfetto::events::MGRAS_FLAG_CLEAR, lo);
                 self.flags.fetch_and(!lo, Ordering::AcqRel);
             }
             0x80000..=0xFFFFF => self.note(format!("fast-path command window write at {off:#x}")),
@@ -1154,8 +1307,11 @@ impl Mgras {
         matches!(off, host::CFIFO | 0x70084 | host::CFIFO_GL | host::CFIFO_PRIVILEGED | 0x50084 | host::RASTER..=0x7FFFF)
     }
 
-    fn do_read(&self, addr: u32, bits: u32) -> Option<u64> {
+    fn do_read(&self, addr: u64, bits: u32) -> Option<u64> {
         let Some(off) = self.offset(addr) else { return Some(0) };
+        if matches!(off, host::STATUS | host::DMABUSY) {
+            self.settle();
+        }
         let sub = self.submit.lock();
         let v = self.read_locked(off, bits);
         crate::pf_level!(self.pf_wait, crate::perfetto::events::MGRAS_WAIT, v.is_none());
@@ -1171,9 +1327,14 @@ impl Mgras {
         Some(v)
     }
 
-    fn do_write(&self, addr: u32, bits: u32, val: u64) -> u32 {
+    fn do_write(&self, addr: u64, bits: u32, val: u64) -> u32 {
         let Some(off) = self.offset(addr) else { return BUS_OK };
         let sub = self.submit.lock();
+        // A store into an idle board may start a busy stretch: time the
+        // bound from here, not from some earlier stretch no STATUS read saw end.
+        if self.busy_bound.load(Ordering::Relaxed) && self.idle() {
+            self.busy_since.store(self.epoch.elapsed().as_nanos() as u64 + 1, Ordering::Relaxed);
+        }
         let ok = self.write_locked(off, bits, val);
         crate::pf_level!(self.pf_fifo_full, crate::perfetto::events::MGRAS_FIFO_FULL, !ok);
         if !ok {
@@ -1427,6 +1588,19 @@ impl crate::gfx_display::GfxDisplay for Mgras {
     fn screen(&self) -> &Mutex<crate::disp::Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
     fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { *self.cycles.lock() }
+    fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
+        // A racy read of the VC3, as the display thread's snapshot does.
+        let vc3 = &self.front_view().dcb.vc3;
+        let (x, y, size, glyph) = vc3.cursor()?;
+        // The glyph layout `frame.rs` draws: two planes, MSB leftmost.
+        let words_per_row = size / 16;
+        let plane_words = size * words_per_row;
+        let word = |plane: usize, row: usize, w: usize| vc3.sram[(glyph + plane * plane_words + row * words_per_row + w) & 0x7FFF] as u64;
+        let mask = (0..size).map(|row| (0..words_per_row).fold(0u64, |m, w| {
+            m | ((word(0, row, w) | word(1, row, w)).reverse_bits() >> 48) << (w * 16)
+        })).collect();
+        Some(crate::gfx_display::HwCursor { x, y, size, mask })
+    }
 }
 
 impl Device for Mgras {
@@ -1471,26 +1645,26 @@ fn read_status(v: Option<u64>) -> (u32, u64) {
 }
 
 impl BusDevice for Mgras {
-    fn read32(&self, addr: u32) -> BusRead32 {
+    fn read32(&self, addr: u64) -> BusRead32 {
         let (status, data) = read_status(self.do_read(addr, 32));
         BusRead32 { status, data: data as u32 }
     }
-    fn write32(&self, addr: u32, val: u32) -> u32 { self.do_write(addr, 32, val as u64) }
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn write32(&self, addr: u64, val: u32) -> u32 { self.do_write(addr, 32, val as u64) }
+    fn read8(&self, addr: u64) -> BusRead8 {
         let (status, data) = read_status(self.do_read(addr, 8));
         BusRead8 { status, data: data as u8 }
     }
-    fn write8(&self, addr: u32, val: u8) -> u32 { self.do_write(addr, 8, val as u64) }
-    fn read16(&self, addr: u32) -> BusRead16 {
+    fn write8(&self, addr: u64, val: u8) -> u32 { self.do_write(addr, 8, val as u64) }
+    fn read16(&self, addr: u64) -> BusRead16 {
         let (status, data) = read_status(self.do_read(addr, 16));
         BusRead16 { status, data: data as u16 }
     }
-    fn write16(&self, addr: u32, val: u16) -> u32 { self.do_write(addr, 16, val as u64) }
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn write16(&self, addr: u64, val: u16) -> u32 { self.do_write(addr, 16, val as u64) }
+    fn read64(&self, addr: u64) -> BusRead64 {
         let (status, data) = read_status(self.do_read(addr, 64));
         BusRead64 { status, data }
     }
-    fn write64(&self, addr: u32, val: u64) -> u32 { self.do_write(addr, 64, val) }
+    fn write64(&self, addr: u64, val: u64) -> u32 { self.do_write(addr, 64, val) }
 }
 
 /// The board as the display host GL presents into: frames land in the

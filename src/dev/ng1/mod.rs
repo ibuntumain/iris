@@ -22,6 +22,11 @@ pub mod rex3_shape;
 /// records what the guest draws, and the generated shader table serves draws in
 /// builds with no Cranelift at all.
 pub mod rex3_profile;
+/// Priority compile queue for the REX3 JIT. Split out of `rex3_jit` so it
+/// carries no Cranelift types: it is compiled (and unit-tested) without the
+/// `rex-jit` feature.
+#[cfg(any(feature = "rex-jit", test))]
+pub mod rex3_jit_queue;
 #[cfg(feature = "rex-jit")]
 pub mod rex3_jit;
 pub mod vc2;

@@ -15,7 +15,7 @@ const SECTOR_SIZE: u64 = 512;
 /// FICLONE) when supported; fall back to a regular byte copy otherwise. On a
 /// reflink-capable filesystem this is metadata-only — sub-millisecond for any
 /// size — which makes per-snapshot overlay capture essentially free.
-fn reflink_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
+pub(crate) fn reflink_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
     let _ = std::fs::remove_file(dst);
     if try_reflink(src, dst).is_ok() {
         return Ok(());
@@ -65,7 +65,14 @@ fn dirty_sidecar_path(overlay_path: &str) -> PathBuf {
     PathBuf::from(format!("{}.dirty", overlay_path))
 }
 
-fn load_dirty_sidecar(path: &Path) -> io::Result<HashSet<u64>> {
+/// The `.dirty` sidecar that persists an overlay's dirty sector set. Shared
+/// with [`crate::block_node::CowNode`], which is the layered re-expression of
+/// this backend.
+pub(crate) fn sidecar_path_for(overlay_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.dirty", overlay_path.display()))
+}
+
+pub(crate) fn load_dirty_sidecar(path: &Path) -> io::Result<HashSet<u64>> {
     if !path.exists() { return Ok(HashSet::new()); }
     let mut f = File::open(path)?;
     let mut count_buf = [0u8; 8];
@@ -80,7 +87,7 @@ fn load_dirty_sidecar(path: &Path) -> io::Result<HashSet<u64>> {
     Ok(set)
 }
 
-fn save_dirty_sidecar(path: &Path, dirty: &HashSet<u64>) -> io::Result<()> {
+pub(crate) fn save_dirty_sidecar(path: &Path, dirty: &HashSet<u64>) -> io::Result<()> {
     // Write atomically: write to a temp file then rename.
     let tmp = path.with_extension("dirty.tmp");
     {

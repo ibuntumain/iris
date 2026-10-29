@@ -97,11 +97,15 @@ pub fn visit_paths(cfg: &mut MachineConfig, mut visit: impl FnMut(&mut String)) 
     visit(&mut cfg.prom);
     visit(&mut cfg.nvram);
     visit(&mut cfg.nveeprom);
+    if let Some(flash) = &mut cfg.octane.flash {
+        visit(flash);
+    }
     for path in [
         &mut cfg.serial_log,
         &mut cfg.load_elf,
         &mut cfg.test_device_dump,
         &mut cfg.network.tftp_dir,
+        &mut cfg.network.rsh_dir,
     ] {
         if let Some(path) = path {
             visit(path);

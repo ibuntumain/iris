@@ -1,6 +1,6 @@
 //! GR2 graphics (Indy XZ / Indigo2 XZ / Indigo2 Extreme).
 //!
-//! Block layout (rules/gr2/DESIGN.md):
+//! Block layout (clanker/gr2/DESIGN.md):
 //!   hq2.rs     HQ2 registers + HLE command interpreter (HQ2 thread)
 //!   re3.rs     RE3 registers, VRAM, drawing (RE3 thread)
 //!   ge7.rs     GE7 windows + microcode storage (inert)
@@ -65,8 +65,15 @@ use vc1::Vc1;
 use xmap5::Xmap5;
 
 /// GIO gfx slot base and size (the board decodes a 4 MB slot).
-pub const GR2_BASE: u32 = 0x1F00_0000;
+pub const GR2_BASE: u64 = 0x1F00_0000;
 pub const GR2_SLOT_SIZE: u32 = 0x0040_0000;
+
+/// Bus address to a 32-bit offset from the slot base. The decode table only
+/// routes the GR2 slot here, so the truncation never loses bits.
+#[inline]
+fn slot_off(addr: u64) -> u32 {
+    (addr - GR2_BASE) as u32
+}
 
 // Region offsets from the board base (GR2.h).
 const SHRAM: u32 = 0x00000;
@@ -169,7 +176,7 @@ pub struct Gr2 {
     /// has not executed yet. FIN3 reads as clear while any is pending: with
     /// our deep FIFO an older Finish would otherwise raise FIN3 for a newer
     /// wait, and the pipeline would run a whole frame behind every swap
-    /// (ideas flicker, IRIX 6.5.22). See rules/gr2/fin3-must-track-pending-finish.md.
+    /// (ideas flicker, IRIX 6.5.22). See clanker/gr2/fin3-must-track-pending-finish.md.
     fin3_pending: AtomicU32,
     /// Set when the kernel acks FIN2 (write to 0x6A04C), which it does right
     /// before issuing a FIN2 command (pixel DMA 0x147, context save/restore)
@@ -179,7 +186,7 @@ pub struct Gr2 {
     /// graphics error and detached Xsgi. While set, a version read with FIN2
     /// clear stalls (bus busy) as long as the HQ2 still has work, so the
     /// kernel sees FIN2 as soon as the HQ2 gets there. See
-    /// rules/gr2/fin2-wait-must-stall.md.
+    /// clanker/gr2/fin2-wait-must-stall.md.
     fin2_wait: AtomicU32,
     /// Host time (fin2_clock ns) of the last progress seen by a stalled FIN2
     /// poll since the wait was armed (0 = no stalled poll yet). The stall
@@ -199,7 +206,7 @@ pub struct Gr2 {
     /// (the kernel's VDMA) drains; head / tail count words since reset.
     /// A read with the ring empty waits (bus busy) while the HQ2 still has
     /// work, since the kernel starts the VDMA right after queuing the
-    /// request. See rules/gr2/gedma-read-port.md.
+    /// request. See clanker/gr2/gedma-read-port.md.
     gedma_out: [AtomicU32; GEDMA_OUT_WORDS],
     gedma_out_head: AtomicU32,
     gedma_out_tail: AtomicU32,
@@ -424,13 +431,17 @@ impl Gr2 {
         }
     }
 
-    /// An engine thread with nothing to do: park for up to 2 ms, unless
-    /// `has_work` finds a push made before `asleep` was raised.
+    /// An engine thread with nothing to do: park for up to 50 ms, unless
+    /// `has_work` finds a push made before `asleep` was raised. The timeout
+    /// is only a backstop for a wake the fence protocol should never lose,
+    /// so it is long enough that an idle engine costs ~20 wakeups/s rather
+    /// than 500; a hypothetical missed wake would cost one interval of
+    /// latency, never correctness.
     fn sleep(asleep: &AtomicBool, has_work: impl FnOnce() -> bool) {
         asleep.store(true, Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::SeqCst);
         if !has_work() {
-            thread::park_timeout(std::time::Duration::from_millis(2));
+            thread::park_timeout(std::time::Duration::from_millis(50));
         }
         asleep.store(false, Ordering::Relaxed);
     }
@@ -981,6 +992,18 @@ impl crate::gfx_display::GfxDisplay for Gr2 {
     fn screen(&self) -> &Mutex<Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
     fn cycles(&self) -> CyclesPtr { self.cycles.get() }
+    fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
+        // A racy read of the registers, as the display thread's compose does.
+        let vc1 = &self.regs().vc1;
+        if !vc1.cursor_visible() {
+            return None;
+        }
+        let (x, y) = vc1.cursor_pos();
+        let mask = (0..32).map(|cy| (0..32).fold(0u64, |m, cx| {
+            m | ((vc1.cursor_pixel(cx, cy) != 0) as u64) << cx
+        })).collect();
+        Some(crate::gfx_display::HwCursor { x, y, size: 32, mask })
+    }
 }
 
 impl Resettable for Gr2 {
@@ -994,33 +1017,33 @@ impl Resettable for Gr2 {
 }
 
 impl BusDevice for Gr2 {
-    fn read32(&self, addr: u32) -> BusRead32 {
-        let r = self.reg_read((addr - GR2_BASE) & (GR2_SLOT_SIZE - 4));
+    fn read32(&self, addr: u64) -> BusRead32 {
+        let r = self.reg_read(slot_off(addr) & (GR2_SLOT_SIZE - 4));
         crate::pf_level!(self.pf_wait, crate::perfetto::events::GR2_WAIT, r.status == BUS_BUSY);
         r
     }
-    fn write32(&self, addr: u32, val: u32) -> u32 {
-        let st = self.reg_write((addr - GR2_BASE) & (GR2_SLOT_SIZE - 4), val);
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        let st = self.reg_write(slot_off(addr) & (GR2_SLOT_SIZE - 4), val);
         self.pf_write(st);
         st
     }
     // Narrow accesses hit 8/16-bit peripheral chips on word addresses: the
     // access carries the register value whatever its width or lane (GR2.h).
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn read8(&self, addr: u64) -> BusRead8 {
         let r = self.read32(addr & !3);
         BusRead8 { status: r.status, data: r.data as u8 }
     }
-    fn write8(&self, addr: u32, val: u8) -> u32 {
-        self.reg_write_narrow((addr - GR2_BASE) & (GR2_SLOT_SIZE - 4), val as u32)
+    fn write8(&self, addr: u64, val: u8) -> u32 {
+        self.reg_write_narrow(slot_off(addr) & (GR2_SLOT_SIZE - 4), val as u32)
     }
-    fn read16(&self, addr: u32) -> BusRead16 {
+    fn read16(&self, addr: u64) -> BusRead16 {
         let r = self.read32(addr & !3);
         BusRead16 { status: r.status, data: r.data as u16 }
     }
-    fn write16(&self, addr: u32, val: u16) -> u32 {
-        self.reg_write_narrow((addr - GR2_BASE) & (GR2_SLOT_SIZE - 4), val as u32)
+    fn write16(&self, addr: u64, val: u16) -> u32 {
+        self.reg_write_narrow(slot_off(addr) & (GR2_SLOT_SIZE - 4), val as u32)
     }
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn read64(&self, addr: u64) -> BusRead64 {
         let hi = self.read32(addr);
         if hi.status != BUS_OK {
             return BusRead64 { status: hi.status, data: 0 };
@@ -1031,7 +1054,7 @@ impl BusDevice for Gr2 {
         }
         BusRead64::ok(((hi.data as u64) << 32) | lo.data as u64)
     }
-    fn write64(&self, addr: u32, val: u64) -> u32 {
+    fn write64(&self, addr: u64, val: u64) -> u32 {
         let st = self.write64_inner(addr, val);
         self.pf_write(st);
         st
@@ -1046,8 +1069,8 @@ impl Gr2 {
         crate::pf_level!(self.pf_fifo_full, crate::perfetto::events::GR2_FIFO_FULL, st == BUS_BUSY);
     }
 
-    fn write64_inner(&self, addr: u32, val: u64) -> u32 {
-        let off = (addr - GR2_BASE) & (GR2_SLOT_SIZE - 8);
+    fn write64_inner(&self, addr: u64, val: u64) -> u32 {
+        let off = slot_off(addr) & (GR2_SLOT_SIZE - 8);
         let (hi, lo) = ((val >> 32) as u32, val as u32);
         if (FIFO..FIFO_END).contains(&off) {
             // Both words or neither: a retried store must not push the first twice.

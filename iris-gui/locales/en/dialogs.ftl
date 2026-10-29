@@ -26,7 +26,6 @@ dialog-new-machine-ram-banks = Set each memory bank
 dialog-new-machine-mb = { $size } MB
 # $bank is the bank number, 0 to 3.
 dialog-new-machine-bank = Bank { $bank }
-dialog-new-machine-bank-ip28-only = 256 and 512 MB banks need the Indigo2 R10000 model.
 dialog-new-machine-ip28-note = Indigo2 R10000 support is experimental. The machine gets IMPACT graphics, because the IRIX kernel for this model has no Newport driver. The built-in PROM is used unless you choose a PROM file.
 dialog-new-machine-disks = Disks
 dialog-new-machine-hdd = Hard disk (SCSI 1)
@@ -54,3 +53,4 @@ dialog-create-disk-subtitle =
 dialog-create-disk-exists = ⚠ { $file } already exists ({ $size } MB). Creating the image erases it.
 dialog-create-disk-overwrite = Erase the existing image
 dialog-create-disk-create = Create
+dialog-new-machine-octane-note = The Octane needs the IP30 PROM image; choose it above. It has the R10000 at 195 MHz and Solid IMPACT graphics.

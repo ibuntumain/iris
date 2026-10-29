@@ -11,8 +11,9 @@ use crate::dev::eeprom_93c56::Eeprom93c56;
 use crate::dev::ioc::Ioc;
 use crate::dev::ds1x86::Ds1x86;
 use crate::net::GatewayConfig;
-use crate::dev::seeq8003::{Seeq8003, SeeqCallback};
-use crate::dev::wd33c93a::{Wd33c93a, ScsiCallback};
+use crate::dev::seeq8003::Seeq8003;
+use crate::dev::wd33c93a::Wd33c93a;
+use crate::irq::{InterruptController, IrqLine};
 use crate::dev::ioc::IocInterrupt;
 use crate::dev::hal2::Hal2;
 use crate::hptimer::TimerManager;
@@ -239,74 +240,86 @@ struct Hpc3State {
     pbus_pio: [u32; 0x1000],
 }
 
-pub trait PdmaCallback: Send + Sync {
-    fn set_dma_interrupt(&self, level: bool);
-}
-
-
-struct Hpc3Irq {
+/// The HPC3's interrupt status (INTSTAT) as a controller: line `n` is
+/// INTSTAT bit `n`. SCSI channel 0's chip and DMA bits are ORed onto the
+/// IOC's SCSI0 line and channel 1's onto SCSI1; the SEEQ's goes to Ethernet.
+struct Hpc3Interrupts {
     state: Arc<Mutex<Hpc3State>>,
-    ioc: Ioc,
-    bit: u32,
-    ioc_line: IocInterrupt,
-    /// For SCSI chip-IRQ wirings: the paired PDMA channel + its DMA-side
-    /// intstat bit, so that a chip-INT ack also drops the PDMA half of the
-    /// shared SCSI INT3 line.  None for callbacks that don't have a paired
-    /// PDMA channel (e.g. PDMA-side Hpc3Irq, ethernet, …).
-    pdma_paired: Option<(Arc<Mutex<PdmaChannel>>, u32)>,
+    /// The IOC's SCSI0, SCSI1 and Ethernet lines.
+    scsi: [IrqLine; 2],
+    ethernet: IrqLine,
+    /// The SCSI PDMA channels, so that a chip-INT ack can also drop the PDMA
+    /// half of the shared SCSI line (see `set_line`).
+    scsi_dma: [Arc<Mutex<PdmaChannel>>; 2],
 }
 
-impl Hpc3Irq {
-    fn update(&self, level: bool) {
+impl Hpc3Interrupts {
+    /// The line for one INTSTAT bit.
+    fn line(self: &Arc<Self>, bit: u32) -> IrqLine {
+        IrqLine::new(self.clone(), bit.trailing_zeros())
+    }
+
+    /// Set or clear `bit`, then drive SCSI channel `n`'s IOC line from both
+    /// of its bits.
+    fn update_scsi(&self, n: usize, bit: u32, level: bool) {
         let mut state = self.state.lock();
-        if level { state.intstat |= self.bit; } else { state.intstat &= !self.bit; }
-
-        // Determine IOC line state based on all contributors
-        let active = match self.ioc_line {
-            IocInterrupt::Scsi0 => (state.intstat & (HPC3_INTSTAT_SCSI0_DEV | HPC3_INTSTAT_SCSI0_DMA)) != 0,
-            IocInterrupt::Scsi1 => (state.intstat & (HPC3_INTSTAT_SCSI1_DEV | HPC3_INTSTAT_SCSI1_DMA)) != 0,
-            IocInterrupt::Ethernet => (state.intstat & (HPC3_INTSTAT_ENET_DEV | HPC3_INTSTAT_ENET_RX_DMA | HPC3_INTSTAT_ENET_TX_DMA)) != 0,
-            _ => false,
-        };
-        self.ioc.set_interrupt(self.ioc_line, active);
+        if level { state.intstat |= bit; } else { state.intstat &= !bit; }
+        self.scsi[n].set(state.intstat & SCSI_BITS[n] != 0);
     }
 }
 
+/// Each SCSI channel's chip and DMA bits, which share its IOC line.
+const SCSI_BITS: [u32; 2] = [
+    HPC3_INTSTAT_SCSI0_DEV | HPC3_INTSTAT_SCSI0_DMA,
+    HPC3_INTSTAT_SCSI1_DEV | HPC3_INTSTAT_SCSI1_DMA,
+];
 
-impl ScsiCallback for Hpc3Irq {
-    fn set_interrupt(&self, level: bool) {
-        self.update(level);
-        if !level {
-            // When the chip-side INT deasserts, also drop any pending PDMA
-            // DMA-completion bit on the same SCSI line — on real HPC3 the SCSI
-            // INT3 source is shared and the chip ack settles both halves.
-            // Without this, intstat[SCSI*_DMA] stays asserted forever when the
-            // IRIX miniroot's SCSI driver only acks via the chip path.
-            if let Some((chan, dma_bit)) = &self.pdma_paired {
-                let mut c = chan.lock();
-                if c.ctrl & PDMA_CTRL_INT != 0 {
-                    c.ctrl &= !PDMA_CTRL_INT;
+impl InterruptController for Hpc3Interrupts {
+    fn set_line(&self, line: u32, level: bool) {
+        let bit = 1u32 << line;
+        match bit {
+            HPC3_INTSTAT_SCSI0_DMA => self.update_scsi(0, bit, level),
+            HPC3_INTSTAT_SCSI1_DMA => self.update_scsi(1, bit, level),
+            HPC3_INTSTAT_SCSI0_DEV | HPC3_INTSTAT_SCSI1_DEV => {
+                let (n, dma_bit) = if bit == HPC3_INTSTAT_SCSI0_DEV {
+                    (0, HPC3_INTSTAT_SCSI0_DMA)
+                } else {
+                    (1, HPC3_INTSTAT_SCSI1_DMA)
+                };
+                self.update_scsi(n, bit, level);
+                if !level {
+                    // When the chip-side INT deasserts, also drop any pending
+                    // PDMA DMA-completion bit on the same SCSI line: on a real
+                    // HPC3 the SCSI INT3 source is shared and the chip ack
+                    // settles both halves. Without this, intstat[SCSI*_DMA]
+                    // stays asserted forever when the IRIX miniroot's SCSI
+                    // driver only acks via the chip path.
+                    {
+                        let mut c = self.scsi_dma[n].lock();
+                        if c.ctrl & PDMA_CTRL_INT != 0 {
+                            c.ctrl &= !PDMA_CTRL_INT;
+                        }
+                    }
+                    let mut st = self.state.lock();
+                    st.intstat &= !dma_bit;
+                    let active = st.intstat & SCSI_BITS[n] != 0;
+                    drop(st);
+                    self.scsi[n].set(active);
                 }
-                drop(c);
-                let mut st = self.state.lock();
-                st.intstat &= !*dma_bit;
-                let active = (st.intstat & (HPC3_INTSTAT_SCSI0_DEV | HPC3_INTSTAT_SCSI0_DMA
-                                           | HPC3_INTSTAT_SCSI1_DEV | HPC3_INTSTAT_SCSI1_DMA))
-                             & match self.ioc_line {
-                                 IocInterrupt::Scsi0 => HPC3_INTSTAT_SCSI0_DEV | HPC3_INTSTAT_SCSI0_DMA,
-                                 IocInterrupt::Scsi1 => HPC3_INTSTAT_SCSI1_DEV | HPC3_INTSTAT_SCSI1_DMA,
-                                 _ => 0,
-                             };
-                drop(st);
-                self.ioc.set_interrupt(self.ioc_line, active != 0);
             }
+            HPC3_INTSTAT_ENET_DEV => {
+                {
+                    let mut st = self.state.lock();
+                    if level { st.intstat |= HPC3_INTSTAT_ENET_DEV; }
+                    else     { st.intstat &= !HPC3_INTSTAT_ENET_DEV; }
+                }
+                dlog_dev!(LogModule::Hpc3, "ENET IRQ: level={}", level);
+                // The SEEQ's own level, as it always was: not ORed with the
+                // Ethernet DMA bits.
+                self.ethernet.set(level);
+            }
+            _ => {}
         }
-    }
-}
-
-impl PdmaCallback for Hpc3Irq {
-    fn set_dma_interrupt(&self, level: bool) {
-        self.update(level);
     }
 }
 
@@ -341,7 +354,8 @@ struct PdmaChannel {
     sys_mem: Option<Arc<dyn BusDevice>>,
     endian: bool,
     even_high: bool,    // PBUS only: even bytes on high bus lane (bit 19 of dmacfg)
-    callback: Option<Arc<dyn PdmaCallback>>,
+    /// The channel's DMA-completion interrupt (SCSI channels only).
+    irq: Option<IrqLine>,
     dump_enabled: Arc<AtomicU32>,
     dump_file: Option<File>,
     dump_transaction_id: u32,
@@ -377,7 +391,7 @@ impl PdmaChannel {
             sys_mem: None,
             endian: false,
             even_high: false,
-            callback: None,
+            irq: None,
             dump_enabled,
             dump_file: None,
             dump_transaction_id: 0,
@@ -445,9 +459,9 @@ fn start_transaction(&mut self) {
                 // Word 0: Buffer Address (PADDR)
                 // Word 1: Byte Count & Flags (CNTINFO)
                 // Word 2: Next Descriptor (PNEXT)
-                let w_addr = { let _r = mem.read32(nbdp + PDMA_DESC_CBP_OFFSET); if _r.is_ok() { let d = _r.data; d } else { 0 } };
-                let w_cnt = { let _r = mem.read32(nbdp + PDMA_DESC_BC_OFFSET); if _r.is_ok() { let d = _r.data; d } else { 0 } };
-                let w_next = { let _r = mem.read32(nbdp + PDMA_DESC_NBP_OFFSET); if _r.is_ok() { let d = _r.data; d } else { 0 } };
+                let w_addr = { let _r = mem.read32((nbdp + PDMA_DESC_CBP_OFFSET) as u64); if _r.is_ok() { let d = _r.data; d } else { 0 } };
+                let w_cnt = { let _r = mem.read32((nbdp + PDMA_DESC_BC_OFFSET) as u64); if _r.is_ok() { let d = _r.data; d } else { 0 } };
+                let w_next = { let _r = mem.read32((nbdp + PDMA_DESC_NBP_OFFSET) as u64); if _r.is_ok() { let d = _r.data; d } else { 0 } };
 
                 // Track current descriptor pointer for HPC3 writeback at interrupt time.
                 // RX (ch10): crbdp = address of descriptor currently being filled.
@@ -479,8 +493,8 @@ fn start_transaction(&mut self) {
                             if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[{}]: Transfer Complete (EOX), Interrupting", self.id); }
                             self.ctrl |= PDMA_CTRL_INT; // Set interrupt pending
                             self.trace_int();
-                            if let Some(cb) = &self.callback {
-                                cb.set_dma_interrupt(true);
+                            if let Some(irq) = &self.irq {
+                                irq.set(true);
                             }
                         }
                         break; // Done
@@ -549,7 +563,7 @@ fn start_transaction(&mut self) {
         if self.id < 8 {
             let addr = self.cbp;
             let mem_val = if let Some(mem) = &self.sys_mem {
-                { let _r = mem.read32(addr); if _r.is_ok() { _r.data } else { return None } }
+                { let _r = mem.read32(addr as u64); if _r.is_ok() { _r.data } else { return None } }
             } else {
                 return None;
             };
@@ -576,14 +590,14 @@ fn start_transaction(&mut self) {
 
         let val = if let Some(mem) = &self.sys_mem {
             if self.width_16 {
-                let _r = mem.read16(addr);
+                let _r = mem.read16(addr as u64);
                 if _r.is_ok() {
                     let v = if swap { _r.data.swap_bytes() } else { _r.data };
                     self.handle_dump(addr, &v.to_be_bytes(), true);
                     Some(v as u32)
                 } else { None }
             } else {
-                let _r = mem.read8(addr);
+                let _r = mem.read8(addr as u64);
                 if _r.is_ok() {
                     self.handle_dump(addr, &[_r.data], true);
                     Some(_r.data as u32)
@@ -641,7 +655,7 @@ fn start_transaction(&mut self) {
             };
 
             if let Some(mem) = &self.sys_mem {
-                mem.write32(addr, mem_val);
+                mem.write32(addr as u64, mem_val);
                 self.handle_dump(addr, &mem_val.to_be_bytes(), false);
             }
             return self.advance(4, eop);
@@ -654,10 +668,10 @@ fn start_transaction(&mut self) {
         if let Some(mem) = &self.sys_mem {
             if self.width_16 {
                 let v = if swap { (val as u16).swap_bytes() } else { val as u16 };
-                mem.write16(addr, v);
+                mem.write16(addr as u64, v);
                 self.handle_dump(addr, &v.to_be_bytes(), false);
             } else {
-                mem.write8(addr, val as u8);
+                mem.write8(addr as u64, val as u8);
                 self.handle_dump(addr, &[val as u8], false);
             }
         }
@@ -733,9 +747,9 @@ fn start_transaction(&mut self) {
             status |= DmaStatus(DmaStatus::IRQ);
             // For SCSI/PBUS channels (callback installed): set ctrl INT flag and notify.
             // For enet channels (no callback): IRQ bit in status is the signal; don't touch ctrl.
-            if let Some(cb) = &self.callback {
+            if let Some(irq) = &self.irq {
                 self.ctrl |= PDMA_CTRL_INT;
-                cb.set_dma_interrupt(true);
+                irq.set(true);
             }
             if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[{}]: Interrupting (xie caller_eop={} bc_done={})", self.id, caller_eop, bc_done); }
         }
@@ -797,8 +811,8 @@ impl PdmaChannelOps for PbusDmaOps {
                 let val = chan.ctrl;
                 if (chan.ctrl & PDMA_CTRL_INT) != 0 {
                     chan.ctrl &= !PDMA_CTRL_INT;
-                    if let Some(cb) = &chan.callback {
-                        cb.set_dma_interrupt(false);
+                    if let Some(irq) = &chan.irq {
+                        irq.set(false);
                     }
                 }
                 val
@@ -847,8 +861,8 @@ impl PdmaChannelOps for ScsiDmaOps {
                 let val = chan.ctrl;
                 if (chan.ctrl & SCSI_CTRL_INT) != 0 {
                     chan.ctrl &= !SCSI_CTRL_INT;
-                    if let Some(cb) = &chan.callback {
-                        cb.set_dma_interrupt(false);
+                    if let Some(irq) = &chan.irq {
+                        irq.set(false);
                     }
                 }
                 val
@@ -924,26 +938,6 @@ impl PdmaChannelOps for ScsiDmaOps {
 const ENET_BC_TXD: u16 = 0x8000;
 // BC register bit 28: HPC3 has sampled EOX from the current descriptor
 const ENET_BC_EOX_SAMPLED: u32 = 0x10000000;
-
-/// Ethernet SEEQ interrupt callback.
-/// Raises/lowers the IOC Ethernet line and updates intstat.
-/// INTPEND (bit 1 of ENET_RX_RESET register) is mirrored in enet_intpend (AtomicBool)
-/// so it can be read lock-free by ENET_RX_RESET register reads (which hold the channel lock).
-struct EnetSeeqIrq {
-    hpc3_state: Arc<Mutex<Hpc3State>>,
-    ioc:        Ioc,
-}
-impl SeeqCallback for EnetSeeqIrq {
-    fn set_interrupt(&self, level: bool) {
-        {
-            let mut st = self.hpc3_state.lock();
-            if level { st.intstat |= HPC3_INTSTAT_ENET_DEV; }
-            else     { st.intstat &= !HPC3_INTSTAT_ENET_DEV; }
-        }
-        dlog_dev!(LogModule::Hpc3, "ENET IRQ: level={}", level);
-        self.ioc.set_interrupt(IocInterrupt::Ethernet, level);
-    }
-}
 
 struct EnetRxDmaOps {
     seeq: Arc<OnceLock<Arc<Seeq8003>>>,
@@ -1129,6 +1123,7 @@ impl Hpc3 {
         let pcap_interface = net.pcap_interface;
         let nfs_pcap_ip = net.nfs_pcap_ip;
         let tftp_dir = net.tftp_dir.clone();
+        let rsh_dir = net.rsh_dir.clone();
         let rtc = Arc::new(Ds1x86::new(8192, nvram_path, rtc_offset));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
@@ -1163,19 +1158,6 @@ impl Hpc3 {
                 chan.active_mask = ENET_TX_CTRL_ACTIVE; // 0x200 for enet RX/TX
             }
             
-            // Setup DMA interrupts
-            if i == HPC3_PDMA_CHAN_SCSI0 as usize {
-                chan.callback = Some(Arc::new(Hpc3Irq {
-                    state: state.clone(), ioc: ioc.clone(), bit: HPC3_INTSTAT_SCSI0_DMA, ioc_line: IocInterrupt::Scsi0,
-                    pdma_paired: None,  // PDMA-side: doesn't itself need to clear another PDMA
-                }));
-            } else if i == HPC3_PDMA_CHAN_SCSI1 as usize {
-                chan.callback = Some(Arc::new(Hpc3Irq {
-                    state: state.clone(), ioc: ioc.clone(), bit: HPC3_INTSTAT_SCSI1_DMA, ioc_line: IocInterrupt::Scsi1,
-                    pdma_paired: None,
-                }));
-            }
-            // Enet channels 10/11: no DMA completion callback — interrupt is driven by SEEQ via EnetSeeqIrq
             pdma_channels.push(Arc::new(Mutex::new(chan)));
             dma_clients.push(Arc::new(PdmaClientImpl { channel: pdma_channels.last().unwrap().clone() }));
             if i <= HPC3_PDMA_CHAN_GENERIC as usize {
@@ -1196,10 +1178,18 @@ impl Hpc3 {
         let enet_rx_dma = Arc::new(PdmaClientImpl { channel: pdma_channels[10].clone() });
         let enet_tx_dma = Arc::new(PdmaClientImpl { channel: pdma_channels[11].clone() });
 
-        let seeq_irq = Arc::new(EnetSeeqIrq {
-            hpc3_state: state.clone(),
-            ioc:        ioc.clone(),
+        // The interrupt status, and its lines: each SCSI PDMA channel's
+        // completion, each WD33C93A, the SEEQ. Enet channels 10/11 have no
+        // DMA completion line: the SEEQ drives the interrupt.
+        let irqs = Arc::new(Hpc3Interrupts {
+            state: state.clone(),
+            scsi: [ioc.irq_line(IocInterrupt::Scsi0), ioc.irq_line(IocInterrupt::Scsi1)],
+            ethernet: ioc.irq_line(IocInterrupt::Ethernet),
+            scsi_dma: [pdma_channels[HPC3_PDMA_CHAN_SCSI0 as usize].clone(), pdma_channels[HPC3_PDMA_CHAN_SCSI1 as usize].clone()],
         });
+        pdma_channels[HPC3_PDMA_CHAN_SCSI0 as usize].lock().irq = Some(irqs.line(HPC3_INTSTAT_SCSI0_DMA));
+        pdma_channels[HPC3_PDMA_CHAN_SCSI1 as usize].lock().irq = Some(irqs.line(HPC3_INTSTAT_SCSI1_DMA));
+        let seeq_irq = irqs.line(HPC3_INTSTAT_ENET_DEV);
         let gateway_cfg = GatewayConfig {
             nfs,
             port_forwards,
@@ -1210,6 +1200,7 @@ impl Hpc3 {
             pcap_interface,
             nfs_pcap_ip,
             tftp_dir,
+            rsh_dir,
             ..GatewayConfig::default()
         };
         let net_base = gateway_cfg.clone();
@@ -1218,12 +1209,9 @@ impl Hpc3 {
         let _ = enet_seeq_lock.set(seeq.clone());
         
         let scsi0_dma = Arc::new(PdmaClientImpl { channel: pdma_channels[8].clone() });
-        let scsi0_irq = Arc::new(Hpc3Irq {
-            state: state.clone(), ioc: ioc.clone(), bit: HPC3_INTSTAT_SCSI0_DEV, ioc_line: IocInterrupt::Scsi0,
-            // Pair the chip-IRQ with the SCSI0 PDMA channel so a chip-INT ack
-            // (kernel reads SCSI_STATUS) also drops any lingering PDMA INT.
-            pdma_paired: Some((pdma_channels[8].clone(), HPC3_INTSTAT_SCSI0_DMA)),
-        });
+        // A chip-INT ack (the kernel reads SCSI_STATUS) also drops any
+        // lingering PDMA INT on the same line; see Hpc3Interrupts.
+        let scsi0_irq = irqs.line(HPC3_INTSTAT_SCSI0_DEV);
 
         let scsi_dev = Arc::new(Wd33c93a::new_with_id(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone(), scsi_deferred_int, 0));
         let _ = scsi_wd_lock.set(scsi_dev.clone());
@@ -1231,10 +1219,7 @@ impl Hpc3 {
         // Fullhouse's second WD33C93A — see scsi1_wd_lock's doc comment above.
         let scsi_dev1 = if !guinness {
             let scsi1_dma = Arc::new(PdmaClientImpl { channel: pdma_channels[9].clone() });
-            let scsi1_irq = Arc::new(Hpc3Irq {
-                state: state.clone(), ioc: ioc.clone(), bit: HPC3_INTSTAT_SCSI1_DEV, ioc_line: IocInterrupt::Scsi1,
-                pdma_paired: Some((pdma_channels[9].clone(), HPC3_INTSTAT_SCSI1_DMA)),
-            });
+            let scsi1_irq = irqs.line(HPC3_INTSTAT_SCSI1_DEV);
             let dev = Arc::new(Wd33c93a::new_with_id(Some(scsi1_dma), Some(scsi1_irq), heartbeat.clone(), scsi_deferred_int, 1));
             let _ = scsi1_wd_lock.set(dev.clone());
             Some(dev)
@@ -1492,9 +1477,9 @@ impl Device for Hpc3 {
                     writeln!(writer, "PDMA descriptor chain from {:08x}:", addr).unwrap();
                     let mut idx = 0usize;
                     loop {
-                        let cbp  = { let _r = mem.read32(addr + PDMA_DESC_CBP_OFFSET); if _r.is_ok() { let d = _r.data; d } else { break } };
-                        let bc   = { let _r = mem.read32(addr + PDMA_DESC_BC_OFFSET); if _r.is_ok() { let d = _r.data; d } else { break } };
-                        let nbdp = { let _r = mem.read32(addr + PDMA_DESC_NBP_OFFSET); if _r.is_ok() { let d = _r.data; d } else { break } };
+                        let cbp  = { let _r = mem.read32((addr + PDMA_DESC_CBP_OFFSET) as u64); if _r.is_ok() { let d = _r.data; d } else { break } };
+                        let bc   = { let _r = mem.read32((addr + PDMA_DESC_BC_OFFSET) as u64); if _r.is_ok() { let d = _r.data; d } else { break } };
+                        let nbdp = { let _r = mem.read32((addr + PDMA_DESC_NBP_OFFSET) as u64); if _r.is_ok() { let d = _r.data; d } else { break } };
                         let eox  = (bc & PDMA_DESC_EOX) != 0;
                         let eop  = (bc & PDMA_DESC_EOP) != 0;
                         let xie  = (bc & PDMA_DESC_XIE) != 0;
@@ -1614,8 +1599,8 @@ impl Device for Hpc3 {
 }
 
 impl BusDevice for Hpc3 {
-    fn read8(&self, addr: u32) -> BusRead8 {
-        let offset = addr - HPC3_BASE;
+    fn read8(&self, addr: u64) -> BusRead8 {
+        let offset = (addr - HPC3_BASE as u64) as u32;
 
         // IP28's PROM copies the PBUS control bitfield with byte loads.
         if offset < 8 * PBUS_DMA_STRIDE {
@@ -1691,7 +1676,7 @@ impl BusDevice for Hpc3 {
             }
             // Sparse decode: addr/4 gives actual byte index in RTC
             let byte_index = rtc_offset >> 2;
-            return self.rtc.read8(byte_index);
+            return self.rtc.read8(byte_index as u64);
         }
 
         // MISC_EEPROM_DATA, byte lane (PROM bit-bangs this register 8 bits
@@ -1726,8 +1711,8 @@ impl BusDevice for Hpc3 {
         BusRead8::ok(0)
     }
 
-    fn write8(&self, addr: u32, val: u8) -> u32 {
-        let offset = addr - HPC3_BASE;
+    fn write8(&self, addr: u64, val: u8) -> u32 {
+        let offset = (addr - HPC3_BASE as u64) as u32;
 
         // IP28's PROM emits four sb instructions for its DMA control struct.
         // Use the addressed big-endian byte lane, without reading CTRL back:
@@ -1805,7 +1790,7 @@ impl BusDevice for Hpc3 {
             }
             // Sparse decode: addr/4 gives actual byte index in RTC
             let byte_index = rtc_offset >> 2;
-            return self.rtc.write8(byte_index, val);
+            return self.rtc.write8(byte_index as u64, val);
         }
 
         // MISC_EEPROM_DATA, byte lane — see matching comment in read8.
@@ -1837,8 +1822,8 @@ impl BusDevice for Hpc3 {
         BUS_OK
     }
 
-    fn read32(&self, addr: u32) -> BusRead32 {
-        let offset = addr - HPC3_BASE;
+    fn read32(&self, addr: u64) -> BusRead32 {
+        let offset = (addr - HPC3_BASE as u64) as u32;
 
         // INT2 (fullhouse only, PBUS PIO channel 4) - should not use 32-bit access, but allow for legacy
         if !self.guinness && (HPC3_INT2_BASE..HPC3_INT2_BASE + HPC3_INT2_SIZE).contains(&offset) {
@@ -1960,7 +1945,7 @@ impl BusDevice for Hpc3 {
             let rtc_offset = (offset - PBUS_BBRAM) as u32;
             // For 32-bit reads, only the bottom byte is valid
             let byte_index = rtc_offset >> 2;
-            let r = self.rtc.read8(byte_index);
+            let r = self.rtc.read8(byte_index as u64);
             return if r.is_ok() { BusRead32::ok(r.data as u32) } else { BusRead32 { status: r.status, data: 0 } };
         }
 
@@ -1968,8 +1953,8 @@ impl BusDevice for Hpc3 {
         BusRead32::ok(0)
     }
 
-    fn write32(&self, addr: u32, val: u32) -> u32 {
-        let offset = addr - HPC3_BASE;
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        let offset = (addr - HPC3_BASE as u64) as u32;
 
         // INT2 (fullhouse only, PBUS PIO channel 4) - should not use 32-bit access, but allow for legacy
         if !self.guinness && (HPC3_INT2_BASE..HPC3_INT2_BASE + HPC3_INT2_SIZE).contains(&offset) {
@@ -2084,8 +2069,8 @@ impl BusDevice for Hpc3 {
                             let mut chan = self.pdma_channels[*ch_idx].lock();
                             if chan.ctrl & PDMA_CTRL_INT != 0 {
                                 chan.ctrl &= !PDMA_CTRL_INT;
-                                if let Some(cb) = &chan.callback {
-                                    cb.set_dma_interrupt(false);
+                                if let Some(irq) = &chan.irq {
+                                    irq.set(false);
                                 }
                             }
                         }
@@ -2141,7 +2126,7 @@ impl BusDevice for Hpc3 {
             // For 32-bit writes, extract the bottom byte
             let byte_index = rtc_offset >> 2;
             let byte_val = (val & 0xFF) as u8;
-            return self.rtc.write8(byte_index, byte_val);
+            return self.rtc.write8(byte_index as u64, byte_val);
         }
 
         // Log other writes
@@ -2150,8 +2135,8 @@ impl BusDevice for Hpc3 {
         BUS_OK
     }
 
-    fn read16(&self, addr: u32) -> BusRead16 {
-        let offset = addr - HPC3_BASE;
+    fn read16(&self, addr: u64) -> BusRead16 {
+        let offset = (addr - HPC3_BASE as u64) as u32;
 
         // HAL2 registers are 16-bit; forward directly
         if (HAL2_BASE..HAL2_BASE + 0x400).contains(&offset) {
@@ -2169,8 +2154,8 @@ impl BusDevice for Hpc3 {
         BusRead16::ok(0)
     }
 
-    fn write16(&self, addr: u32, val: u16) -> u32 {
-        let offset = addr - HPC3_BASE;
+    fn write16(&self, addr: u64, val: u16) -> u32 {
+        let offset = (addr - HPC3_BASE as u64) as u32;
 
         // HAL2 registers are 16-bit; forward directly
         if (HAL2_BASE..HAL2_BASE + 0x400).contains(&offset) {
@@ -2203,7 +2188,7 @@ impl Resettable for Hpc3 {
             state.pbus_pio = [0; 0x1000];
         }
         // Reset all DMA channels to their power-on state.
-        // We preserve the configuration fields (active_mask, sys_mem, callback, etc.)
+        // We preserve the configuration fields (active_mask, sys_mem, irq, etc.)
         // that are wired at construction time, and only reset the transfer-state registers.
         for chan_arc in &self.pdma_channels {
             let mut chan = chan_arc.lock();
@@ -2326,6 +2311,53 @@ impl Saveable for Hpc3 {
 mod tests {
     use super::*;
 
+    /// INTSTAT as a controller: each SCSI channel's chip and DMA bits are
+    /// ORed onto its IOC line; a chip-INT ack also settles the paired PDMA
+    /// half; the SEEQ's level goes to Ethernet as it is.
+    #[test]
+    fn intstat_ors_scsi_halves_and_a_chip_ack_settles_the_dma_half() {
+        use crate::irq::LevelProbe;
+        let (s0, s0_line) = LevelProbe::line();
+        let (s1, s1_line) = LevelProbe::line();
+        let (en, en_line) = LevelProbe::line();
+        let dump = Arc::new(AtomicU32::new(0));
+        let chans = [
+            Arc::new(Mutex::new(PdmaChannel::new(8, dump.clone()))),
+            Arc::new(Mutex::new(PdmaChannel::new(9, dump))),
+        ];
+        let state = Arc::new(Mutex::new(Hpc3State { intstat: 0, gio_misc: 0, eeprom_reg: 0, pbus_pio: [0; 0x1000] }));
+        let irqs = Arc::new(Hpc3Interrupts {
+            state: state.clone(),
+            scsi: [s0_line, s1_line],
+            ethernet: en_line,
+            scsi_dma: chans.clone(),
+        });
+        let (dev0, dma0) = (irqs.line(HPC3_INTSTAT_SCSI0_DEV), irqs.line(HPC3_INTSTAT_SCSI0_DMA));
+
+        dma0.set(true);
+        assert!(s0.level() && !s1.level());
+        dev0.set(true);
+        dma0.set(false);
+        assert!(s0.level(), "the chip half still holds the line");
+
+        dma0.set(true);
+        chans[0].lock().ctrl |= PDMA_CTRL_INT;
+        dev0.set(false);
+        assert!(!s0.level(), "the chip ack settles both halves");
+        assert_eq!(state.lock().intstat & SCSI_BITS[0], 0);
+        assert_eq!(chans[0].lock().ctrl & PDMA_CTRL_INT, 0);
+
+        irqs.line(HPC3_INTSTAT_SCSI1_DMA).set(true);
+        assert!(s1.level() && !s0.level());
+
+        state.lock().intstat |= HPC3_INTSTAT_ENET_RX_DMA;
+        let enet = irqs.line(HPC3_INTSTAT_ENET_DEV);
+        enet.set(true);
+        assert!(en.level());
+        enet.set(false);
+        assert!(!en.level(), "the SEEQ's own level, not ORed with the DMA bits");
+    }
+
     #[test]
     fn stop_saves_both_battery_backed_devices() {
         let dir = std::env::temp_dir().join(format!("iris-hpc3-stop-{}", std::process::id()));
@@ -2371,11 +2403,16 @@ mod tests {
         )
     }
 
+    /// Bus address of a register in PBUS DMA channel 1 (Codec A).
+    fn ch1(off: u32) -> u64 {
+        (HPC3_BASE + PBUS_DMA_STRIDE + off) as u64
+    }
+
     #[test]
     fn ip28_byte_control_writes_start_and_drain_audio_dma() {
         struct TuneMemory;
         impl BusDevice for TuneMemory {
-            fn read32(&self, addr: u32) -> BusRead32 {
+            fn read32(&self, addr: u64) -> BusRead32 {
                 match addr {
                     0x1000 => BusRead32::ok(0x2000),
                     0x1004 => BusRead32::ok(0x8000_0004), // one sample, EOX
@@ -2386,45 +2423,43 @@ mod tests {
             }
         }
         let hpc = hpc3_for_test();
-        let base = HPC3_BASE + PBUS_DMA_STRIDE; // Codec A channel 1
         hpc.pdma_channels[1].lock().sys_mem = Some(Arc::new(TuneMemory));
-        hpc.write32(HPC3_BASE + PBUS_CFGDMA_BASE + PBUS_CFGDMA_STRIDE, PBUS_DMACFG_DS16);
-        hpc.write32(base + PBUS_DMA_DP, 0x1000);
+        hpc.write32((HPC3_BASE + PBUS_CFGDMA_BASE + PBUS_CFGDMA_STRIDE) as u64, PBUS_DMACFG_DS16);
+        hpc.write32(ch1(PBUS_DMA_DP), 0x1000);
         // InitiateDMA's four byte stores, with ACT/ACT_LD in the final lane.
         for (lane, byte) in [0x07, 0x04, 0x0b, 0x70].into_iter().enumerate() {
-            assert_eq!(hpc.write8(base + PBUS_DMA_CTRL + lane as u32, byte), BUS_OK);
+            assert_eq!(hpc.write8(ch1(PBUS_DMA_CTRL + lane as u32), byte), BUS_OK);
             assert_eq!(hpc.pdma_channels[1].lock().is_active(), lane == 3);
         }
-        assert_eq!(hpc.read8(base + PBUS_DMA_CTRL + 3).data & 2, 2);
+        assert_eq!(hpc.read8(ch1(PBUS_DMA_CTRL + 3)).data & 2, 2);
         let (sample, status, _) = hpc.pdma_channels[1].lock().dma_read().expect("audio DMA sample");
         assert_eq!(sample, 0x1234);
         assert!(!status.refused());
-        assert_eq!(hpc.read8(base + PBUS_DMA_CTRL + 3).data & 2, 0);
-        assert_eq!(hpc.read32(base + PBUS_DMA_BP).data, 0x2004);
+        assert_eq!(hpc.read8(ch1(PBUS_DMA_CTRL + 3)).data & 2, 0);
+        assert_eq!(hpc.read32(ch1(PBUS_DMA_BP)).data, 0x2004);
     }
 
     #[test]
     fn pbus_byte_lanes_preserve_addresses_and_control_side_effects() {
         let hpc = hpc3_for_test();
-        let base = HPC3_BASE + PBUS_DMA_STRIDE;
         for reg in [PBUS_DMA_BP, PBUS_DMA_DP] {
-            hpc.write32(base + reg, 0x1234_5678);
-            hpc.write8(base + reg + 1, 0xab);
-            assert_eq!(hpc.read32(base + reg).data, 0x12ab_5678);
+            hpc.write32(ch1(reg), 0x1234_5678);
+            hpc.write8(ch1(reg + 1), 0xab);
+            assert_eq!(hpc.read32(ch1(reg)).data, 0x12ab_5678);
             for (lane, byte) in [0x12, 0xab, 0x56, 0x78].into_iter().enumerate() {
-                assert_eq!(hpc.read8(base + reg + lane as u32).data, byte);
+                assert_eq!(hpc.read8(ch1(reg + lane as u32)).data, byte);
             }
         }
-        hpc.write8(base + PBUS_DMA_CTRL + 3, PDMA_CTRL_LITTLE as u8);
+        hpc.write8(ch1(PBUS_DMA_CTRL + 3), PDMA_CTRL_LITTLE as u8);
         hpc.pdma_channels[1].lock().ctrl |= PDMA_CTRL_INT;
         for lane in 0..3 {
-            hpc.write8(base + PBUS_DMA_CTRL + lane, 0xff);
-            assert_eq!(hpc.read8(base + PBUS_DMA_CTRL + lane).data, 0);
+            hpc.write8(ch1(PBUS_DMA_CTRL + lane), 0xff);
+            assert_eq!(hpc.read8(ch1(PBUS_DMA_CTRL + lane)).data, 0);
             let c = hpc.pdma_channels[1].lock();
             assert!(c.endian);
             assert_ne!(c.ctrl & PDMA_CTRL_INT, 0);
         }
-        assert_eq!(hpc.read8(base + PBUS_DMA_CTRL + 3).data & 1, 1);
+        assert_eq!(hpc.read8(ch1(PBUS_DMA_CTRL + 3)).data & 1, 1);
         assert_eq!(hpc.pdma_channels[1].lock().ctrl & PDMA_CTRL_INT, 0);
     }
 

@@ -6,6 +6,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::machine::Machine;
+use crate::workstation::{MachineSlot, Workstation};
 use crate::gfx_display::GfxDisplay;
 use crate::dev::z85c30::CiSerialBackend;
 
@@ -57,16 +58,26 @@ impl Response {
 
 pub struct CiServer {
     socket_path: String,
-    /// The Machine's shared pointer slot (see `Machine::machine_slot`): the
-    /// same one the monitor's SystemController uses, nulled when the Machine
-    /// is dropped, so a CI command can never reach a freed Machine.
-    machine: crate::machine::MachineSlot,
+    /// The machine's shared pointer slot (see `Workstation::machine_slot`):
+    /// the same one the monitor's SystemController uses, nulled when the
+    /// machine is dropped, so a CI command can never reach a freed machine.
+    machine: MachineSlot,
     ci_serial: Arc<CiSerialBackend>,
     /// Optional in case --headless is also passed (no REX3). Screenshot
     /// commands return an error in that case.
     display: Option<Arc<dyn GfxDisplay>>,
     display_head1: Option<Arc<dyn GfxDisplay>>,
+    /// In-flight command connections; bounded so long waits cannot exhaust
+    /// threads/file descriptors.
+    connections: AtomicUsize,
 }
+
+/// Concurrent CI connections allowed. Short-lived `iris-ci` commands use one
+/// at a time; agents holding a session open stay well under this.
+const MAX_CI_CONNECTIONS: usize = 32;
+/// A connection that sends nothing for this long is reaped. Long waits are
+/// bounded by their own `wait-serial` timeout, not this read timeout.
+const CI_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 impl Drop for CiServer {
     fn drop(&mut self) {
@@ -87,15 +98,15 @@ impl CiServer {
     /// mutex serializes all Machine accesses from CI command handlers.
     /// CPU/peripheral threads observe state changes only when the methods we
     /// call stop them first (ci_restore/ci_rollback do).
-    fn with_machine<R>(&self, f: impl FnOnce(&mut Machine) -> R) -> Result<R, String> {
-        crate::machine::with_machine_slot(&self.machine, f)
+    fn with_machine<R>(&self, f: impl FnOnce(&mut dyn Workstation) -> R) -> Result<R, String> {
+        crate::workstation::with_machine_slot(&self.machine, f)
     }
 
     /// `with_machine` for a fallible closure, flattening both failures into
     /// the message the command reports.
     fn with_machine_result<T, E: std::fmt::Display>(
         &self,
-        f: impl FnOnce(&mut Machine) -> Result<T, E>,
+        f: impl FnOnce(&mut dyn Workstation) -> Result<T, E>,
     ) -> Result<T, String> {
         self.with_machine(f)?.map_err(|e| e.to_string())
     }
@@ -103,27 +114,26 @@ impl CiServer {
 
 /// Bind the control socket, spawn the accept thread, return a handle.
 ///
-/// # Safety
-/// `machine_ptr` must point to a live `Machine` in its final location (boxed,
-/// or on `main`'s stack). The server reaches it only through the Machine's
-/// shared slot afterwards, so it may be dropped while the server runs.
+/// `machine` must be in its final location (boxed). The server reaches it
+/// only through the machine's shared slot afterwards, so it may be dropped
+/// while the server runs.
 pub fn start_server(
-    machine_ptr: *mut Machine,
+    machine: &mut dyn Workstation,
     socket_path: &str,
 ) -> Result<Arc<CiServer>, String> {
-    // SAFETY: caller guarantees the pointer is valid.
-    let ci_serial = unsafe { (*machine_ptr).get_ci_serial() }
-        .ok_or_else(|| "CI mode: CiSerialBackend not installed on Machine".to_string())?;
-    let display = unsafe { (*machine_ptr).get_display() };
-    let display_head1 = unsafe { (*machine_ptr).get_display_head1() };
+    let ci_serial = machine.get_ci_serial()
+        .ok_or_else(|| "CI mode: CiSerialBackend not installed on the machine".to_string())?;
+    let display = machine.get_display();
+    let display_head1 = machine.get_display_head1();
 
     let path = socket_path.to_string();
     let server = Arc::new(CiServer {
         socket_path: path.clone(),
-        machine: unsafe { (*machine_ptr).machine_slot() },
+        machine: machine.machine_slot(),
         ci_serial,
         display,
         display_head1,
+        connections: AtomicUsize::new(0),
     });
 
     *SOCKET_PATH.lock() = Some(path.clone());
@@ -156,10 +166,18 @@ fn start_unix_server(server: Arc<CiServer>, path: &str) -> Result<(), String> {
             for conn in listener.incoming() {
                 match conn {
                     Ok(stream) => {
+                        if server_clone.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CI_CONNECTIONS {
+                            server_clone.connections.fetch_sub(1, Ordering::AcqRel);
+                            eprintln!("iris-ci-accept: too many connections (max {MAX_CI_CONNECTIONS}); refusing");
+                            continue;
+                        }
                         let s = server_clone.clone();
                         thread::Builder::new()
                             .name("iris-ci-handler".into())
-                            .spawn(move || handle_client(s, stream))
+                            .spawn(move || {
+                                handle_client(s.clone(), stream);
+                                s.connections.fetch_sub(1, Ordering::AcqRel);
+                            })
                             .ok();
                     }
                     Err(e) => eprintln!("iris-ci-accept: {}", e),
@@ -193,10 +211,18 @@ fn start_tcp_server_impl(server: Arc<CiServer>, path: &str) -> Result<(), String
                 match conn {
                     Ok(stream) => {
                         let _ = stream.set_nodelay(true);
+                        if server_clone.connections.fetch_add(1, Ordering::AcqRel) >= MAX_CI_CONNECTIONS {
+                            server_clone.connections.fetch_sub(1, Ordering::AcqRel);
+                            eprintln!("iris-ci-accept: too many connections (max {MAX_CI_CONNECTIONS}); refusing");
+                            continue;
+                        }
                         let s = server_clone.clone();
                         thread::Builder::new()
                             .name("iris-ci-handler".into())
-                            .spawn(move || handle_client_tcp(s, stream))
+                            .spawn(move || {
+                                handle_client_tcp(s.clone(), stream);
+                                s.connections.fetch_sub(1, Ordering::AcqRel);
+                            })
                             .ok();
                     }
                     Err(e) => eprintln!("iris-ci-accept: {}", e),
@@ -229,6 +255,7 @@ fn handle_client_lines(server: Arc<CiServer>, reader: impl BufRead, mut writer: 
 
 #[cfg(unix)]
 fn handle_client(server: Arc<CiServer>, stream: UnixStream) {
+    let _ = stream.set_read_timeout(Some(CI_IDLE_TIMEOUT));
     match stream.try_clone() {
         Ok(writer) => {
             let reader = BufReader::new(stream);
@@ -239,6 +266,7 @@ fn handle_client(server: Arc<CiServer>, stream: UnixStream) {
 }
 
 fn handle_client_tcp(server: Arc<CiServer>, stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(CI_IDLE_TIMEOUT));
     match stream.try_clone() {
         Ok(writer) => {
             let reader = BufReader::new(stream);
@@ -257,6 +285,7 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "ping" => Response::ok(),
         "quit" => cmd_quit(server, &req.args),
         "start" => cmd_start(server),
+        "status" => cmd_status(server),
         "save" => cmd_save(server, &req.args),
         "restore" => cmd_restore(server, &req.args),
         "rollback" => cmd_rollback(server),
@@ -288,9 +317,7 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
 fn cmd_rtc_save(server: &CiServer, args: &Value) -> Response {
     let explicit_path = args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
     let result = server.with_machine_result(|m| {
-        let rtc = m.hpc3().rtc();
-        let path = explicit_path.clone().unwrap_or_else(|| rtc.nvram_path().to_string());
-        rtc.save_nvram(&path).map(|_| path)
+        m.save_nvram(explicit_path.as_deref())
     });
     match result {
         Ok(path) => Response::data(serde_json::json!({ "path": path })),
@@ -304,7 +331,7 @@ fn cmd_cdrom_eject(server: &CiServer, args: &Value) -> Response {
         None => return Response::err("cdrom-eject: missing 'id' arg"),
     };
     let result = server.with_machine_result(|m| {
-        m.hpc3().scsi().eject_disc(id)
+        m.disc_changer().ok_or("no CD-ROM controller")?.eject_disc(id)
     });
     match result {
         Ok(path) => Response::data(serde_json::json!({ "id": id, "new_disc": path })),
@@ -322,7 +349,7 @@ fn cmd_cdrom_load(server: &CiServer, args: &Value) -> Response {
         None => return Response::err("cdrom-load: missing 'path' arg"),
     };
     let result = server.with_machine_result(|m| {
-        m.hpc3().scsi().load_disc(id, path.clone())
+        m.disc_changer().ok_or("no CD-ROM controller")?.load_disc(id, path.clone())
     });
     match result {
         Ok(loaded) => Response::data(serde_json::json!({ "id": id, "disc": loaded })),
@@ -396,8 +423,22 @@ fn cmd_quit(server: &CiServer, args: &Value) -> Response {
 }
 
 fn cmd_start(server: &CiServer) -> Response {
-    match server.with_machine(|m| m.cpu_start()) {
-        Ok(()) => Response::ok(),
+    // Same path as the monitor's `machine-start`: idempotent, and it brings
+    // peripherals back before releasing the CPU after a stop. A machine that
+    // has not finished `Machine::start` reports `idle` and the harness should
+    // poll `status` first; the CI socket is created after that startup step,
+    // so a connected client normally cannot see `idle`.
+    match server.with_machine_result(|m| m.start_guest()) {
+        Ok(_) => Response::ok(),
+        Err(e) => Response::err(e),
+    }
+}
+
+/// Guest state and monitor readiness, from the same `Workstation::status` the
+/// monitor's `machine-status` prints.
+fn cmd_status(server: &CiServer) -> Response {
+    match server.with_machine(|m| m.status()) {
+        Ok(status) => Response::data(status.to_json()),
         Err(e) => Response::err(e),
     }
 }
@@ -571,19 +612,15 @@ fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
         return Response::err("screenshot: missing 'path' arg");
     };
 
-    // Snapshot the framebuffer under the screen lock; unlock before the PNG
-    // encode so the refresh thread isn't blocked during disk I/O.
-    let (width, height, rgba_copy) = {
-        let screen = display.screen().lock();
-        let w = screen.width;
-        let h = screen.height;
-        let mut out = Vec::with_capacity(w * h);
-        // `rgba` has row stride 2048; copy the visible window.
-        for y in 0..h {
-            let base = y * 2048;
-            out.extend_from_slice(&screen.rgba[base..base + w]);
-        }
-        (w, h, out)
+    // The board composes the next frame into `rgba` (Newport with no
+    // front-end composes in software on its refresh thread). The host
+    // status bar and debug overlay are never in it: this is the guest's
+    // screen.
+    let mut rgba_copy = Vec::new();
+    let Some((width, height, _)) = crate::gfx_display::fresh_frame(
+        &**display, &mut rgba_copy, std::time::Duration::from_millis(250))
+    else {
+        return Response::err("screenshot: the display has no video mode yet");
     };
 
     let mut rgb = Vec::with_capacity(width * height * 3);
@@ -661,7 +698,7 @@ fn cmd_wait_serial(server: &CiServer, args: &Value) -> Response {
 //     (sector-aligned; conv=sync zero-pads the trailing partial sector).
 //
 // Each scratch op briefly stops the machine to quiesce in-flight SCSI I/O
-// (Machine::with_paused). The CPU is restarted only if it was running before
+// (`with_paused` on `dyn Workstation`). The CPU is restarted only if it was running before
 // — a scratch-write issued before the harness `start`s the CPU does not
 // auto-start it.
 // ----------------------------------------------------------------------------
@@ -842,6 +879,8 @@ fn cmd_validate(server: &CiServer, args: &Value) -> Response {
         .unwrap_or(1_000_000);
 
     let report_result = server.with_machine_result(|m| {
+        let m = m.as_any_mut().downcast_mut::<crate::machine::Machine>()
+            .ok_or("not supported on this machine")?;
         crate::validate::validate_snapshot_determinism(m, &name, n)
     });
 

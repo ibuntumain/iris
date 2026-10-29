@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use crate::traits::{BusRead32, BusRead64};
+use crate::traits::{BusRead32, BusRead64, Resettable};
 use super::*;
 use crate::test_board::TestBoard;
 
@@ -26,6 +26,22 @@ use crate::test_board::TestBoard;
 /// default Rust test thread stack (2MB), and Rex3Context now embeds the 1 MiB HOSTRW
 /// data-port array, which construction moves through several temporaries.
 fn make_rex3() -> TestBoard<Rex3> {
+    let rex = make_rex3_unstarted();
+    rex.start();
+    rex
+}
+
+/// `make_rex3` without `start()`: no processor and no refresh thread, so every
+/// bus write stays in the GFIFO until the test looks at it.
+///
+/// Tests that inspect queue depth or STATUS need the consumer to be absent —
+/// with it running, a queue of one entry drains before the status read lands
+/// and the observation is a race. `TestBoard::drop` still calls `stop()`, which
+/// pushes a shutdown sentinel with the *blocking* `GFifo::push`; a test that
+/// fills the queue must therefore reset it before returning (see
+/// `FifoResetGuard`) or the drop would spin forever on a full queue with no
+/// consumer left to drain it.
+fn make_rex3_unstarted() -> TestBoard<Rex3> {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
@@ -43,19 +59,59 @@ fn make_rex3() -> TestBoard<Rex3> {
             }
             #[cfg(feature = "rex-jit")]
             rex.jit_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
-            let rex = TestBoard::new(Arc::<Rex3>::from(rex));
-            rex.start();
-            rex
+            TestBoard::new(Arc::<Rex3>::from(rex))
         })
         .expect("spawn")
         .join()
-        .expect("make_rex3 thread panicked")
+        .expect("make_rex3_unstarted thread panicked")
+}
+
+/// Run `f` on a thread with the same 64 MB stack the construction helpers use.
+///
+/// `Rex3Context` is over a megabyte (the HOSTRW data port alone is 1 MiB) and
+/// `Resettable::power_on` assigns a freshly built one — twice, counting the
+/// temporary — which overflows the 2 MB default Rust test thread stack.
+fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn")
+        .join()
+        .expect("big-stack test thread panicked")
+}
+
+/// A freshly reset, running Rex3. The order mirrors `Machine::reset`:
+/// power-on with the threads stopped, then start.
+///
+/// The order is not just about stack depth. `power_on` replaces the whole
+/// context, including the `host` back-pointer that `start()` installs; calling
+/// it on a running board instead leaves the draw path with a null device and
+/// every primitive silently does nothing.
+fn make_rex3_reset() -> TestBoard<Rex3> {
+    let rex = with_big_stack(|| {
+        let rex = make_rex3_unstarted();
+        rex.power_on();
+        rex
+    });
+    rex.start();
+    rex
+}
+
+/// Empties the GFIFO when it goes out of scope, including on an assertion
+/// failure. `GFifo::reset` may only be called with the consumer stopped, which
+/// is exactly the state `make_rex3_unstarted` leaves the board in.
+struct FifoResetGuard<'a>(&'a Rex3);
+
+impl Drop for FifoResetGuard<'_> {
+    fn drop(&mut self) {
+        self.0.gfifo.reset();
+    }
 }
 
 // Compute the SET address (no GO bit) for a register offset.
-fn set_addr(offset: u32) -> u32 { REX3_BASE | offset }
+fn set_addr(offset: u32) -> u64 { (REX3_BASE | offset) as u64 }
 // Compute the GO address (bit 11 set) for a register offset.
-fn go_addr(offset: u32) -> u32  { REX3_BASE | 0x0800 | offset }
+fn go_addr(offset: u32) -> u64  { (REX3_BASE | 0x0800 | offset) as u64 }
 
 /// Bus write that retries on `BUS_BUSY`, the way the CPU re-executes a store
 /// on `EXEC_RETRY`. `Rex3::write32` returns `BUS_BUSY` when the GFIFO is
@@ -63,14 +119,14 @@ fn go_addr(offset: u32) -> u32  { REX3_BASE | 0x0800 | offset }
 /// throughput benchmarks below into a measurement of how fast a host thread
 /// can *attempt* pushes (a flat ~18M spans/s at every span length, i.e.
 /// "22 Gpx/s" for 1280-pixel Gouraud spans).
-fn w32(rex: &Rex3, addr: u32, value: u32) {
+fn w32(rex: &Rex3, addr: u64, value: u32) {
     while rex.write32(addr, value) == crate::traits::BUS_BUSY {
         std::hint::spin_loop();
     }
 }
 
 /// 64-bit counterpart of `w32`.
-fn w64(rex: &Rex3, addr: u32, value: u64) {
+fn w64(rex: &Rex3, addr: u64, value: u64) {
     while rex.write64(addr, value) == crate::traits::BUS_BUSY {
         std::hint::spin_loop();
     }
@@ -110,6 +166,29 @@ fn read_reg(rex: &Rex3, offset: u32) -> u32 {
         }
         std::hint::spin_loop();
     }
+}
+
+/// Read STATUS *without* the idle gate `read_reg` imposes.
+///
+/// The point of reading STATUS is usually to see a queue that is not idle, so
+/// waiting for it first would hide the very state under test. STATUS itself is
+/// never gated behind `busy_or_val!`; the retry loop is here only because the
+/// rest of this harness treats a transient busy as a retry, and a panic on one
+/// would turn a queue race into a bogus failure.
+fn read_status_now(rex: &Rex3) -> u32 {
+    loop {
+        let r: BusRead32 = rex.read32(set_addr(REX3_STATUS));
+        if r.is_ok() { return r.data; }
+        if r.status != crate::traits::BUS_BUSY {
+            panic!("read_status_now: bad status {:#x}", r.status);
+        }
+        std::hint::spin_loop();
+    }
+}
+
+/// The `GFIFOLEVEL` field of a STATUS value.
+fn gfifo_level(status: u32) -> u32 {
+    (status & STATUS_GFIFOLEVEL_MASK) >> STATUS_GFIFOLEVEL_SHIFT
 }
 
 /// Read from HOSTRW0 GO space: returns current word, then triggers next batch.
@@ -1757,7 +1836,7 @@ const DM0_DRAW_ILINE_STEP: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LIN
 // DM0 for a full F_LINE draw — fractional-endpoint Bresenham correction.
 const DM0_DRAW_FLINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_F_LINE_SH | DM0_DOSETUP | DM0_STOPONXY;
 // DM0 for a full A_LINE draw — F_LINE plus AWEIGHT-LUT endpoint suppression (needs ENDPTFILTER, bit 22, set separately).
-// Its Bresenham walk is not tested yet (see rules/testing/rex3-fline-fractional-bresenham.md);
+// Its Bresenham walk is not tested yet (see clanker/rex3/rex3-fline-fractional-bresenham.md);
 // the blend tests use it for its alpha.
 #[allow(dead_code)]
 const DM0_DRAW_ALINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_A_LINE_SH | DM0_DOSETUP | DM0_STOPONXY;
@@ -1839,147 +1918,39 @@ fn draw_iline_step(rex: &Rex3, x0: i32, y0: i32, x1: i32, y1: i32, color: u8) ->
     pts
 }
 
-/// Reference F_LINE Bresenham in software — a mechanical transcription of
-/// `setup()` + `fline_apply_fract()` + the `bres_step!` macro from
-/// `draw_line_bresenham` (rex3.rs), NOT the simplified octant-agnostic form
-/// `bres_pixels()` uses. This is deliberately duplicated rather than calling
-/// the real implementation: a hand-transcribed oracle must fail if
-/// `fline_apply_fract`/`setup()` regress, which a shared-code oracle cannot
-/// detect (see `rules/` note on this — a call-through oracle would mask
-/// exactly the kind of regression this test exists to catch).
-///
-/// `x0_frac4`/`y0_frac4` are the *start* endpoint's fractional nibble
-/// (0-15, 1/16-pixel units) — the only fractional input `fline_apply_fract`
-/// consumes; the end endpoint is integer-only here, matching what the
-/// F_LINE hardware path actually uses (draw_aline's AWEIGHT lookup is the
-/// only consumer of the *end* endpoint's fraction, handled separately by
-/// `aline_endpoint_skip` below).
-fn fline_pixels(x0: i32, x0_frac4: i32, y0: i32, y0_frac4: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
-    // BRES table copied verbatim from draw_line_bresenham (rex3.rs):
-    // (incrx1, incrx2, incry1, incry2, y_major), indexed by octant.
-    #[rustfmt::skip]
-    const BRES: [(i32, i32, i32, i32, bool); 8] = [
-        ( 0,  1, -1, -1, true ),  // octant 0
-        ( 0,  1,  1,  1, true ),  // octant 1
-        ( 0, -1, -1, -1, true ),  // octant 2
-        ( 0, -1,  1,  1, true ),  // octant 3
-        ( 1,  1,  0, -1, false),  // octant 4
-        ( 1,  1,  0,  1, false),  // octant 5
-        (-1, -1,  0, -1, false),  // octant 6
-        (-1, -1,  0,  1, false),  // octant 7
-    ];
-
-    // 21.11 fixed-point endpoint values, matching how the register writes
-    // populate ctx.xstart/ystart/xend/yend.
-    let xstart = (x0 << 11) | (x0_frac4 << 7);
-    let ystart = (y0 << 11) | (y0_frac4 << 7);
-    let xend = x1 << 11;
-    let yend = y1 << 11;
-
-    // --- setup(): derive octant + initial incr1/incr2/d (rex3.rs:1390-1419) ---
-    let dx = xend - xstart;
-    let dy = yend - ystart;
-    let adx = dx.abs() >> 11;
-    let ady = dy.abs() >> 11;
-
-    let mut octant = 0u32;
-    if dy < 0 { octant |= 1 << 0; } // OCTANT_YDEC
-    if dx < 0 { octant |= 1 << 1; } // OCTANT_XDEC
-    if adx > ady { octant |= 1 << 2; } // OCTANT_XMAJOR
-
-    let (major, minor) = if adx > ady { (adx, ady) } else { (ady, adx) };
-    let incr1 = 2 * minor;
-    let incr2 = 2 * (minor - major);
-    let mut d = incr1 - major;
-
-    let (incrx1, incrx2, incry1, incry2, y_major) = BRES[(octant & 7) as usize];
-
-    let mut x = xstart >> 11;
-    let mut y = ystart >> 11;
-    let x2 = xend >> 11;
-    let y2 = yend >> 11;
-
-    // --- fline_apply_fract() (rex3.rs:1754-1816), transcribed verbatim ---
-    {
-        let x1p = xstart >> 11;
-        let y1p = ystart >> 11;
-        let x2p = xend >> 11;
-        let y2p = yend >> 11;
-        let mut fdx = (x1p - x2p).abs();
-        let mut fdy = (y1p - y2p).abs();
-        let mut xf = (xstart >> 7) & 0xF;
-        let mut yf = (ystart >> 7) & 0xF;
-
-        match octant & 7 {
-            1 => {
-                std::mem::swap(&mut xf, &mut yf);
-                std::mem::swap(&mut fdx, &mut fdy);
-            }
-            3 => {
-                xf = 0x10 - xf;
-                std::mem::swap(&mut xf, &mut yf);
-                std::mem::swap(&mut fdx, &mut fdy);
-            }
-            7 => { xf = 0x10 - xf; }
-            6 => {
-                xf = 0x10 - xf;
-                yf = 0x10 - yf;
-            }
-            2 => {
-                let t = 0x10 - xf;
-                xf = 0x10 - yf;
-                yf = t;
-                std::mem::swap(&mut fdx, &mut fdy);
-            }
-            0 => {
-                let t = 0x10 - yf;
-                yf = xf;
-                xf = t;
-                std::mem::swap(&mut fdx, &mut fdy);
-            }
-            4 => { yf = 0x10 - yf; }
-            _ => {}
-        }
-
-        // Spec-correct base d for F_LINE/A_LINE is 3*minor - 2*major, not
-        // I_LINE's 2*minor - major (see rex3.rs fline_apply_fract for the
-        // full derivation from rex3_pdf.md 3.6.1.2 and MAME's do_fline).
-        // `d` here still holds the I_LINE-formula value; apply the same
-        // (minor - major) correction the real fix applies before adding
-        // the fractional term.
-        d += fdy - fdx;
-        d += 2 * (((fdx * yf) >> 4) - ((fdy * xf) >> 4));
-        let major_delta = if y_major { fdy } else { fdx };
-        let e = d - 2 * major_delta;
-        if e > 0 {
-            d = e;
-            let x_major = !y_major;
-            if x_major {
-                y -= incry2;
-            } else {
-                x += incrx2;
-            }
-        }
+/// Reference F_LINE, from geometry rather than from the implementation: the
+/// start point's own pixel, then in each column of the major axis, up to the
+/// end point's, the row holding the true line at the column's centre (pixel n
+/// covers [n, n+1)), moving at most one row per column. That is the pixel set
+/// IRIS GL computes for its software Z buffer (fsn.rec: see
+/// clanker/rex3/soft-z-lines-zpattern-and-bresround.md). Endpoints in 1/16
+/// pixels. None when the line passes exactly through a row boundary at some
+/// column centre: which side wins there is BRESROUND's choice.
+fn fline_geom(x1: i32, y1: i32, x2: i32, y2: i32) -> Option<Vec<(i32, i32)>> {
+    let x_major = (x2 - x1).abs() > (y2 - y1).abs();
+    // (major, minor) start and end
+    let (a1, b1, a2, b2) = if x_major { (x1, y1, x2, y2) } else { (y1, x1, y2, x2) };
+    let (p1, p2) = (a1 >> 4, a2 >> 4);
+    let step = if p2 >= p1 { 1 } else { -1 };
+    let mut out = vec![(p1, b1 >> 4)];
+    let mut p = p1;
+    while p != p2 {
+        p += step;
+        // minor at the column centre, as num / den in 1/16 units
+        let c = p * 16 + 8;
+        let (mut num, mut den) = (b1 as i64 * (a2 - a1) as i64 + (c - a1) as i64 * (b2 - b1) as i64, (a2 - a1) as i64);
+        if den < 0 { num = -num; den = -den; }
+        if num.rem_euclid(den * 16) == 0 { return None; }
+        let want = num.div_euclid(den * 16) as i32;
+        let prev = out.last().unwrap().1;
+        out.push((p, prev + (want - prev).clamp(-1, 1)));
     }
+    Some(out.into_iter().map(|(a, b)| if x_major { (a, b) } else { (b, a) }).collect())
+}
 
-    // --- step exactly like bres_step! / draw_line_bresenham's main loop ---
-    let adx2 = (x2 - x).abs();
-    let ady2 = (y2 - y).abs();
-    let pixel_count = adx2.max(ady2) + 1;
-
-    let mut pts = Vec::new();
-    for i in 0..pixel_count {
-        pts.push((x, y));
-        let is_last = i == pixel_count - 1;
-        if !is_last {
-            if d < 0 {
-                x += incrx1; y -= incry1; d += incr1;
-            } else {
-                x += incrx2; y -= incry2; d += incr2;
-            }
-        }
-    }
-    pts
+/// `fline_geom` for a start point with a fractional nibble and an integer end.
+fn fline_pixels(x0: i32, x0_frac4: i32, y0: i32, y0_frac4: i32, x1: i32, y1: i32) -> Option<Vec<(i32, i32)>> {
+    fline_geom(x0 * 16 + x0_frac4, y0 * 16 + y0_frac4, x1 * 16, y1 * 16)
 }
 
 /// Reference A_LINE endpoint-suppression decision — mirrors `draw_aline`'s
@@ -2354,8 +2325,10 @@ fn test_fline_all_octants_half_pixel() {
                 }
             }
         }
-        let expected: HashSet<(i32,i32)> =
-            fline_pixels(cx, cx_frac, cy, cy_frac, x1, y1).into_iter().collect();
+        // A line through a pixel-row boundary is BRESROUND's call, not
+        // geometry's.
+        let Some(expected) = fline_pixels(cx, cx_frac, cy, cy_frac, x1, y1) else { continue };
+        let expected: HashSet<(i32,i32)> = expected.into_iter().collect();
 
         assert_eq!(pts, expected,
             "fline half-pixel octant test deg={deg}: ({cx}.5,{cy}.5)->({x1},{y1}): got {:?} expected {:?}",
@@ -2408,8 +2381,11 @@ fn test_fline_quarter_pixel_offsets() {
                     }
                 }
             }
-            let expected: HashSet<(i32,i32)> =
-                fline_pixels(cx, frac4, cy, frac4, x1, y1).into_iter().collect();
+            let Some(expected) = fline_pixels(cx, frac4, cy, frac4, x1, y1) else {
+                color = color.wrapping_add(1).max(1);
+                continue;
+            };
+            let expected: HashSet<(i32,i32)> = expected.into_iter().collect();
 
             assert_eq!(pts, expected,
                 "fline frac4={frac4} deg={deg}: ({cx}+{frac4}/16,{cy}+{frac4}/16)->({x1},{y1}): \
@@ -2420,7 +2396,7 @@ fn test_fline_quarter_pixel_offsets() {
     }
 }
 
-// A_LINE tests: out of scope for this pass — see rules/testing/rex3-fline-fractional-bresenham.md.
+// A_LINE tests: out of scope for this pass — see clanker/rex3/rex3-fline-fractional-bresenham.md.
 // aline_endpoint_skip() (the AWEIGHT-LUT oracle helper) is kept for a future session.
 
 // ============================================================================
@@ -2744,6 +2720,87 @@ mod jit_tests {
             },
             dm0, dm1,
         );
+    }
+
+    /// IRIX 7's `gfx::init` clears the overlay, popup and CID planes with a
+    /// full-screen 1280x1024 block fill before it touches the rest of the
+    /// display. #108 reported the guest trapping at EPC=0 with the REX3 JIT
+    /// during that clear, so exercise the exact sequence on both engines: the
+    /// JIT must match the interpreter, must not write past the 1280th column,
+    /// must leave the command FIFO idle (the guest's `wait_idle` polls
+    /// STATUS), and must leave the primitive state clean.
+    #[test]
+    fn jit_full_screen_aux_clear_like_irix7() {
+        const SENTINEL: u32 = 0xA5A5_A5A5;
+        let pixel = |x: i32, y: i32| (y as usize * 2048) + x as usize;
+
+        for planes in [DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_CID] {
+            let dm1 = (DM1_RGB24_SRC & !0x7) | planes;
+            let setup = |rex: &Rex3| {
+                unsafe { (*rex.fb_aux.get()).fill(SENTINEL); }
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK, 0x00FF_FFFF);
+                reg(rex, REX3_COLORRED, 0);
+                reg(rex, REX3_COLORGRN, 0);
+                reg(rex, REX3_COLORBLUE, 0);
+                reg(rex, REX3_COLORALPHA, 0);
+                reg(rex, REX3_COLORVRAM, 0);
+                reg(rex, REX3_XYENDI, xy(1279, 1023));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+            };
+
+            let rex_interp = &make_rex3();
+            rex3init(rex_interp);
+            setup(rex_interp);
+            reg_go(rex_interp, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+            let fb_interp = unsafe { (*rex_interp.fb_aux.get()).clone() };
+
+            let rex_jit = &make_rex3_jit();
+            rex3init(rex_jit);
+            setup(rex_jit);
+            wait(rex_jit);
+            let cm = {
+                use crate::dev::ng1::rex3::CLIPMODE_JIT_KEY_MASK;
+                let ctx = unsafe { &*rex_jit.context.get() };
+                ctx.clipmode & CLIPMODE_JIT_KEY_MASK
+            };
+            // First GO triggers compilation and runs on the generic fallback.
+            reg_go(rex_jit, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+            let compiled = rex_jit.rex_jit.as_ref()
+                .map(|jit| jit.wait_compiled(DM0_DRAW_BLOCK, dm1, cm))
+                .unwrap_or(false);
+            assert!(compiled, "REX3 JIT did not compile the aux clear for planes={planes}");
+
+            // Reset and re-run through the freshly compiled shader.
+            unsafe { (*rex_jit.fb_aux.get()).fill(SENTINEL); }
+            rex3init(rex_jit);
+            setup(rex_jit);
+            reg_go(rex_jit, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+            let fb_jit = unsafe { (*rex_jit.fb_aux.get()).clone() };
+            assert_eq!(fb_interp, fb_jit,
+                "aux clear JIT/interp mismatch for planes={planes}");
+
+            for &(x, y) in &[(0, 0), (1279, 0), (0, 1023), (1279, 1023), (640, 512)] {
+                // WRMASK is 0x00FF_FFFF, so the fill clears the 24 plane
+                // bits and leaves the top byte of the sentinel alone.
+                assert_eq!(fb_jit[pixel(x, y)] & 0x00FF_FFFF, 0,
+                    "planes={planes}: screen pixel ({x},{y}) was not cleared");
+            }
+            for &(x, y) in &[(1280, 0), (2047, 0), (1280, 512), (2047, 1023)] {
+                assert_eq!(fb_jit[pixel(x, y)], SENTINEL,
+                    "planes={planes}: the fill wrote outside the 1280-wide screen at ({x},{y})");
+            }
+
+            let status = read_status_now(rex_jit);
+            assert_eq!(status & STATUS_GFXBUSY, 0,
+                "planes={planes}: GFIFO still busy after the fill (guest wait_idle would spin)");
+            assert_eq!(gfifo_level(status), 0,
+                "planes={planes}: GFIFO not drained after the fill");
+            let ctx = unsafe { &*rex_jit.context.get() };
+            assert!(!ctx.mid_primitive,
+                "planes={planes}: the fill left the primitive mid-flight");
+        }
     }
 
     /// CI8 solid fill block — 8bpp palette mode.
@@ -5045,7 +5102,7 @@ mod jit_tests {
     /// rex3_simd::try_fastclear_block intercepted BLOCK draws before
     /// execute_go's processor selection and never checked CID, so BOTH engines
     /// wrote COLORVRAM and agreed. Removing that path exposed the real
-    /// divergence. See rules/rex3/fastclear-cid-divergence.md.
+    /// divergence. See clanker/rex3/fastclear-cid-divergence.md.
     ///
     /// Colour registers are o12.11 DDA values (get_colori shifts right by 11),
     /// so they are written as `component << 11`, not as packed RGB24 — writing
@@ -5153,6 +5210,29 @@ mod jit_tests {
 
         rex_jit.stop();
         rex_interp.stop();
+    }
+
+    /// RGBMODE must mean the same thing to the Cranelift engine as to the
+    /// interpreter: bit 15 clear is a CI index in the red byte, bit 15 set
+    /// composes all three colour DDAs. The interpreter-only test in the parent
+    /// module pins the pixel values; this one pins the JIT to them.
+    #[test]
+    fn jit_rgbmode_fill_matches_interp() {
+        for rgbmode in [0u32, 1] {
+            let dm1 = DM1_RGB24_PLANES | (rgbmode << 15);
+            compare_jit_interp(0, 0, 15, 0,
+                |rex| {
+                    reg(rex, REX3_DRAWMODE1, dm1);
+                    reg(rex, REX3_WRMASK,    0xFFFFFF);
+                    reg(rex, REX3_COLORRED,  0x80 << 11);
+                    reg(rex, REX3_COLORGRN,  0x40 << 11);
+                    reg(rex, REX3_COLORBLUE, 0x20 << 11);
+                    reg(rex, REX3_XYENDI,    xy(15, 0));
+                    reg(rex, REX3_XYSTARTI,  xy(0, 0));
+                },
+                DM0_DRAW_BLOCK, dm1,
+            );
+        }
     }
 }
 
@@ -5667,7 +5747,7 @@ fn gfifo_push_cost() {
     // write32 default arm runs and the entry lands in the fifo.
     let push_one = |r: &Rex3| {
         // Retry on BUS_BUSY exactly as the CPU does.
-        while r.write32(REX3_COLORRED, 0x40 << 11) == crate::traits::BUS_BUSY {
+        while r.write32(REX3_COLORRED as u64, 0x40 << 11) == crate::traits::BUS_BUSY {
             std::hint::spin_loop();
         }
     };
@@ -5712,15 +5792,15 @@ fn gfifo_push64_cost() {
     // COLORRED/COLORGRN are adjacent and neither has a CPU-thread side effect,
     // so a 64-bit store to the pair takes the queue path.
     let push64 = |r: &Rex3| {
-        while r.write64(REX3_COLORRED, 0x0000_0040_0000_0050) == crate::traits::BUS_BUSY {
+        while r.write64(REX3_COLORRED as u64, 0x0000_0040_0000_0050) == crate::traits::BUS_BUSY {
             std::hint::spin_loop();
         }
     };
     let push32x2 = |r: &Rex3| {
-        while r.write32(REX3_COLORRED, 0x40) == crate::traits::BUS_BUSY {
+        while r.write32(REX3_COLORRED as u64, 0x40) == crate::traits::BUS_BUSY {
             std::hint::spin_loop();
         }
-        while r.write32(REX3_COLORRED + 4, 0x50) == crate::traits::BUS_BUSY {
+        while r.write32(REX3_COLORRED as u64 + 4, 0x50) == crate::traits::BUS_BUSY {
             std::hint::spin_loop();
         }
     };
@@ -5878,7 +5958,7 @@ fn gfifo_push_breakdown() {
     let rex = &make_rex3();
     rex3init(rex);
     let c = bench("write32 (full bus path + consumer)", &|| {
-        while rex.write32(REX3_COLORRED, 0x40 << 11) == crate::traits::BUS_BUSY {
+        while rex.write32(REX3_COLORRED as u64, 0x40 << 11) == crate::traits::BUS_BUSY {
             std::hint::spin_loop();
         }
     });
@@ -7618,4 +7698,498 @@ fn test_hostw_full_block_replicates_single_word() {
     }
     assert_eq!(read_pixel(&rex, x1 + 1, y0) & 0xFFFFFF, 0, "spilled past XEND");
     assert_eq!(read_pixel(&rex, x0, y1 + 1) & 0xFFFFFF, 0, "spilled past YEND");
+}
+
+/// IRIS GL's software-Z lines (fsn's label text, blast's HUD): each short
+/// stroke is an F_LINE without DOSETUP, set up by a SETUP write, drawn by a
+/// ZPATTERN GO whose mask is MSB-aligned (0xe0000000 = three pixels). The
+/// pattern is a recirculating register, "msb = first pixel": a ZPATTERN
+/// write reloads it, so every stroke starts at bit 31. When the bit position
+/// carried over from the previous stroke instead, the second stroke tested
+/// bits 28.. of its mask and came out partly or wholly missing.
+#[test]
+fn test_zpattern_write_restarts_pattern_for_soft_z_lines() {
+    const DM0_FLINE_SOFTZ: u32 = 0x0000_930e; // DRAW FLINE STOPONX STOPONY ENZPAT LEN32
+
+    let rex = &make_rex3();
+    rex3init(rex);
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(rex, REX3_WRMASK, 0xFF);
+
+    // (x0, y0, x1, y1, mask), as fsn sends them.
+    let strokes = [
+        (10, 10, 12, 10, 0xe000_0000u32),
+        (10, 20, 13, 20, 0xf000_0000),
+        (10, 30, 11, 30, 0xc000_0000),
+        (10, 40, 10, 43, 0xf000_0000),
+    ];
+    for (i, &(x0, y0, x1, y1, mask)) in strokes.iter().enumerate() {
+        reg(rex, REX3_COLORI, 1 + i as u32);
+        write_xstartf(rex, x0, 0);
+        write_ystartf(rex, y0, 0);
+        write_xendf(rex, x1, 0);
+        write_yendf(rex, y1, 0);
+        reg(rex, REX3_DRAWMODE0, DM0_FLINE_SOFTZ);
+        reg(rex, REX3_SETUP, 0);
+        reg_go(rex, REX3_ZPATTERN, mask);
+    }
+    for (i, &(x0, y0, x1, y1, _)) in strokes.iter().enumerate() {
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                assert_eq!(read_pixel(rex, x, y) & 0xFF, 1 + i as u32,
+                    "stroke {i} pixel ({x}, {y}) missing: its ZPATTERN mask was tested from the wrong bit");
+            }
+        }
+    }
+}
+
+/// BRESROUND (BRESRNDINC2[31:24], one bit per octant) picks which way a
+/// Bresenham step with d == 0 goes: set = diagonal, clear = straight. A 2x1
+/// I_LINE starts at d = 2*1 - 2 = 0, so its middle pixel shows the choice.
+/// IRIS GL draws with BRESROUND = 0, the X server with 0xff. Both engines.
+#[test]
+fn test_bresround_decides_the_d_zero_step() {
+    const DM0_DRAW_ILINE_XY: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE_SH | DM0_DOSETUP | DM0_STOPONXY;
+    let mut cases = vec![(false, 0x00u32, 10), (false, 0xff, 11)];
+    if cfg!(feature = "rex-jit") {
+        cases.push((true, 0x00, 10));
+        cases.push((true, 0xff, 11));
+    }
+    for (jit, rnd, middle_row) in cases {
+        let rex = &make_rex3();
+        #[cfg(feature = "rex-jit")]
+        rex.jit_enabled.store(jit, std::sync::atomic::Ordering::Relaxed);
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_COLORI, 5);
+        reg(rex, REX3_BRESRNDINC2, rnd << 24);
+        #[cfg(feature = "rex-jit")]
+        let before = rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "rex-jit")]
+        if jit {
+            let j = rex.rex_jit.as_ref().unwrap();
+            let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_CI8_SRC, DRAWMODE0_OPCODE_DRAW);
+            let cm = unsafe { (*rex.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
+            j.request_compile(DM0_DRAW_ILINE_XY, dm1, cm);
+            assert!(j.wait_compiled(DM0_DRAW_ILINE_XY, dm1, cm));
+        }
+        reg(rex, REX3_XYENDI, xy(12, 11));
+        reg(rex, REX3_XYSTARTI, xy(10, 10));
+        reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_ILINE_XY);
+        #[cfg(feature = "rex-jit")]
+        assert_eq!(rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed) > before, jit,
+            "jit={jit}: the line ran on the wrong engine");
+        for (x, y) in [(10, 10), (11, middle_row), (12, 11)] {
+            assert_eq!(read_pixel(rex, x, y) & 0xFF, 5,
+                "jit={jit} BRESROUND={rnd:#x}: pixel ({x}, {y}) not drawn");
+        }
+    }
+}
+
+/// F_LINE with both endpoints fractional, every direction, lengths like
+/// stroke text (0-12 pixels): the pixels must be `fline_geom`'s. Deterministic
+/// pseudo-random endpoints; lines through a row boundary are skipped.
+#[test]
+fn test_fline_fractional_both_ends_matches_geometry() {
+    fline_geometry_sweep(false);
+    #[cfg(feature = "rex-jit")]
+    fline_geometry_sweep(true);
+}
+
+fn fline_geometry_sweep(jit: bool) {
+    let rex = &make_rex3();
+    #[cfg(feature = "rex-jit")]
+    rex.jit_enabled.store(jit, std::sync::atomic::Ordering::Relaxed);
+    rex3init(rex);
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(rex, REX3_WRMASK, 0xFF);
+    #[cfg(feature = "rex-jit")]
+    if jit {
+        let j = rex.rex_jit.as_ref().unwrap();
+        let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_CI8_SRC, DRAWMODE0_OPCODE_DRAW);
+        let cm = unsafe { (*rex.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
+        j.request_compile(DM0_DRAW_FLINE, dm1, cm);
+        assert!(j.wait_compiled(DM0_DRAW_FLINE, dm1, cm));
+    }
+    #[cfg(feature = "rex-jit")]
+    let before = rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+    let mut seed = 0x1234_5678u32;
+    let mut rnd = |n: u32| { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; seed % n };
+    let (c, pad) = (100i32, 16i32);
+    let (mut checked, mut ties) = (0, 0);
+    for _ in 0..2000 {
+        let x1 = c * 16 + rnd(16) as i32;
+        let y1 = c * 16 + rnd(16) as i32;
+        let x2 = x1 + rnd(25 * 16) as i32 - 12 * 16;
+        let y2 = y1 + rnd(25 * 16) as i32 - 12 * 16;
+        let Some(want) = fline_geom(x1, y1, x2, y2) else { ties += 1; continue };
+        reg(rex, REX3_COLORI, 0);
+        reg(rex, REX3_XYENDI, xy(c + pad, c + pad));
+        reg(rex, REX3_XYSTARTI, xy(c - pad, c - pad));
+        // DOSETUP: without it the block steps in the last line's octant.
+        reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK | DM0_DOSETUP);
+        reg(rex, REX3_COLORI, 7);
+        write_xstartf(rex, x1 >> 4, x1 & 15);
+        write_ystartf(rex, y1 >> 4, y1 & 15);
+        write_xendf(rex, x2 >> 4, x2 & 15);
+        write_yendf(rex, y2 >> 4, y2 & 15);
+        reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_FLINE);
+        let mut got = HashSet::new();
+        for y in c - pad..=c + pad {
+            for x in c - pad..=c + pad {
+                if read_pixel(rex, x, y) & 0xFF == 7 { got.insert((x, y)); }
+            }
+        }
+        let want: HashSet<(i32, i32)> = want.into_iter().collect();
+        assert_eq!(got, want, "jit={jit}: F_LINE ({x1}/16, {y1}/16) -> ({x2}/16, {y2}/16)");
+        checked += 1;
+    }
+    assert!(checked > 1500, "only {checked} lines checked ({ties} ties)");
+    #[cfg(feature = "rex-jit")]
+    assert_eq!(rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed) > before, jit,
+        "jit={jit}: the lines ran on the wrong engine");
+    let _ = jit;
+}
+
+/// One of fsn's label strokes (the left of an 'a', from fns.log): y-major,
+/// x and y increasing, (26052, 29923) -> (26094, 29976) in 1/16 pixels.
+/// IRIS GL's software Z buffer expects x = 1628, 1629, 1630, 1630; with the
+/// y fraction mirrored the wrong way round it came out 1628, 1628, 1629, 1630
+/// and the spotlight drawn afterwards left the expected pixels unpainted.
+/// Two more from fsn.rec, where a first-pixel adjustment (the spec's E test,
+/// or E/G) moved the start off the start point's own pixel.
+#[test]
+fn test_fline_fsn_label_stroke() {
+    let rex = &make_rex3();
+    rex3init(rex);
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_COLORI, 9);
+    // Same place, shifted into the visible framebuffer.
+    let (x1, y1, x2, y2) = (26052 - 1500 * 16, 29923 - 1800 * 16, 26094 - 1500 * 16, 29976 - 1800 * 16);
+    write_xstartf(rex, x1 >> 4, x1 & 15);
+    write_ystartf(rex, y1 >> 4, y1 & 15);
+    write_xendf(rex, x2 >> 4, x2 & 15);
+    write_yendf(rex, y2 >> 4, y2 & 15);
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_FLINE);
+    for (x, y) in [(128, 70), (129, 71), (130, 72), (130, 73)] {
+        assert_eq!(read_pixel(rex, x, y) & 0xFF, 9, "pixel ({x}, {y}) not drawn");
+    }
+    assert_eq!(read_pixel(rex, 128, 71) & 0xFF, 0, "(128, 71) drawn: y fraction mirrored the wrong way");
+
+    // fsn.rec: (27278, 22016) -> (30550, 31190), shifted by (-1600, -1300)
+    // pixels. Starts at x = 1704.875: its first pixel is column 104, where
+    // the start point is; an E/G adjustment moved it to 105.
+    reg(rex, REX3_COLORI, 11);
+    let (x1, y1, x2, y2) = (27278 - 1600 * 16, 22016 - 1300 * 16, 30550 - 1600 * 16, 31190 - 1300 * 16);
+    write_xstartf(rex, x1 >> 4, x1 & 15);
+    write_ystartf(rex, y1 >> 4, y1 & 15);
+    write_xendf(rex, x2 >> 4, x2 & 15);
+    write_yendf(rex, y2 >> 4, y2 & 15);
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_FLINE);
+    assert_eq!(read_pixel(rex, 104, 76) & 0xFF, 11, "first pixel is not the start point's own");
+    assert_eq!(read_pixel(rex, 105, 76) & 0xFF, 0, "first pixel moved off the start point's pixel");
+}
+
+/// A SPAN never steps y: once it reaches XEND, XSTART is left one past it and
+/// YSTART is unchanged (rex3.pdf §3.5.3), and both pattern bit positions
+/// restart at 31. The JIT used to end a span like a block row (x back to
+/// XSAVE, y + 1), and left a disabled pattern's bit position stale; IRIS GL
+/// reads XSTART/YSTART back (fsn.rec). fsn's soft-Z span: two LEN32 GOs.
+#[test]
+fn test_span_end_leaves_y_and_x_past_end() {
+    const DM0_SPAN_SOFTZ: u32 = 0x0008_9102; // DRAW SPAN STOPONX ENZPAT LEN32 LRONLY
+    let engines: &[bool] = if cfg!(feature = "rex-jit") { &[false, true] } else { &[false] };
+    for &jit in engines {
+        let rex = &make_rex3();
+        #[cfg(feature = "rex-jit")]
+        rex.jit_enabled.store(jit, std::sync::atomic::Ordering::Relaxed);
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_SRC);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_COLORI, 3);
+        #[cfg(feature = "rex-jit")]
+        if jit {
+            let j = rex.rex_jit.as_ref().unwrap();
+            let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_CI8_SRC, DRAWMODE0_OPCODE_DRAW);
+            let cm = unsafe { (*rex.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
+            j.request_compile(DM0_SPAN_SOFTZ, dm1, cm);
+            assert!(j.wait_compiled(DM0_SPAN_SOFTZ, dm1, cm));
+        }
+        #[cfg(feature = "rex-jit")]
+        let before = rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+        // 46 pixels from x = 10 on row 20: a 32-pixel GO, then 14.
+        reg(rex, REX3_XYENDI, xy(55, 20));
+        reg(rex, REX3_XYSTARTI, xy(10, 20));
+        reg(rex, REX3_DRAWMODE0, DM0_SPAN_SOFTZ);
+        reg_go(rex, REX3_ZPATTERN, 0xffff_ffff);
+        reg_go(rex, REX3_ZPATTERN, 0);
+        #[cfg(feature = "rex-jit")]
+        assert_eq!(rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed) > before, jit,
+            "jit={jit}: the span ran on the wrong engine");
+        let ctx = unsafe { &*rex.context.get() };
+        let (x, y) = ((ctx.xstart >> 11) - REX3_COORD_BIAS, (ctx.ystart >> 11) - REX3_COORD_BIAS);
+        assert_eq!((x, y), (56, 20), "jit={jit}: span end left XSTART/YSTART at ({x}, {y})");
+        assert_eq!((ctx.zpat_bit, ctx.pat_bit), (31, 31), "jit={jit}: pattern bits not restarted");
+        for px in 10..42 {
+            assert_eq!(read_pixel(rex, px, 20) & 0xFF, 3, "jit={jit}: ({px}, 20) not drawn");
+        }
+        assert_eq!(read_pixel(rex, 42, 20) & 0xFF, 0, "jit={jit}: masked chunk drew");
+    }
+}
+
+// ============================================================================
+// Hardware conformance: RGBMODE and GFIFO depth
+//
+// Two behaviours the OS REX3 driver depends on. Both are pinned here against
+// the emulator's public register interface, and the places where IRIS is more
+// forgiving than a real Indy are recorded in docs/Indy/rex3.md
+// ("Where IRIS diverges from real hardware"). A change to either side should
+// fail a test here rather than show up as an OS-only bug.
+// ============================================================================
+
+/// `DRAWMODE1.PLANES=RGB`, 24bpp, with the caller's LOGICOP/COMPARE.
+const DM1_RGB24_PLANES: u32 = DRAWMODE1_PLANES_RGB
+    | (DRAWMODE1_DRAWDEPTH_24 << 3)
+    | DRAWMODE1_COMPARE_DISABLE_SH
+    | DRAWMODE1_LOGICOP_SRC_SH;
+
+/// Fill a 16x1 block at the top-left in 24bpp and return the pixel written.
+///
+/// Colour registers are written *after* DRAWMODE1 because the write format of
+/// COLORRED depends on RGBMODE and DRAWDEPTH (spec Table 7): in 12-bit CI mode
+/// the bus value is o12.9 and gets shifted, in RGB mode it is a component.
+fn fill_24bpp_and_sample(rex: &Rex3, dm1: u32) -> u32 {
+    reg(rex, REX3_DRAWMODE1, dm1);
+    reg(rex, REX3_WRMASK,    0xFFFFFF);
+    // CLIPMODE resets to CIDMATCH=0 (permit nothing), so permit every CID; this
+    // is device setup, not part of the RGBMODE question.
+    reg(rex, REX3_CLIPMODE,  0xF << CLIPMODE_CIDMATCH_SHIFT);
+    reg(rex, REX3_COLORRED,  0x80 << 11);
+    reg(rex, REX3_COLORGRN,  0x40 << 11);
+    reg(rex, REX3_COLORBLUE, 0x20 << 11);
+    reg(rex, REX3_XYENDI,    xy(15, 0));
+    reg(rex, REX3_XYSTARTI,  xy(0, 0));
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    read_pixel(rex, 0, 0)
+}
+
+/// After reset, DRAWMODE1 is at IRIS's reset value, not the hardware's.
+///
+/// The spec's Table 11 init column has PLANES=001, RGBMODE=1, FASTCLEAR=1 and
+/// LOGICOP=SRC. IRIS resets to PLANES=NONE, RGBMODE=0, FASTCLEAR=0,
+/// LOGICOP=ZERO, keeping only COMPARE=0x7 (afunction disabled). That is a
+/// deliberate, documented divergence: software must program DRAWMODE1 after a
+/// reset, and this test pins both the register value and its consequence — a
+/// draw attempted before that programming writes nothing at all.
+#[test]
+fn reset_leaves_drawmode1_planes_disabled() {
+    let rex = &make_rex3_reset();
+
+    assert_eq!(read_reg(rex, REX3_DRAWMODE1), 0x7000,
+        "reset DRAWMODE1 should be COMPARE=0x7 and nothing else");
+    assert_eq!(read_reg(rex, REX3_WRMASK), 0,
+        "reset WRMASK should be 0");
+
+    // Program everything except DRAWMODE1: colour, write mask, CID permit
+    // and geometry are all valid, so only PLANES=NONE can stop the write.
+    // (CLIPMODE must be programmed too — it also resets to "permit no CIDs",
+    // which on its own would refuse every pixel.)
+    reg(rex, REX3_WRMASK,    0xFFFFFF);
+    reg(rex, REX3_CLIPMODE,  0xF << CLIPMODE_CIDMATCH_SHIFT);
+    reg(rex, REX3_COLORRED,  0xFF << 11);
+    reg(rex, REX3_COLORGRN,  0xFF << 11);
+    reg(rex, REX3_COLORBLUE, 0xFF << 11);
+    reg(rex, REX3_XYENDI,    xy(7, 0));
+    reg(rex, REX3_XYSTARTI,  xy(0, 0));
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    for x in 0..8 {
+        assert_eq!(read_pixel(rex, x, 0), 0,
+            "PLANES=NONE must not write the framebuffer (x={x})");
+    }
+}
+
+/// A 24bpp RGB fill needs `DRAWMODE1` bit 15 (RGBMODE) *as well as*
+/// PLANES=RGB. Bit 15 clear is CI mode, where the shader is a single index
+/// taken from COLORRED: COLORGRN and COLORBLUE never contribute, and the index
+/// is written as the 24-bit value itself — which, in the BGR pixel layout,
+/// puts it in the red byte and clears green and blue.
+///
+/// This is the behaviour the OS driver depends on: forgetting the bit turns a
+/// white fill into a red one. IRIS matches the hardware here rather than being
+/// permissive; the test proves the bit is load-bearing in both directions.
+#[test]
+fn rgb24_fill_needs_rgbmode_as_well_as_rgb_planes() {
+    let rex = &make_rex3_reset();
+
+    // CI mode: planes says RGB, but RGBMODE is clear.
+    let ci_pixel = fill_24bpp_and_sample(rex, DM1_RGB24_PLANES);
+    assert_eq!(ci_pixel & 0xFFFFFF, 0x000080,
+        "RGBMODE=0 must write the CI index into the red byte only, not compose RGB");
+    // The same index is what COLORI reads back in this mode: one colour
+    // register, no green or blue.
+    assert_eq!(read_reg(rex, REX3_COLORI), 0x000080,
+        "CI-mode COLORI should be the COLORRED index alone");
+
+    // RGB mode: the same three colour registers now compose a 24-bit pixel.
+    let rgb_pixel = fill_24bpp_and_sample(rex, DM1_RGB24_PLANES | (1 << 15));
+    assert_eq!(rgb_pixel & 0xFFFFFF, 0x204080,
+        "RGBMODE=1 must compose blue<<16 | green<<8 | red");
+    assert_eq!(read_reg(rex, REX3_COLORI), 0x204080,
+        "RGB-mode COLORI should compose all three channels");
+
+    // Every pixel of the block, not just the first: a bug that only the first
+    // pixel of a primitive sees would otherwise pass.
+    for x in 0..16 {
+        assert_eq!(read_pixel(rex, x, 0) & 0xFFFFFF, 0x204080,
+            "RGB-mode fill pixel x={x}");
+    }
+}
+
+/// The emulated GFIFO is 65536 entries deep (65535 live), not the hardware's
+/// 32, and STATUS reports only the last 32 slots of it.
+///
+/// Pins all three facts a driver can observe: the queue accepts 65535 writes
+/// with no consumer running; GFIFOLEVEL is 1 for every non-empty depth below
+/// `GFIFO_DEPTH - GFIFO_HW_DEPTH`, then counts up to 31 at the brim; and
+/// overflow is back-pressure (BUS_BUSY, the write is refused and retried)
+/// rather than the hardware's silent drop at level 32.
+#[test]
+fn status_reports_only_the_last_32_fifo_slots() {
+    let rex = &make_rex3_unstarted();
+    // Leave the queue empty even if an assertion below fires: TestBoard::drop
+    // pushes a shutdown sentinel with a blocking push and there is no consumer.
+    let _reset = FifoResetGuard(rex);
+
+    let s = read_status_now(rex);
+    assert_eq!(s & STATUS_GFXBUSY, 0, "empty GFIFO must read idle");
+    assert_eq!(gfifo_level(s), 0, "empty GFIFO must read level 0");
+
+    // One queued entry is enough to set GFXBUSY: the spec defines the bit as
+    // "graphics pipeline not idle or GFIFO not empty".
+    assert_eq!(rex.write32(set_addr(REX3_WRMASK), 0xFF), BUS_OK);
+    let s = read_status_now(rex);
+    assert_ne!(s & STATUS_GFXBUSY, 0, "one queued entry must read busy");
+    assert_eq!(gfifo_level(s), 1, "one queued entry must read level 1");
+
+    // Fill past a real 32-entry FIFO's capacity many times over. IRIS accepts
+    // every write and still reports level 1, because only its last 32 slots
+    // are visible in the 6-bit field.
+    let mut pending = 1usize;
+    let visible_from = GFIFO_DEPTH - GFIFO_HW_DEPTH; // 65504
+    while pending < visible_from + 1 {
+        assert_eq!(rex.write32(set_addr(REX3_WRMASK), 0xFF), BUS_OK,
+            "write {pending} must be accepted");
+        pending += 1;
+    }
+    // 65505 entries: pending - visible_from is 1, so the level still reads 1.
+    assert_eq!(gfifo_level(read_status_now(rex)), 1,
+        "level stays 1 until the emulated ring is within 32 slots of full");
+
+    // One more entry and the level starts counting upwards.
+    assert_eq!(rex.write32(set_addr(REX3_WRMASK), 0xFF), BUS_OK);
+    pending += 1;
+    assert_eq!(gfifo_level(read_status_now(rex)), 2,
+        "the level counts only once the ring is inside the last 32 slots");
+
+    while rex.write32(set_addr(REX3_WRMASK), 0xFF) == BUS_OK {
+        pending += 1;
+        assert!(pending < GFIFO_DEPTH,
+            "the ring must refuse a write at DEPTH-1, not wrap");
+    }
+    assert_eq!(pending, GFIFO_DEPTH - 1,
+        "a DEPTH-entry ring holds DEPTH-1 entries (one empty slot distinguishes full from empty)");
+    assert_eq!(gfifo_level(read_status_now(rex)), 31,
+        "the visible level tops out at 31, not the hardware's 32");
+    assert_eq!(rex.gfifo.len(), GFIFO_DEPTH - 1);
+
+    // Overflow is back-pressure, not data loss: the refused write is still
+    // owed to the caller (the CPU re-executes the store on BUS_BUSY).
+    assert_eq!(rex.write32(set_addr(REX3_WRMASK), 0xFF), BUS_BUSY);
+    assert_eq!(rex.gfifo.len(), GFIFO_DEPTH - 1, "a refused write must not be queued");
+}
+
+/// The GFIFO threshold interrupt is not modelled.
+///
+/// The spec has GFIFOLEVEL compared against CONFIG GFIFODEPTH, raising the
+/// sticky STATUS.GFIFO_INT and stalling the bus with GRXDLY above it. IRIS
+/// stores the CONFIG fields and reports the level, but never raises the
+/// interrupt and never stalls. A driver that *only* waits for GFIFO_INT instead
+/// of polling GFXBUSY would therefore hang here.
+///
+/// This is a documented divergence (docs/Indy/rex3.md); if the interrupt is
+/// ever wired up, this test is the reminder to change the documentation too.
+#[test]
+fn fifo_threshold_interrupt_stays_clear() {
+    let rex = &make_rex3_unstarted();
+    let _reset = FifoResetGuard(rex);
+
+    let config = (1 << CONFIG_GFIFODEPTH_SHIFT) | CONFIG_GFIFOABOVEINT;
+    assert_eq!(rex.write32(set_addr(REX3_CONFIG), config), BUS_OK);
+    assert_eq!(read_reg(rex, REX3_CONFIG) & 0x3FFF, config,
+        "CONFIG should at least store the threshold fields");
+
+    for _ in 0..8 {
+        assert_eq!(rex.write32(set_addr(REX3_WRMASK), 0xFF), BUS_OK);
+    }
+    let s = read_status_now(rex);
+    assert_ne!(s & STATUS_GFXBUSY, 0);
+    assert_eq!(s & STATUS_GFIFO_INT, 0,
+        "IRIS does not raise GFIFO_INT; a level-based wait would hang (see docs/Indy/rex3.md)");
+}
+
+/// Back-to-back fills with no STATUS poll in between all land, in order.
+///
+/// This is the driver-visible half of the shallow-FIFO divergence: a real
+/// 32-entry FIFO needs a drain between bursts of primitives, IRIS's 65536-entry
+/// ring does not. The test offers 384 queue entries (64 fills of six writes
+/// each) with no `wait_idle` and no STATUS read, then drains once and checks
+/// every row separately — a dropped or reordered entry shows up as a wrong row,
+/// not just a missing pixel. `reg_go` (the `REX3WAIT(REX)` equivalent in the
+/// SGI diagnostics) is deliberately not used in the loop; `wait` once at the end
+/// is the whole drain.
+///
+/// Note what this does *not* prove: `w32` retries on BUS_BUSY the way the CPU
+/// does, so this would still pass if the ring shrank to 32 entries with correct
+/// back-pressure. `status_reports_only_the_last_32_fifo_slots` pins the depth.
+#[test]
+fn back_to_back_fills_need_no_status_poll() {
+    let rex = &make_rex3();
+    rex3init(rex);
+
+    const ROWS: i32 = 64;
+    const WIDTH: i32 = 32;
+
+    reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+    reg(rex, REX3_WRMASK,    0xFFFFFF);
+
+    for row in 0..ROWS {
+        // A different red value per row, so a row drawn with another row's
+        // colour (or not at all) is visible.
+        reg(rex, REX3_COLORRED,  (row as u32 * 4) << 11);
+        reg(rex, REX3_COLORGRN,  0x80 << 11);
+        reg(rex, REX3_COLORBLUE, 0x40 << 11);
+        reg(rex, REX3_XYSTARTI,  xy(0, row));
+        reg(rex, REX3_XYENDI,    xy(WIDTH - 1, row));
+        // GO with no wait and no STATUS read in between.
+        w32(rex, go_addr(REX3_DRAWMODE0), DM0_DRAW_BLOCK);
+    }
+
+    // One drain at the end of the whole burst.
+    wait(rex);
+
+    // The drain really finished: the REX3WAIT-equivalent state is idle.
+    let s = read_status_now(rex);
+    assert_eq!(s & STATUS_GFXBUSY, 0, "GFXBUSY must clear once the burst drains");
+    assert_eq!(gfifo_level(s), 0, "GFIFOLEVEL must be 0 once the burst drains");
+
+    for row in 0..ROWS {
+        let expected = (0x40u32 << 16) | (0x80 << 8) | (row as u32 * 4);
+        for x in 0..WIDTH {
+            assert_eq!(read_pixel(rex, x, row) & 0xFFFFFF, expected,
+                "row {row} x={x} after a {ROWS}-fill burst with no poll");
+        }
+    }
 }

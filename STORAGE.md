@@ -2,7 +2,7 @@
 
 Disk images, overlays, snapshots, the CI control interface, and scratch-volume
 workflows. The full configuration inventory is in [FEATURES.md](FEATURES.md);
-[HELP.md](HELP.md) covers image preparation and monitor commands. The sections
+[HELP.md](HELP.md) covers image preparation and [debug.md](debug.md) the monitor commands. The sections
 below retain the detailed material previously in README.md.
 
 ### CHD image support
@@ -50,7 +50,7 @@ the GUI's "Commit changes to disk") folds the diff back into the base.
 Graphics coverage is incomplete: GR2 saves register/microcode/display tables
 but omits VRAM and full drawing-engine state; IMPACT board state is not saved
 yet. A snapshot of either board cannot reproduce its complete graphics state.
-See [TODO.md](TODO.md) for remaining device and restore work.
+See [TODO.md](clanker/TODO.md) for remaining device and restore work.
 
 Capture RAM, supported device state, and the COW overlay into
 `saves/<name>/`, and restore it later. CPU, MC, IOC, HPC3, REX3, RTC, EEPROM,
@@ -89,7 +89,7 @@ Two restore tiers:
 Reflinks are used on APFS / btrfs / xfs so capturing a snapshot of a 4 GB disk
 image takes <10 ms and uses ~18 MB of actual disk.
 
-See [CHANGELOG.md](CHANGELOG.md) for the full feature set, and `rules/snapshot/`
+See [CHANGELOG.md](CHANGELOG.md) for the full feature set, and `clanker/snapshot/`
 for the format and its gotchas.
 
 
@@ -116,6 +116,7 @@ debugging the wrapper itself.
 ./target/release/iris --ci
 
 # In another terminal: drive it
+./target/release/iris-ci status --wait-ready 60   # guest state + monitor readiness
 ./target/release/iris-ci boot          # PROM menu → IRIS console login (one cmd)
 ./target/release/iris-ci login         # send root + dismiss vt100 prompt + wait #
 ./target/release/iris-ci run 'ls /'    # send shell command, get stdout + exit code
@@ -133,6 +134,24 @@ debugging the wrapper itself.
 Run `iris-ci --help` for the full list, or `iris-ci <subcmd> --help` for any
 subcommand. Every operation has a typed clap arg — no JSON quoting, no
 hand-managed timeouts.
+
+### Waiting for a fresh machine
+
+The control socket is created only after `Machine::start` has bound the monitor,
+so a successful connection (or `iris-ci ping`) also means the monitor is
+listening. A harness that launches iris should poll, not sleep:
+`iris-ci status --wait-ready 60` retries until `monitor_ready` is true and then
+prints the guest state (`idle`, `starting`, `running`, `halted`) and the
+monitor address. `--json` emits the same fields as one object. A `--ci` machine
+sits in `starting` with the CPU parked until `iris-ci start` (or the monitor's
+`machine-start`), whose reply acknowledges the transition; repeating it is a
+no-op. See [debug.md](debug.md#machine) for `machine-status` on the monitor
+side.
+
+`script FILE` (also spelled `batch FILE`) runs one command per line through a
+single control-socket connection, so a multi-step scenario costs one connect
+rather than one per line. It prints per-step status and stops at the first
+failure; `--keep-going` runs the remaining steps and still exits non-zero.
 
 For automation that doesn't want to depend on `iris-ci`, the underlying socket
 protocol is newline-delimited JSON; `cmd` and `args` per request, `{ok, data,

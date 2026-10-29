@@ -247,6 +247,15 @@ config-tftp-boot = To boot a kernel from it, press Esc at “Starting up the sys
 # $gateway is the server's IP address.
 config-tftp-irix = From IRIX, the server is { $gateway }:
 
+config-rsh = rsh server
+config-rsh-subtitle =
+config-rsh-enable = Serve a folder over rsh (install source)
+config-rsh-dir = Folder
+config-rsh-dir-empty = Choose a folder to turn the rsh server on.
+config-rsh-dir-missing = That folder doesn't exist.
+config-rsh-inst = To install from it, give inst this location (the folder is the root):
+config-rsh-readonly = Read-only: the guest can list and read files, nothing else.
+
 config-nfs = NFS share
 config-nfs-subtitle =
 config-nfs-enable = Share a folder over NFS
@@ -387,3 +396,12 @@ config-ci-scroll = Scroll pixels per line
 config-ci-ping = Test connection
 config-ci-test = Test headless boot
 config-ci-test-subtitle =
+
+## Octane
+
+config-octane-subtitle = An R10000 at 195 MHz. Needs the IP30 PROM image; there is no built-in PROM.
+config-octane-flash = Flash file
+config-octane-flash-tip = Keeps the PROM's saved records between runs. Created from the PROM image when missing.
+config-octane-graphics-none = None
+config-octane-graphics-subtitle = The Octane models IMPACT as SI (Solid), SI with texture option (High) and MXI (Maximum), or no graphics board and a serial console.
+config-ram-banks-octane-subtitle = Each bank is a pair of DIMMs of 64, 128, 256 or 512 MB. Fill the banks from bank 0 with no gaps.

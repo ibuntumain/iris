@@ -7,7 +7,7 @@ use crate::cpu::mips_tlb::*;
 use crate::cpu::mips_cache_v2::*;
 use crate::devlog::{LogModule, devlog_mask, devlog_is_active};
 use crate::cpu::mips_dis;
-use crate::physical::{HIMEM_BASE, HIMEM_END, LOMEM_BASE, LOMEM_END};
+use crate::ip22_bus::{HIMEM_BASE, HIMEM_END, LOMEM_BASE, LOMEM_END};
 use std::fmt::Write as FmtWrite;
 use crate::cpu::mips_dis::SymbolTable;
 use std::sync::Arc;
@@ -197,7 +197,7 @@ fn is_qnan_d(bits: u64) -> bool {
 /// Every ADD/SUB/MUL/DIV/SQRT/RECIP/RSQRT/MADD-family handler's exception
 /// checks are computed from operand/result bit patterns alone — never from
 /// the host FPU's own exception flags (see
-/// `rules/jitv2/fpu-flags-are-computed-not-read.md` for why: Cranelift
+/// `clanker/jitv2/fpu-flags-are-computed-not-read.md` for why: Cranelift
 /// `call_indirect` and even plain LTO/codegen-units=1 optimization can't be
 /// trusted to preserve host FPU status-register state across the boundary
 /// between "clear it" and "read it back"). `is_snan_s/d` here catches what
@@ -322,7 +322,7 @@ struct CpuSnapshot {
 
     // LL/SC state
     llbit: bool,
-    lladdr: u32,
+    lladdr: u64,
 
     // CP0 registers
     cp0_index: u32,
@@ -1164,7 +1164,7 @@ impl JitMemStatsPair {
 /// Result of address translation: 8 bytes, no heap.
 ///
 /// Layout when success (EXEC_IS_EXCEPTION clear in `status`):
-///   `phys`   — 32-bit physical address
+///   `phys`   — physical address (up to 40 bits on the R10000)
 ///   `status` — bits [2:0]: C-field cache attr (TR_UNCACHED/TR_CACHEABLE/TR_CACHEABLE_COH)
 ///              bit  [3]:   TR_MAPPED — translation came from the TLB
 ///              bit  [4]:   TR_GLOBAL — that TLB entry was global (G=1)
@@ -1175,21 +1175,21 @@ impl JitMemStatsPair {
 ///   `status` — fully-formed ExecStatus for handle_exception
 #[derive(Debug, Clone, Copy)]
 pub struct TranslateResult {
-    pub phys:   u32,
+    pub phys:   u64,
     pub status: u32,
 }
 
 impl TranslateResult {
     #[inline(always)]
     pub fn ok(phys: u64, c_field: u32) -> Self {
-        Self { phys: phys as u32, status: c_field }
+        Self { phys, status: c_field }
     }
     /// Success from a TLB-mapped segment, carrying the entry's G bit so the
     /// nutlb can decide whether to tag the fill with an ASID.
     #[inline(always)]
     pub fn ok_mapped(phys: u64, c_field: u32, global: bool) -> Self {
         Self {
-            phys: phys as u32,
+            phys,
             status: c_field | TR_MAPPED | if global { TR_GLOBAL } else { 0 },
         }
     }
@@ -1251,7 +1251,7 @@ pub const LL_STATS_SLOTS: usize = 1024;
 /// a diagnostic whose whole job is "is THIS address stuck".
 #[cfg(feature = "llstats")]
 #[inline]
-fn ll_stats_slot(tbl: &mut [LlSiteStats; LL_STATS_SLOTS], key: u32) -> &mut LlSiteStats {
+fn ll_stats_slot(tbl: &mut [LlSiteStats; LL_STATS_SLOTS], key: u64) -> &mut LlSiteStats {
     let slot = (key as usize) & (LL_STATS_SLOTS - 1);
     let e = &mut tbl[slot];
     if e.key != key {
@@ -1263,7 +1263,7 @@ fn ll_stats_slot(tbl: &mut [LlSiteStats; LL_STATS_SLOTS], key: u32) -> &mut LlSi
 /// Read-only slot lookup for tests/inspection: `None` when this address has no
 /// row (never seen, or evicted by a collision).
 #[cfg(feature = "llstats")]
-pub fn ll_stats_lookup(tbl: &[LlSiteStats; LL_STATS_SLOTS], key: u32) -> Option<&LlSiteStats> {
+pub fn ll_stats_lookup(tbl: &[LlSiteStats; LL_STATS_SLOTS], key: u64) -> Option<&LlSiteStats> {
     let e = &tbl[(key as usize) & (LL_STATS_SLOTS - 1)];
     if e.key == key { Some(e) } else { None }
 }
@@ -1272,11 +1272,11 @@ pub fn ll_stats_lookup(tbl: &[LlSiteStats; LL_STATS_SLOTS], key: u32) -> Option<
 #[cfg(feature = "llstats")]
 #[derive(Default, Clone, Copy)]
 pub struct LlSiteStats {
-    /// `LLAddr` (phys >> 4) this row describes; `u32::MAX` when the slot has
+    /// `LLAddr` (phys >> 4) this row describes; `u64::MAX` when the slot has
     /// never been used. Stored because the table is direct-mapped and two
     /// addresses can collide onto one slot — on a collision the slot is reset
     /// and re-keyed, so a row always describes exactly one address.
-    pub key: u32,
+    pub key: u64,
     /// `LL` executed here, taking a reservation.
     pub ll: u64,
     /// `SC` here found the LLbit set and stored.
@@ -1306,7 +1306,7 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     #[cfg(feature = "developer")]
     pending_memory_writes: Vec<MemoryWrite>,
     traceback: TracebackBuffer,
-    /// Per-instruction execution trace recorder (rules/jitv2's lockstep
+    /// Per-instruction execution trace recorder (clanker/jitv2's lockstep
     /// verification tooling, `src/cpu/trace.rs`). `None` when not recording —
     /// checked on every step() (one branch on a `None` tag), so armed cost
     /// is a file write, disarmed cost is a predictable branch. Developer-only:
@@ -1385,7 +1385,7 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// Per-instruction execution frequency counters (feature = "instr_stats").
     #[cfg(feature = "instr_stats")]
     pub instr_stats: crate::cpu::mips_instr_stats::InstrStats,
-    /// JIT v2 engine state: physical-code-page pool + allocator (rules/jitv2/jit-v2-design.md §2.4).
+    /// JIT v2 engine state: physical-code-page pool + allocator (clanker/jitv2/jit-v2-design.md §2.4).
     /// Lives independently of the executor (`Arc<Mutex<...>>`, constructed by
     /// `Machine` and shared in) — NOT owned by the executor's own struct
     /// literal — specifically so the compile thread (which needs to call
@@ -1526,6 +1526,26 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// recompiling to compare against).
     #[cfg(feature = "jitv2")]
     pub jitv2_dispatch_enabled: bool,
+    /// Called by the CPU thread between batches of instructions (about every
+    /// thousand), with the executor locked: for a machine that has to act on
+    /// where the guest is running (the O2 hands its cache over to the
+    /// shadow model once a kernel starts, and back when POST starts over).
+    /// None costs one check per batch.
+    pub batch_hook: Option<Box<dyn FnMut(&mut MipsExecutor<T, C>) + Send>>,
+    /// A window of physical addresses that reaches memory at another address,
+    /// `(base, size, target)`, applied to mapped and XKPHYS translations
+    /// before [`Self::phys_mask`]. The O2 has a no-ECC alias of its memory at
+    /// 0x8000_0000 that would otherwise reach the PCI window the bus decodes
+    /// there. None on the other machines.
+    pub phys_alias: Option<(u64, u64, u64)>,
+    /// The physical address bits the board decodes, applied to mapped,
+    /// XKPHYS and ERL-identity translations after [`Self::phys_alias`]. The
+    /// CPU drives 36 or 40 bits, but the Indy, Indigo2 and O2 decode 32 and
+    /// alias the rest away, and IRIX relies on it: its page-table entries keep
+    /// software bits (the PFN lock among them) just above the PFN, so they
+    /// reach EntryLo and come out as physical address bits 32 and up. All
+    /// ones (no fold) by default; each machine sets its own.
+    pub phys_mask: u64,
     /// `jitcheck`'s hardware-read fixup: `validate_jit_determinism`'s two
     /// passes run at genuinely different real wall-clock speed, so any
     /// device register whose value is driven by host time (e.g. the MC's
@@ -1575,7 +1595,7 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
 /// read differently between `jitcheck`'s two separately-timed passes with no
 /// JIT bug involved. Deliberately not learned/inferred — an address only
 /// belongs here once a live divergence has been manually confirmed benign
-/// (see rules/jitv2/ for the investigation trail). Extend this list as more
+/// (see clanker/jitv2/ for the investigation trail). Extend this list as more
 /// such registers are found; do not add speculative entries.
 #[cfg(feature = "developer")]
 pub(crate) const HW_READ_FIXUP_ADDRS: &[u64] = &[
@@ -1701,7 +1721,7 @@ fn mips_executor_status_cb<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, _ol
 /// `opt_level=speed` optimizer folds it back into the same value (verified:
 /// byte-identical output).
 ///
-/// See `rules/jitv2/callout-arg0-is-core-ptr.md` for the full measurements.
+/// See `clanker/jitv2/callout-arg0-is-core-ptr.md` for the full measurements.
 ///
 /// # Safety
 /// `ctx` must be arg 0 as produced by `codegen::callout_core_arg` — a real,
@@ -2329,7 +2349,7 @@ fn round_f32_to_int_mode(x: f32, rm: u8) -> f32 {
 /// codegen restructuring exposed a case where the JIT observed 0 flags
 /// immediately after a conversion the interpreter, with different
 /// instruction spacing, correctly saw as Invalid/Inexact. See
-/// rules/testing/fpu-exception-model-vs-r4400.md.
+/// clanker/cpu/fpu-exception-model-vs-r4400.md.
 ///
 /// `x` must already be rounded to an integral value via
 /// `round_f32_to_int_mode`/`round_f64_to_int_mode` — this only classifies
@@ -2672,11 +2692,14 @@ macro_rules! step_preamble {
 impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// Create a new executor from a config and a bus (sysad) and a TLB.
     /// The cache hierarchy is constructed internally as a unified R4000Cache.
-    pub fn new(sysad: Arc<dyn BusDevice>, tlb: T, cfg: &MipsCpuConfig) -> Self
+    pub fn new(sysad: Arc<dyn BusDevice>, mut tlb: T, cfg: &MipsCpuConfig) -> Self
     where
         C: From<Arc<dyn BusDevice>>
     {
         let mut core = MipsCore::new();
+        // Mapped pages decode their C field with this model's table, as KSEG0
+        // and xkphys do.
+        tlb.set_cache_attrs(Self::cache_attr_table());
 
         // Cache geometry comes from the model type C, so Config describes this CPU.
         // `mut` is only used by the Triton L2-enable sync below.
@@ -2831,7 +2854,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             #[cfg(feature = "developer")]
             trace_writer: None,
             #[cfg(feature = "llstats")]
-            ll_stats: Box::new([LlSiteStats { key: u32::MAX, ..Default::default() }; LL_STATS_SLOTS]),
+            ll_stats: Box::new([LlSiteStats { key: u64::MAX, ..Default::default() }; LL_STATS_SLOTS]),
             #[cfg(feature = "idle-pause")]
             idle_profiler: IdleProfiler::default(),
             #[cfg(feature = "idle-pause")]
@@ -2929,6 +2952,9 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             // `j2 dispatch on|off` still flips it at runtime.
             #[cfg(feature = "jitv2")]
             jitv2_dispatch_enabled: !matches!(std::env::var("IRIS_JIT_DISPATCH").as_deref(), Ok("off") | Ok("0")),
+            batch_hook: None,
+            phys_alias: None,
+            phys_mask: u64::MAX,
             #[cfg(feature = "developer")]
             hw_read_fixup_replay: None,
             #[cfg(feature = "developer")]
@@ -3061,8 +3087,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // Publish for the async compile worker, which owns its Codegen by
         // value and so cannot be stamped directly (see worker_loop).
         let core_addr = &mut self.core as *mut MipsCore as usize;
+        let geometry_changed;
         {
             let j = self.jitv2.lock();
+            geometry_changed = *j.dc_geometry.lock() != geom && j.pages_used() > 0;
             *j.dc_geometry.lock() = geom;
             // Everything codegen may bake as an immediate reaches its final
             // value here — this method is the last thing that moves any of
@@ -3099,6 +3127,22 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.core.jit_tc_base = self.cache.tcache_base_ptr();
         self.core.jit_tc_gen = self.cache.tcache_gen_ptr();
         self.core.jit_l2_tags = self.cache.jit_l2_tags_ptr();
+        // A cache that changes shape at run time (the O2's hand-over from the
+        // full model to the tagless one once a kernel starts): code compiled
+        // so far probes the old shape, and the compile workers took their
+        // geometry when they started. Flushing discards that code and
+        // restarts the workers, which then read the geometry published
+        // above. Without it, every inline load on the O2 probed the full
+        // model's emptied tags and called out (73M helper calls a second
+        // at idle); going back to the full model on a reboot would also
+        // leave tagless code reading memory under the full model's dirty
+        // lines.
+        if geometry_changed {
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            // Not clear_pcp alone: the fetch nanotlb would still hit, and
+            // nothing would re-derive the page step_jit needs.
+            self.nanotlb_invalidate();
+        }
     }
 
     /// Install JIT v2's memory-access and exception-delivery hooks
@@ -3185,7 +3229,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.tlb.stats_nanotlb_miss(at);
         let result = (self.translate_fn)(self, va, at);
         if !result.is_exception() {
-            self.core.nanotlb[AT as usize].fill_raw(va_page, result.phys as u64, result.status & 0x7);
+            self.core.nanotlb[AT as usize].fill_raw(va_page, result.phys, result.status & 0x7);
             #[cfg(feature = "jitv2")]
             if AT == AccessType::Fetch as u8 {
                 self.jitv2_track_pcp(result.phys);
@@ -3322,7 +3366,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         let arr = if W { NUTLB_WRITE } else { NUTLB_READ };
         let e = &mut self.core.nutlb[arr][idx];
         e.virttag = va & !0xFFF;
-        e.phys    = (result.phys as u64 & !0xFFF) | (result.status & 0x7) as u64;
+        e.phys    = (result.phys & !0xFFF) | (result.status & 0x7) as u64;
         // Tag first, then validity. The order matters only for a reader that
         // could observe the entry between the two stores; nothing does today
         // (single-threaded per core), but publishing validity last is the
@@ -3483,14 +3527,19 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     /// JIT v2: re-derive `self.pcp` if the fetch just landed on a different physical
-    /// page than the one currently tracked (rules/jitv2/jit-v2-design.md §2.1 — PCPs
+    /// page than the one currently tracked (clanker/jitv2/jit-v2-design.md §2.1 — PCPs
     /// are keyed by physical frame, never by VA). Cheap on the common case: same-page
     /// sequential/loop execution never touches the pool or its lookup map, only the
     /// nanotlb hit path above and a single PFN comparison here.
     #[cfg(feature = "jitv2")]
     #[inline(always)]
-    fn jitv2_track_pcp(&mut self, phys_addr: u32) {
-        let pfn = phys_addr / crate::cpu::jitv2::PAGE_SIZE;
+    fn jitv2_track_pcp(&mut self, phys_addr: u64) {
+        // Code above the JIT's pfn map gets no page and runs in the
+        // interpreter (`step_jit` checks for the null page).
+        let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(phys_addr) else {
+            self.clear_pcp();
+            return;
+        };
         let same_page = !self.pcp.is_null() && unsafe { (*self.pcp).pfn == pfn };
         if same_page {
             return;
@@ -3526,7 +3575,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // wants; `page.is_published`/`is_runnable` still handle every
         // other arrival at an already-compiled offset without needing this
         // flag at all.
-        if phys_addr & (crate::cpu::jitv2::PAGE_SIZE - 1) == 0 {
+        if phys_addr & (crate::cpu::jitv2::PAGE_SIZE as u64 - 1) == 0 {
             self.core.jit_trigger = true;
         }
 
@@ -3711,7 +3760,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// cost to the interpreter's per-instruction hot loop.
     pub fn exec(&mut self, instr: u32) -> ExecStatus {
         #[cfg(feature = "jitv2")]
-        self.jitv2_track_pcp(self.core.pc as u32);
+        self.jitv2_track_pcp(self.core.pc & 0xFFFF_FFFF);
         self.ins.raw = instr;
         self.ins.flags = FLAG_NOT_DECODED;
         decode_into::<T, C>(&mut self.ins);
@@ -4007,12 +4056,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// `step_preamble!` only runs via a fallback exit calling `step_int()`
     /// directly — exactly when something (a gate miss, a pending interrupt
     /// caught inline) actually needs the interpreter's real preamble.
-    /// Full dispatch-gate rationale: rules/jitv2/jit-v2-design.md §13.
+    /// Full dispatch-gate rationale: clanker/jitv2/jit-v2-design.md §13.
     #[cfg(feature = "jitv2")]
     pub fn step_jit(&mut self) -> ExecStatus {
         let pc = self.core.pc;
 
-        let fetch = self.fetch_instr(pc);
+        let fetch = self.jit_entry_fetch(pc);
         // Retired AFTER fetch_instr, not before: fetch_instr's own
         // nanotlb_translate is what runs jitv2_track_pcp, the thing that
         // sets `core.jit_trigger = true` on a fresh page's first arrival.
@@ -4021,8 +4070,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // step_jit() call never triggered a compile at all).
         let trigger = self.core.jit_trigger;
         self.core.jit_trigger = false;
-        let result = if fetch.status == EXEC_COMPLETE {
-            assert!(!self.pcp.is_null(), "step_jit reached with no tracked PhysicalCodePage");
+        let result = if fetch.status == EXEC_COMPLETE && self.pcp.is_null() {
+            // Fetched from above the JIT's pfn map (`jitv2_track_pcp`).
+            self.step_int()
+        } else if fetch.status == EXEC_COMPLETE {
             let page = unsafe { &mut *self.pcp };
             let entry_offset = ((pc & 0xFFF) >> 2) as usize;
             'gate: {
@@ -4110,8 +4161,35 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         result
     }
 
+    /// `step_jit`'s fetch at `pc`. Entering compiled code needs the page
+    /// (`self.pcp`) and the offset, not the instruction, and every other way
+    /// out of the gate (`step_int`, an exception from it) fetches for itself.
+    /// So when the cache's fetch changes nothing (`MipsCache::fetch_is_pure`)
+    /// and no breakpoint can match (a `lightning` build), only the
+    /// translation runs: it is what raises a fetch's TLB exceptions and moves
+    /// `self.pcp` onto a new page. A cacheable page then needs no cache
+    /// access; an uncached one goes to the bus as before, its translation
+    /// already in the slot. Profiled, the cache fetch was most of the cost of
+    /// entering compiled code, which calls, syscalls and a GL driver's inner
+    /// loop all do constantly.
+    #[cfg(feature = "jitv2")]
+    #[inline(always)]
+    fn jit_entry_fetch(&mut self, pc: u64) -> FetchInstrResult {
+        if !(cfg!(feature = "lightning") && self.cache.fetch_is_pure()) {
+            return self.fetch_instr(pc);
+        }
+        let t = self.nanotlb_translate::<{ AccessType::Fetch as u8 }>(pc);
+        if t.is_exception() {
+            FetchInstrResult::exception(t.status)
+        } else if t.is_cached() {
+            FetchInstrResult::hit(std::ptr::null())
+        } else {
+            self.fetch_instr(pc)
+        }
+    }
+
     /// Begin recording a per-instruction execution trace to `path`
-    /// (`src/cpu/trace.rs`, rules/jitv2's lockstep verification tooling).
+    /// (`src/cpu/trace.rs`, clanker/jitv2's lockstep verification tooling).
     /// Overwrites any existing file at `path`. No-op-safe to call while
     /// already recording — starts a fresh file, silently dropping (not
     /// flushing) whatever writer was active before, so callers that want a
@@ -4703,10 +4781,22 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     ///
     /// `C::MIPS4` is the model discriminator — R5000 is the MIPS IV part,
     /// R4400 the MIPS III one — matching how the rest of this file selects
-    /// per-model behaviour.
+    /// per-model behaviour. The R10000 is MIPS IV too and has a third table
+    /// (`R10000 UM` Table 4-1), selected by `C::R10K_CACHE_OPS`.
     #[inline]
     pub(crate) fn decode_cache_attr(c: u32) -> u32 {
-        if C::MIPS4 {
+        if C::R10K_CACHE_OPS {
+            // R10000 UM Table 4-1: MIPS IV like the R5000, but its own table.
+            // 4 and 5 are the coherent algorithms, not reserved: the O2's
+            // IRIX runs KSEG0 with K0=5, and reading that as uncached sent
+            // every kernel fetch, load and store to the bus. 7 (uncached
+            // accelerated) only gathers stores; a load is a plain uncached one.
+            match c & 0x7 {
+                3     => TR_CACHEABLE,
+                4 | 5 => TR_CACHEABLE_COH,
+                _     => TR_UNCACHED, // 2 and 7; 0, 1, 6 reserved
+            }
+        } else if C::MIPS4 {
             // VR5000 Table 6-6.
             match c & 0x7 {
                 0 | 1 => TR_CACHEABLE, // write-through -> write-back (see above)
@@ -4721,6 +4811,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 _         => TR_UNCACHED,      // 2 = Uncached; 0,1,7 reserved
             }
         }
+    }
+
+    /// [`Self::decode_cache_attr`] for every C value, for the TLB.
+    pub(crate) fn cache_attr_table() -> [CacheAttr; 8] {
+        std::array::from_fn(|c| match Self::decode_cache_attr(c as u32) {
+            TR_UNCACHED => CacheAttr::Uncached,
+            TR_CACHEABLE => CacheAttr::Cacheable,
+            _ => CacheAttr::CacheableCoherent,
+        })
     }
 
     /// KSEG0's cache attribute, from `Config.K0` (bits 2:0) rather than a
@@ -4867,7 +4966,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
                 // When ERL=1, xuseg becomes unmapped, uncached identity mapping
                 if (self.core.cp0_status & crate::cpu::mips_core::STATUS_ERL) != 0 {
-                    return TranslateResult::ok(virt_addr, TR_UNCACHED);
+                    return TranslateResult::ok(self.fold_phys(virt_addr), TR_UNCACHED);
                 }
 
                 // xuseg: true 64-bit address → xtlb=true
@@ -4890,9 +4989,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 if bits_61_59 >= 2 && bits_61_59 <= 7 {
                     if PRIV == PRIV_KERNEL {
                         let phys_addr = virt_addr & 0x07FF_FFFF_FFFF_FFFF;
-                        // bits_61_59 is the C field directly: 2=Uncached, 3=Cacheable, 5=CacheableCoherent
-                        let c = match bits_61_59 { 3 | 5 => bits_61_59 as u32, _ => TR_UNCACHED };
-                        TranslateResult::ok(phys_addr, c)
+                        // bits_61_59 is the C field, with this model's meaning:
+                        // the Octane's IRIX reaches memory through 0xa000... (C=4).
+                        let c = Self::decode_cache_attr(bits_61_59 as u32);
+                        TranslateResult::ok(self.fold_phys(phys_addr), c)
                     } else {
                         if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                         TranslateResult::exc(exec_exception(if access_type == AccessType::Write { EXC_ADES } else { EXC_ADEL }))
@@ -4945,6 +5045,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
+    /// A CPU physical address as the board decodes it: through
+    /// [`Self::phys_alias`] if it falls in it, then cut to [`Self::phys_mask`].
+    #[inline(always)]
+    fn fold_phys(&self, pa: u64) -> u64 {
+        let pa = match self.phys_alias {
+            Some((base, size, target)) if pa.wrapping_sub(base) < size => pa - base + target,
+            _ => pa,
+        };
+        pa & self.phys_mask
+    }
+
     /// TLB translation.  When `DEBUG` is true, CP0 side-effect registers are
     /// not written on miss/invalid/modified — the exception result is still
     /// returned so the caller knows the translation failed.
@@ -4969,7 +5080,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     // ok_mapped, not ok: this came from the TLB, so the nutlb
                     // fill needs TR_MAPPED plus the entry's G bit to decide
                     // whether to ASID-qualify the tag it stores.
-                    TranslateResult::ok_mapped(phys_addr, cache_attr as u32, global)
+                    TranslateResult::ok_mapped(self.fold_phys(phys_addr), cache_attr as u32, global)
                 }
             }
             TlbResult::Miss { .. } => {
@@ -5097,18 +5208,18 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let phys_addr = translate_result.phys;
         if translate_result.is_cached() {
             #[cfg(not(feature = "lightning"))]
-            if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::PhysFetch as u8 }>(phys_addr as u64) {
+            if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::PhysFetch as u8 }>(phys_addr) {
                 return FetchInstrResult::exception(EXEC_BREAKPOINT);
             }
 
-            let r = self.cache.fetch(virt_addr, phys_addr as u64);
+            let r = self.cache.fetch(virt_addr, phys_addr);
             if !DEBUG && r.status == exec_exception(EXC_VCEI) {
                 self.core.cp0_badvaddr = virt_addr;
             }
             r
         } else {
             #[cfg(not(feature = "lightning"))]
-            if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::PhysFetch as u8 }>(phys_addr as u64) {
+            if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::PhysFetch as u8 }>(phys_addr) {
                 return FetchInstrResult::exception(EXEC_BREAKPOINT);
             }
 
@@ -5171,7 +5282,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         };
         if translate_result.is_exception() { return Err(translate_result.status); }
         let result = {
-            let phys_addr = translate_result.phys as u64;
+            let phys_addr = translate_result.phys;
             let is_cached = translate_result.is_cached();
 
             if is_cached {
@@ -5218,16 +5329,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
                     let res = {
                         let r = if SIZE == 1 {
-                            let r = self.sysad.read8(phys_addr as u32);
+                            let r = self.sysad.read8(phys_addr);
                             BusRead64 { status: r.status, data: r.data as u64 }
                         } else if SIZE == 2 {
-                            let r = self.sysad.read16(phys_addr as u32);
+                            let r = self.sysad.read16(phys_addr);
                             BusRead64 { status: r.status, data: r.data as u64 }
                         } else if SIZE == 4 {
-                            let r = self.sysad.read32(phys_addr as u32);
+                            let r = self.sysad.read32(phys_addr);
                             BusRead64 { status: r.status, data: r.data as u64 }
                         } else {
-                            self.sysad.read64(phys_addr as u32)
+                            self.sysad.read64(phys_addr)
                         };
                         if r.is_ok() {
                             Ok(r.data)
@@ -5295,7 +5406,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         {
             self.core.lockstep_mem = result.ok().map(|val| crate::cpu::mips_core::LockstepMemCapture {
                 addr: virt_addr,
-                phys: translate_result.phys as u64,
+                phys: translate_result.phys,
                 value: val,
             });
         }
@@ -5350,7 +5461,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.nanotlb_translate::<{AccessType::Write as u8}>(virt_addr)
         };
         if translate_result.is_exception() { return translate_result.status; }
-        let phys_addr = translate_result.phys as u64;
+        let phys_addr = translate_result.phys;
         let is_cached = translate_result.is_cached();
 
         // Diagnostic (`jitv2_smc_check`): is this write landing on the code
@@ -5398,13 +5509,13 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 dlog_dev!(LogModule::Mips, "Uncached Write{}: PC={:016x} VA={:016x} PA={:016x} Val={:016x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val);
             }
             let ws = if SIZE == 1 {
-                self.sysad.write8(phys_addr as u32, val as u8)
+                self.sysad.write8(phys_addr, val as u8)
             } else if SIZE == 2 {
-                self.sysad.write16(phys_addr as u32, val as u16)
+                self.sysad.write16(phys_addr, val as u16)
             } else if SIZE == 4 {
-                self.sysad.write32(phys_addr as u32, val as u32)
+                self.sysad.write32(phys_addr, val as u32)
             } else {
-                self.sysad.write64(phys_addr as u32, val)
+                self.sysad.write64(phys_addr, val)
             };
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
                 eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws);
@@ -5443,7 +5554,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.nanotlb_translate::<{AccessType::Write as u8}>(virt_addr)
         };
         if translate_result.is_exception() { return translate_result.status; }
-        let phys_addr = translate_result.phys as u64;
+        let phys_addr = translate_result.phys;
         let is_cached = translate_result.is_cached();
 
         #[cfg(not(feature = "lightning"))]
@@ -5461,7 +5572,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             if !DEBUG && mips_log(MIPS_LOG_MEM) {
                 dlog_dev!(LogModule::Mips, "Uncached Write64Masked: PC={:016x} VA={:016x} PA={:016x} Val={:016x} Mask={:016x}", self.core.pc, virt_addr, phys_addr, val, mask);
             }
-            let ws = self.sysad.write64_masked(phys_addr as u32, val, mask);
+            let ws = self.sysad.write64_masked(phys_addr, val, mask);
             if ws != BUS_OK && ws != BUS_BUSY && !DEBUG {
                 eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}", self.core.pc, virt_addr, phys_addr, val, mask, ws);
             }
@@ -6879,7 +6990,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             // Hit operations need address translation
             let tr = self.nanotlb_translate::<{AccessType::Read as u8}>(virt_addr);
             if tr.is_exception() { return self.handle_exception(tr.status); }
-            tr.phys as u64
+            tr.phys
         } else {
             // Index operations use virt_addr as index, no translation needed
             virt_addr
@@ -6976,7 +7087,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     // LL - Load Linked (32-bit)
     /// `ll stats` bookkeeping: a reservation was just taken at `lladdr`.
     #[inline]
-    fn ll_stat_ll(&mut self, #[allow(unused_variables)] lladdr: u32) {
+    fn ll_stat_ll(&mut self, #[allow(unused_variables)] lladdr: u64) {
         #[cfg(feature = "llstats")]
         { ll_stats_slot(&mut self.ll_stats, lladdr).ll += 1; }
     }
@@ -7015,10 +7126,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 // Sign-extend word to 64 bits
                 self.core.write_gpr(rt_reg, value as i32 as i64 as u64);
                 // Store physical address in LLAddr register
-                // The LLAddr register stores bits 35..4 of the physical address
+                // LLAddr holds PA[PA_BITS-1:4]: 35:4 on the R4x00/R5000, 39:4 on the R10000
                 let tr = self.nanotlb_translate::<{AccessType::Read as u8}>(virt_addr);
                 if !tr.is_exception() {
-                    let lladdr = (tr.phys >> 4) as u32;
+                    let lladdr = (tr.phys >> 4) & C::LLADDR_MASK;
                     self.cache.set_lladdr(lladdr);
                     self.core.cp0_lladdr = lladdr;
                     self.cache.set_llbit(true);
@@ -7086,7 +7197,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 // Store physical address in LLAddr register
                 let tr = self.nanotlb_translate::<{AccessType::Read as u8}>(virt_addr);
                 if !tr.is_exception() {
-                    let lladdr = (tr.phys >> 4) as u32;
+                    let lladdr = (tr.phys >> 4) & C::LLADDR_MASK;
                     self.cache.set_lladdr(lladdr);
                     self.core.cp0_lladdr = lladdr;
                     self.cache.set_llbit(true);
@@ -7296,6 +7407,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // Cold path (a handful per context switch), so the unconditional
         // flush costs nothing measurable. See `exec_tlbr` for the other
         // ASID-mutating site, and docs/nutlb-design.md §1a.
+        // LLAddr implements PA[PA_BITS-1:4]; the bits above read as zero.
+        if reg == 17 {
+            self.core.cp0_lladdr &= C::LLADDR_MASK;
+        }
         if reg == 10 {
             // Flushes the nutlb too — its tags carry no ASID, so entries
             // filled under the old one would otherwise stay live and resolve
@@ -7341,7 +7456,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.cache.set_cache_ecc(self.core.cp0_ecc);
         }
         if reg == 26 && self.cheritest_dump_hook {
-            self.sysad.write32(crate::dev::testdev::TEST_DEV_BASE + crate::dev::testdev::REG_DUMP,
+            self.sysad.write32((crate::dev::testdev::TEST_DEV_BASE + crate::dev::testdev::REG_DUMP) as u64,
                                self.core.cp0_ecc);
         }
         #[cfg(feature = "r5ksc_triton")]
@@ -7826,7 +7941,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     /// After a FPU arithmetic op has computed its result but *before* it is
     /// committed: fold in caller-computed exception flags (never read from
-    /// the host FPU — see `rules/jitv2/fpu-flags-are-computed-not-read.md`),
+    /// the host FPU — see `clanker/jitv2/fpu-flags-are-computed-not-read.md`),
     /// update FCSR cause bits, and either commit the result (calling
     /// `write_result`) and raise EXC_FPE if any enabled exception fired, or
     /// — if trapping — leave the destination register and the sticky Flag
@@ -7859,7 +7974,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// since only the caller knows the result's type/width. Implements the
     /// R4000/VR5000 manuals' full Table 9-1/7-1 Underflow rule (both manuals
     /// are word-for-word identical here — see
-    /// rules/testing/fpu-exception-model-vs-r4400.md): a denormalized result
+    /// clanker/cpu/fpu-exception-model-vs-r4400.md): a denormalized result
     /// is never delivered by hardware. With FS clear, or with FS set but
     /// Underflow/Inexact trapping enabled, it is an Unimplemented Operation
     /// (E) instead — E has no Enable/Flag bit and always traps, and per the
@@ -7955,7 +8070,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// Flags [6:2] for ADD/SUB/MUL (S or D): Invalid if either operand is a
     /// signalling NaN (the case `fpu_check_denorm_operand_s/d`'s qNaN check
     /// doesn't catch), else 0 — feeds `fpu_update_fcsr`/`_full`. See
-    /// `rules/jitv2/fpu-flags-are-computed-not-read.md`.
+    /// `clanker/jitv2/fpu-flags-are-computed-not-read.md`.
     #[inline]
     fn fpu_arith_flags_snan_only_s(fs_bits: u32, ft_bits: u32) -> u32 {
         if is_snan_s(fs_bits) || is_snan_s(ft_bits) { FCSR_FV } else { 0 }
@@ -9169,7 +9284,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// the caller, one way or another — never falls through.
     #[cfg(feature = "jitv2")]
     /// Synchronous compile-and-run for `jitv2_inline_compile = true`.
-    /// Full rationale: rules/jitv2/jit-v2-design.md §13.4.
+    /// Full rationale: clanker/jitv2/jit-v2-design.md §13.4.
     fn jitv2_compile_inline(&mut self, req: crate::cpu::jitv2::CompileRequest, trigger: bool) -> ExecStatus {
         let page = unsafe { &mut *self.pcp };
         // Check arena growth BEFORE compiling — flush_from_cpu_thread
@@ -9181,7 +9296,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             let phys_page_base = page.pfn * crate::cpu::jitv2::PAGE_SIZE;
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
             self.clear_pcp();
-            self.jitv2_track_pcp(phys_page_base);
+            self.jitv2_track_pcp(phys_page_base as u64);
             return EXEC_RETRY;
         }
         let mut codegen = self.jitv2.lock().codegen.lock().take();
@@ -9217,7 +9332,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             let phys_page_base = page.pfn * crate::cpu::jitv2::PAGE_SIZE;
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
             self.clear_pcp();
-            self.jitv2_track_pcp(phys_page_base);
+            self.jitv2_track_pcp(phys_page_base as u64);
             return EXEC_RETRY;
         }
         // Re-check is_runnable: handle_request can decline this exact
@@ -9627,7 +9742,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if translate_result.is_exception() {
             return JitReadResult { val: 0, status: translate_result.status };
         }
-        let phys = translate_result.phys as u64;
+        let phys = translate_result.phys;
         if va != captured.addr || phys != captured.phys {
             eprintln!("\n=== jitv2_lockstep DIVERGENCE at pc={:#018x}: read address mismatch ===", self.core.pc);
             eprintln!("  va   jit={:#018x}  interp={:#018x}", va, captured.addr);
@@ -9663,7 +9778,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if translate_result.is_exception() {
             return translate_result.status;
         }
-        let phys = translate_result.phys as u64;
+        let phys = translate_result.phys;
         let mask: u64 = if SIZE == 8 { u64::MAX } else { (1u64 << (SIZE * 8)) - 1 };
         let jit_masked = val & mask;
         let interp_masked = captured.value & mask;
@@ -9775,7 +9890,7 @@ impl LockstepSnapshot {
         // round-to-integer idiom (software %/÷ by constants) is acutely
         // sensitive to this: one ULP of rounding difference flips the integer.
         // The FR-pointer analogue of this is documented in
-        // `rules/jitv2/codegen-gotchas.md`.
+        // `clanker/jitv2/codegen-gotchas.md`.
         crate::platform::set_fpu_mode((self.fcsr & 0x3) as u8);
         // That FR-pointer analogue, closed: the direct `cp0_status` write above equally
         // bypasses the path that re-derives `translate_fn` and the fpr accessors, so a
@@ -9894,7 +10009,7 @@ fn lockstep_classify(raw: u32) -> LockstepClass {
 }
 
 /// True if `next_raw` is one of the fusable load/store opcodes (LB/LBU/LH/LHU/
-/// LW/LD/SB/SH/SW/SD — see rules/perf/ notes on the addr-calc+load/store
+/// LW/LD/SB/SH/SW/SD — see clanker/perf/ notes on the addr-calc+load/store
 /// fusion) using `addr_reg` as its base register (`rs` field). Any offset is
 /// fine — the fused handler reads the load/store's own offset field exactly
 /// like the unfused path does; only ADDU/SUBU/ADDIU are fusable producers
@@ -10397,7 +10512,7 @@ fn invalidate_loaded_range<T: Tlb, C: CpuModel>(exec: &mut MipsExecutor<T, C>, v
     while addr < end {
         let tr = exec.debug_translate(addr);
         if !tr.is_exception() {
-            let phys = tr.phys as u64;
+            let phys = tr.phys;
             exec.cache.cache_op(C_HWBINV | CACH_PD, addr, phys);
             exec.cache.cache_op(C_HWBINV | CACH_SD, addr, phys);
             exec.cache.cache_op(C_HINV | CACH_PI, addr, phys);
@@ -11437,18 +11552,18 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             //let mut last_time = std::time::Instant::now();
             // --- end perf sampling ---
 
-            // Idle detection + park state (see rules/perf/idle-pause-work.md). Compiled
+            // Idle detection + park state (see clanker/perf/idle-pause-work.md). Compiled
             // in only with the `idle-pause` feature (off by default; opt in with
             // --features idle-pause). When compiled in, set IRIS_NO_IDLE to keep
             // spinning the host CPU at runtime (for benchmarking/debug).
             //
-            // We only park when the architectural state (PC + all GPRs) REPEATS
-            // across batches. A polling/idle loop (e.g. the kernel idle loop
-            // waiting on the run queue) cycles through the same states and exits
-            // only on an interrupt — safe to park. A busy-delay loop (e.g. IRIX
-            // DELAY(): `bgezl v1,-1; subu v1,v1,v0`) changes a counter every
-            // iteration, so its state never repeats — we must NOT park it or
-            // boot stalls. The state-repeat test distinguishes the two.
+            // The detector samples the PC once per 32 sample calls (about 320
+            // instructions in the batch loop) and parks only when the execution
+            // stayed inside one long, narrow, kernel code window with
+            // interrupts enabled and nothing pending. Short poll/delay loops
+            // (2-3 instructions) are rejected by the window's minimum span and
+            // distinct-PC count; user-mode code is never parked. See
+            // src/cpu/idle_park.rs.
             #[cfg(feature = "idle-pause")]
             let mut idle_state = crate::cpu::idle_park::IdleParkState::default();
 
@@ -11482,12 +11597,16 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         for _ in 0..1000 {
                             guard.step_jit(); guard.step_jit(); guard.step_jit(); guard.step_jit(); guard.step_jit();
                             guard.step_jit(); guard.step_jit(); guard.step_jit(); guard.step_jit(); guard.step_jit();
+                            #[cfg(feature = "idle-pause")]
+                            idle_state.sample(&guard.core);
                         }
                     } else {
                         // is this going to be a problem for netbsd?
                         for _ in 0..1000 {
                             guard.step_int(); guard.step_int(); guard.step_int(); guard.step_int(); guard.step_int();
                             guard.step_int(); guard.step_int(); guard.step_int(); guard.step_int(); guard.step_int();
+                            #[cfg(feature = "idle-pause")]
+                            idle_state.sample(&guard.core);
                         }
                                                  
                     }
@@ -11498,6 +11617,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         ($step:ident) => {
                             for _ in 0..1000 {
                                 let status = guard.$step();
+                                #[cfg(feature = "idle-pause")]
+                                idle_state.sample(&guard.core);
                                 match status {
                                     EXEC_BREAKPOINT => {
                                         running.store(false, Ordering::SeqCst);
@@ -11521,14 +11642,31 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     #[cfg(not(feature = "jitv2"))]
                     run_batch!(step_int);
                 }
+                if let Some(mut hook) = guard.batch_hook.take() {
+                    hook(&mut guard);
+                    guard.batch_hook = Some(hook);
+                }
                 #[cfg(feature = "idle-pause")]
-                if crate::cpu::idle_park::idle_park_enabled() && idle_state.update(&guard.core) {
-                    drop(guard);
-                    {
-                        let mut guard = executor.lock();
-                        idle_state.park(&mut guard.core, &running);
+                if crate::cpu::idle_park::idle_park_enabled() {
+                    match idle_state.update(&guard.core) {
+                        crate::cpu::idle_park::IdleDecision::Park => {
+                            drop(guard);
+                            {
+                                let mut guard = executor.lock();
+                                idle_state.park(&mut guard.core, &running);
+                            }
+                            guard = executor.lock();
+                        }
+                        crate::cpu::idle_park::IdleDecision::Pace => {
+                            drop(guard);
+                            {
+                                let mut guard = executor.lock();
+                                idle_state.pace(&mut guard.core, &running);
+                            }
+                            guard = executor.lock();
+                        }
+                        crate::cpu::idle_park::IdleDecision::None => {}
                     }
-                    guard = executor.lock();
                 }
                 // --- end idle park ---
                 // --- perf sampling (comment out to disable) ---
@@ -11627,7 +11765,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("ex".to_string(), "Alias for exception".to_string()),
             ("undo".to_string(), "Undo N instructions or control undo buffer: undo [count] | undo <on|off|clear|resize <n>> [DEV]".to_string()),
             ("dt".to_string(), "Disassemble traceback: dt [count] | dt file <path> [count]".to_string()),
-            ("idleprof".to_string(), "Locate idle/spin loops via PC sampling: idleprof <on|off|report [count]>".to_string()),
+            ("idleprof".to_string(), "Locate idle/spin loops: idleprof <on|off|report [count]|stats>".to_string()),
+            #[cfg(feature = "idle-pause")]
+            ("idle".to_string(), "Idle parking: idle <on|off|status>".to_string()),
             #[cfg(feature = "instr_stats")]
             ("instrstats".to_string(), "Per-instruction decode/execution counters: instrstats [report|clear|dump] [DEV]".to_string()),
             ("u".to_string(), "Alias for undo [DEV]".to_string()),
@@ -12042,7 +12182,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 if tr.is_exception() {
                     return Err(format!("Virtual {:016x} -> Translation Failed", addr));
                 }
-                (Some(addr), tr.phys as u64)
+                (Some(addr), tr.phys)
             };
 
             let n = exec.cache.writeback(virt_addr, phys_addr, size);
@@ -12068,7 +12208,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             let (virt_addr, phys_addr) = if (op == "check" || op == "probe") && val >= 0x8000_0000 {
                 let tr = exec.debug_translate(val);
                 if !tr.is_exception() {
-                    let pa = tr.phys as u64;
+                    let pa = tr.phys;
                     writeln!(writer, "Virtual {:016x} -> Physical {:016x}", val, pa).unwrap();
                     (val, pa)
                 } else {
@@ -12862,21 +13002,21 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     match actual_args.first().copied() {
                         Some("clear") => {
                             for e in exec.ll_stats.iter_mut() {
-                                *e = LlSiteStats { key: u32::MAX, ..Default::default() };
+                                *e = LlSiteStats { key: u64::MAX, ..Default::default() };
                             }
                             writeln!(writer, "ll stats cleared").unwrap();
                             return Ok(());
                         }
                         Some("stats") => {
-                            if exec.ll_stats.iter().all(|e| e.key == u32::MAX) {
+                            if exec.ll_stats.iter().all(|e| e.key == u64::MAX) {
                                 writeln!(writer, "ll stats: no LL/SC activity recorded").unwrap();
                                 return Ok(());
                             }
                             // Worst max_run first: a kernel LL/SC loop that
                             // cannot make progress is the thing being hunted,
                             // and it sorts straight to the top.
-                            let mut rows: Vec<(u32, LlSiteStats)> = exec.ll_stats.iter()
-                                .filter(|e| e.key != u32::MAX)
+                            let mut rows: Vec<(u64, LlSiteStats)> = exec.ll_stats.iter()
+                                .filter(|e| e.key != u64::MAX)
                                 .map(|e| (e.key, *e))
                                 .collect();
                             // Lead with reservations that were never resolved:
@@ -13520,7 +13660,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         let mut words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
                         for (i, w) in words.iter_mut().enumerate() {
                             let a = page_base_phys + (i as u32) * 4;
-                            let r = exec.sysad.read32(a);
+                            let r = exec.sysad.read32(a as u64);
                             if !r.is_ok() {
                                 return Err(format!("failed to read word at phys {:#010x} (offset {:#x} into page)", a, i * 4));
                             }
@@ -13588,7 +13728,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             if result.is_exception() {
                                 return Err(format!("{:#018x} doesn't translate", pc));
                             }
-                            let pfn = result.phys / crate::cpu::jitv2::PAGE_SIZE;
+                            let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(result.phys) else {
+                                return Err(format!("phys {:#x} is above the JIT's physical range", result.phys));
+                            };
                             let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
                             let sysad = exec.sysad.clone();
                             let mut jit = exec.jitv2.lock();
@@ -13728,8 +13870,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 writeln!(writer, "No PhysicalCodePage tracked (self.pcp is null) and PC {:#018x} doesn't translate.", pc).unwrap();
                                 return Ok(());
                             }
-                            let phys_addr = result.phys;
-                            let pfn = phys_addr / crate::cpu::jitv2::PAGE_SIZE;
+                            let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(result.phys) else {
+                                writeln!(writer, "No PhysicalCodePage tracked (self.pcp is null) and PC {:#018x} is at phys {:#x}, above the JIT's physical range.", pc, result.phys).unwrap();
+                                return Ok(());
+                            };
                             let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
                             let sysad = exec.sysad.clone();
                             let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
@@ -14383,6 +14527,43 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 Ok(())
             }
             #[cfg(feature = "idle-pause")]
+            "idle" => {
+                let sub = actual_args.first().copied().unwrap_or("status");
+                match sub {
+                    "on" => {
+                        crate::cpu::idle_park::set_idle_park_enabled(true);
+                        writeln!(writer, "idle: parking enabled").unwrap();
+                    }
+                    "off" => {
+                        crate::cpu::idle_park::set_idle_park_enabled(false);
+                        writeln!(writer, "idle: parking disabled").unwrap();
+                    }
+                    "status" => {
+                        use std::sync::atomic::Ordering::Relaxed as R;
+                        let n = crate::cpu::idle_park::PARK_COUNT.load(R);
+                        let ns = crate::cpu::idle_park::PARK_SLEEP_NS.load(R);
+                        let irq = crate::cpu::idle_park::PARK_WAKE_IRQ.load(R);
+                        let other = crate::cpu::idle_park::PARK_WAKE_OTHER.load(R);
+                        writeln!(writer, "idle: {}  parks={} slept={:.3}s wake_irq={} wake_other={}",
+                            if crate::cpu::idle_park::idle_park_enabled() { "on" } else { "off" },
+                            n, ns as f64 / 1e9, irq, other).unwrap();
+                        writeln!(writer, "  updates={} full={} largest={} distinct={}",
+                            crate::cpu::idle_park::UPDATES.load(R),
+                            crate::cpu::idle_park::WINDOW_FULL.load(R),
+                            crate::cpu::idle_park::WINDOW_SAMPLES.load(R),
+                            crate::cpu::idle_park::WINDOW_DISTINCT.load(R)).unwrap();
+                        writeln!(writer, "  resets: irq={} ip={} im0={} ie0={} user={}",
+                            crate::cpu::idle_park::RESET_IRQ.load(R),
+                            crate::cpu::idle_park::RESET_IP.load(R),
+                            crate::cpu::idle_park::RESET_IM0.load(R),
+                            crate::cpu::idle_park::RESET_IE0.load(R),
+                            crate::cpu::idle_park::RESET_USER.load(R)).unwrap();
+                    }
+                    _ => return Err("Usage: idle <on|off|status>".to_string()),
+                }
+                Ok(())
+            }
+            #[cfg(feature = "idle-pause")]
             "idleprof" => {
                 let sub = actual_args.first().copied().unwrap_or("report");
                 match sub {
@@ -14399,7 +14580,16 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         let mut exec = self.try_lock_executor()?;
                         exec.idle_profile_report(count, &mut writer);
                     }
-                    _ => return Err("Usage: idleprof <on | off | report [count]>".to_string()),
+                    "stats" => {
+                        use std::sync::atomic::Ordering;
+                        let n = crate::cpu::idle_park::PARK_COUNT.load(Ordering::Relaxed);
+                        let ns = crate::cpu::idle_park::PARK_SLEEP_NS.load(Ordering::Relaxed);
+                        let irq = crate::cpu::idle_park::PARK_WAKE_IRQ.load(Ordering::Relaxed);
+                        let other = crate::cpu::idle_park::PARK_WAKE_OTHER.load(Ordering::Relaxed);
+                        writeln!(writer, "idleprof: parks={} slept={:.3}s wake_irq={} wake_other={}",
+                            n, ns as f64 / 1e9, irq, other).unwrap();
+                    }
+                    _ => return Err("Usage: idleprof <on | off | report [count] | stats>".to_string()),
                 }
                 Ok(())
             }
@@ -14816,7 +15006,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         // state, and must be reset on load.
         cp0u64!(count_hz);
         cp0u32!(cp0_status); cp0u32!(cp0_cause);
-        cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u32!(cp0_lladdr);
+        cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u64!(cp0_lladdr);
         cp0u32!(cp0_watchlo); cp0u32!(cp0_watchhi); cp0u32!(cp0_ecc); cp0u32!(cp0_cacheerr);
         cp0u64!(cp0_taglo); cp0u32!(cp0_taghi);
         cp0u64!(cp0_badvaddr); cp0u64!(cp0_epc); cp0u64!(cp0_errorepc);
@@ -14882,15 +15072,15 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             // thread) so the live UI matches the restored core state.
             c.count_hz_atomic.store(c.count_hz, std::sync::atomic::Ordering::Relaxed);
             ld32!(cp0_status); ld32!(cp0_cause); ld32!(cp0_prid);
-            ld32!(cp0_config); ld32!(cp0_lladdr); ld32!(cp0_watchlo); ld32!(cp0_watchhi);
+            ld32!(cp0_config); ld64!(cp0_lladdr); ld32!(cp0_watchlo); ld32!(cp0_watchhi);
             ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld64!(cp0_taglo); ld32!(cp0_taghi);
             ld64!(cp0_entrylo0); ld64!(cp0_entrylo1); ld64!(cp0_context);
             ld64!(cp0_pagemask); ld64!(cp0_badvaddr); ld64!(cp0_entryhi);
             ld64!(cp0_xcontext); ld64!(cp0_epc); ld64!(cp0_errorepc);
             // Restart the virtual count from the restored value and re-arm
             // the compare timer — Instants from the previous run are
-            // meaningless here.
-            c.reanchor_count_and_reschedule();
+            // meaningless here — with a live ticket for the restored deadline.
+            c.restore_compare_deadline();
         }
 
         if let Some(fpu) = get_field(v, "fpu") {
@@ -14912,6 +15102,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
 
         if let Some(cache_v) = get_field(v, "cache") {
             exec.cache.load_cache_state(cache_v)?;
+            // A cache whose live model is part of its state (the O2's
+            // hand-over) can come back on another model than the one compiled
+            // code reaches through: publish the live one's pointers again.
+            #[cfg(feature = "jitv2")]
+            exec.install_jit_mem_ptrs();
         }
 
         // cp0_status was restored above by direct field write, so translate_fn and the

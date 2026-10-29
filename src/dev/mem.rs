@@ -28,8 +28,8 @@ pub struct Memory {
     size_words: usize,
     /// Byte mask applied to addr for indexing. Initialized to mem_size_bytes-1.
     /// Always kept masked to mem_size_bytes-1 so it can never exceed the buffer.
-    addr_mask: u32,
-    /// JIT v2: one generation counter per 4KB physical page (rules/jitv2/jit-v2-design.md
+    addr_mask: u64,
+    /// JIT v2: one generation counter per 4KB physical page (clanker/jitv2/jit-v2-design.md
     /// §2.4, §7). Bumped atomically on every write to that page. A compiled artifact for
     /// a page is valid iff its recorded generation still matches this counter (§4.1, §6.5).
     #[cfg(feature = "jitv2")]
@@ -52,7 +52,7 @@ impl Memory {
         Self {
             data: UnsafeCell::new(vec![0u32; size_words]),
             size_words,
-            addr_mask: (size_bytes - 1) as u32,
+            addr_mask: (size_bytes - 1) as u64,
             #[cfg(feature = "jitv2")]
             gen: (0..size_bytes.div_ceil(JITV2_PAGE_SIZE)).map(|_| AtomicU64::new(0)).collect(),
         }
@@ -60,10 +60,10 @@ impl Memory {
 
     /// JIT v2: bump the generation counter for the page containing `addr` (post-mask).
     /// Must be called on every mutating access so a compiled artifact can detect
-    /// staleness (rules/jitv2/jit-v2-design.md §7 — "gen bumps ride on the RAM write").
+    /// staleness (clanker/jitv2/jit-v2-design.md §7 — "gen bumps ride on the RAM write").
     #[cfg(feature = "jitv2")]
     #[inline(always)]
-    fn bump_gen(&self, addr: u32) {
+    fn bump_gen(&self, addr: u64) {
         let page = ((addr & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
         // Relaxed: the publish-side gen re-check (§6.5) re-reads this counter after its
         // own release fetch_or on entry_bits, so ordering is provided there, not here.
@@ -75,7 +75,7 @@ impl Memory {
     /// is valid for the lifetime of `&self` (the `gen` vec is never resized after `new`).
     #[cfg(feature = "jitv2")]
     #[inline]
-    pub fn gen_ptr(&self, addr: u32) -> *const AtomicU64 {
+    pub fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
         let page = ((addr & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
         &self.gen[page] as *const AtomicU64
     }
@@ -83,8 +83,8 @@ impl Memory {
     /// Set a new address mask. The provided mask is AND-ed with `mem_size_bytes-1`
     /// so it can never address outside the buffer.
     pub fn set_addr_mask(&mut self, mask: u32) {
-        let size_mask = (self.size_words * 4 - 1) as u32;
-        self.addr_mask = mask & size_mask;
+        let size_mask = (self.size_words * 4 - 1) as u64;
+        self.addr_mask = mask as u64 & size_mask;
     }
 
     #[inline(always)]
@@ -160,7 +160,7 @@ impl Resettable for Memory {
 
 impl BusDevice for Memory {
     #[inline(always)]
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn read8(&self, addr: u64) -> BusRead8 {
         unsafe {
             let data = self.data();
             let byte_ptr = data.as_ptr() as *const u8;
@@ -171,7 +171,7 @@ impl BusDevice for Memory {
     }
 
     #[inline(always)]
-    fn write8(&self, addr: u32, val: u8) -> u32 {
+    fn write8(&self, addr: u64, val: u8) -> u32 {
         unsafe {
             let data = self.data();
             let byte_ptr = data.as_mut_ptr() as *mut u8;
@@ -184,7 +184,7 @@ impl BusDevice for Memory {
     }
 
     #[inline(always)]
-    fn read16(&self, addr: u32) -> BusRead16 {
+    fn read16(&self, addr: u64) -> BusRead16 {
         unsafe {
             let data = self.data();
             let half_ptr = data.as_ptr() as *const u16;
@@ -195,7 +195,7 @@ impl BusDevice for Memory {
     }
 
     #[inline(always)]
-    fn write16(&self, addr: u32, val: u16) -> u32 {
+    fn write16(&self, addr: u64, val: u16) -> u32 {
         unsafe {
             let data = self.data();
             let half_ptr = data.as_mut_ptr() as *mut u16;
@@ -208,7 +208,7 @@ impl BusDevice for Memory {
     }
 
     #[inline(always)]
-    fn read32(&self, addr: u32) -> BusRead32 {
+    fn read32(&self, addr: u64) -> BusRead32 {
         unsafe {
             let data = self.data();
             let idx = ((addr & self.addr_mask) >> 2) as usize;
@@ -217,7 +217,7 @@ impl BusDevice for Memory {
     }
 
     #[inline(always)]
-    fn write32(&self, addr: u32, val: u32) -> u32 {
+    fn write32(&self, addr: u64, val: u32) -> u32 {
         unsafe {
             let data = self.data();
             let idx = ((addr & self.addr_mask) >> 2) as usize;
@@ -229,7 +229,7 @@ impl BusDevice for Memory {
     }
 
     #[inline(always)]
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn read64(&self, addr: u64) -> BusRead64 {
         unsafe {
             let data = self.data();
             let qword_ptr = data.as_ptr() as *const u64;
@@ -240,7 +240,7 @@ impl BusDevice for Memory {
     }
 
     #[inline(always)]
-    fn write64(&self, addr: u32, val: u64) -> u32 {
+    fn write64(&self, addr: u64, val: u64) -> u32 {
         unsafe {
             let data = self.data();
             let qword_ptr = data.as_mut_ptr() as *mut u64;
@@ -253,7 +253,7 @@ impl BusDevice for Memory {
     }
 
     #[inline]
-    fn mem_ptr(&self, addr: u32) -> Option<*const u64> {
+    fn mem_ptr(&self, addr: u64) -> Option<*const u64> {
         unsafe {
             let data = self.data();
             let qword_ptr = data.as_ptr() as *const u64;
@@ -262,7 +262,7 @@ impl BusDevice for Memory {
     }
 
     #[inline]
-    fn read_block(&self, addr: u32, buf: &mut [u64]) -> u32 {
+    fn read_block(&self, addr: u64, buf: &mut [u64]) -> u32 {
         unsafe {
             let data = self.data();
             let qword_ptr = data.as_ptr() as *const u64;
@@ -275,7 +275,7 @@ impl BusDevice for Memory {
     }
 
     #[inline]
-    fn write_block(&self, addr: u32, buf: &[u64]) -> u32 {
+    fn write_block(&self, addr: u64, buf: &[u64]) -> u32 {
         unsafe {
             let data = self.data();
             let qword_ptr = data.as_mut_ptr() as *mut u64;
@@ -289,7 +289,7 @@ impl BusDevice for Memory {
         #[cfg(feature = "jitv2")]
         {
             let start_page = ((addr & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
-            let last_byte = addr.wrapping_add(((buf.len().max(1) - 1) as u32) * 8);
+            let last_byte = addr.wrapping_add((buf.len().max(1) - 1) as u64 * 8);
             let end_page = ((last_byte & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
             if end_page >= start_page {
                 for page in start_page..=end_page {
@@ -309,7 +309,7 @@ impl BusDevice for Memory {
     }
 
     #[inline(always)]
-    fn write64_masked(&self, addr: u32, val: u64, mask: u64) -> u32 {
+    fn write64_masked(&self, addr: u64, val: u64, mask: u64) -> u32 {
         unsafe {
             let data = self.data();
             let qword_ptr = data.as_mut_ptr() as *mut u64;
@@ -328,59 +328,59 @@ impl BusDevice for Memory {
 
     #[cfg(feature = "jitv2")]
     #[inline]
-    fn gen_ptr(&self, addr: u32) -> *const AtomicU64 {
+    fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
         Memory::gen_ptr(self, addr)
     }
 }
 
 // Implement BusDevice for Arc<Memory> to allow using Arc-wrapped memory directly
 impl BusDevice for Arc<Memory> {
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn read8(&self, addr: u64) -> BusRead8 {
         (**self).read8(addr)
     }
 
-    fn write8(&self, addr: u32, val: u8) -> u32 {
+    fn write8(&self, addr: u64, val: u8) -> u32 {
         (**self).write8(addr, val)
     }
 
-    fn read16(&self, addr: u32) -> BusRead16 {
+    fn read16(&self, addr: u64) -> BusRead16 {
         (**self).read16(addr)
     }
 
-    fn write16(&self, addr: u32, val: u16) -> u32 {
+    fn write16(&self, addr: u64, val: u16) -> u32 {
         (**self).write16(addr, val)
     }
 
-    fn read32(&self, addr: u32) -> BusRead32 {
+    fn read32(&self, addr: u64) -> BusRead32 {
         (**self).read32(addr)
     }
 
-    fn write32(&self, addr: u32, val: u32) -> u32 {
+    fn write32(&self, addr: u64, val: u32) -> u32 {
         (**self).write32(addr, val)
     }
 
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn read64(&self, addr: u64) -> BusRead64 {
         (**self).read64(addr)
     }
 
-    fn write64(&self, addr: u32, val: u64) -> u32 {
+    fn write64(&self, addr: u64, val: u64) -> u32 {
         (**self).write64(addr, val)
     }
 
-    fn write64_masked(&self, addr: u32, val: u64, mask: u64) -> u32 {
+    fn write64_masked(&self, addr: u64, val: u64, mask: u64) -> u32 {
         (**self).write64_masked(addr, val, mask)
     }
 
-    fn read_block(&self, addr: u32, buf: &mut [u64]) -> u32 {
+    fn read_block(&self, addr: u64, buf: &mut [u64]) -> u32 {
         (**self).read_block(addr, buf)
     }
 
-    fn write_block(&self, addr: u32, buf: &[u64]) -> u32 {
+    fn write_block(&self, addr: u64, buf: &[u64]) -> u32 {
         (**self).write_block(addr, buf)
     }
 
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, addr: u32) -> *const AtomicU64 {
+    fn gen_ptr(&self, addr: u64) -> *const AtomicU64 {
         (**self).gen_ptr(addr)
     }
 }
@@ -406,52 +406,52 @@ impl BlackHoleRegion {
 }
 
 impl BusDevice for BlackHoleRegion {
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn read8(&self, addr: u64) -> BusRead8 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Read8 {:08x}", addr);
         }
         BusRead8::ok(0xFF)
     }
-    fn write8(&self, addr: u32, val: u8) -> u32 {
+    fn write8(&self, addr: u64, val: u8) -> u32 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Write8 {:08x} val {:02x}", addr, val);
         }
         BUS_OK
     }
 
-    fn read16(&self, addr: u32) -> BusRead16 {
+    fn read16(&self, addr: u64) -> BusRead16 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Read16 {:08x}", addr);
         }
         BusRead16::ok(0xFFFF)
     }
-    fn write16(&self, addr: u32, val: u16) -> u32 {
+    fn write16(&self, addr: u64, val: u16) -> u32 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Write16 {:08x} val {:04x}", addr, val);
         }
         BUS_OK
     }
 
-    fn read32(&self, addr: u32) -> BusRead32 {
+    fn read32(&self, addr: u64) -> BusRead32 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Read32 {:08x}", addr);
         }
         BusRead32::ok(0xFFFFFFFF)
     }
-    fn write32(&self, addr: u32, val: u32) -> u32 {
+    fn write32(&self, addr: u64, val: u32) -> u32 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Write32 {:08x} val {:08x}", addr, val);
         }
         BUS_OK
     }
 
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn read64(&self, addr: u64) -> BusRead64 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Read64 {:08x}", addr);
         }
         BusRead64::ok(0xFFFFFFFFFFFFFFFF)
     }
-    fn write64(&self, addr: u32, val: u64) -> u32 {
+    fn write64(&self, addr: u64, val: u64) -> u32 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Write64 {:08x} val {:016x}", addr, val);
         }
@@ -464,14 +464,14 @@ impl BusDevice for BlackHoleRegion {
 pub struct UnmappedRam;
 
 impl BusDevice for UnmappedRam {
-    fn read8(&self, _addr: u32) -> BusRead8 { BusRead8::ok(0) }
-    fn write8(&self, _addr: u32, _v: u8) -> u32 { BUS_OK }
-    fn read16(&self, _addr: u32) -> BusRead16 { BusRead16::ok(0) }
-    fn write16(&self, _addr: u32, _v: u16) -> u32 { BUS_OK }
-    fn read32(&self, _addr: u32) -> BusRead32 { BusRead32::ok(0) }
-    fn write32(&self, _addr: u32, _v: u32) -> u32 { BUS_OK }
-    fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::ok(0) }
-    fn write64(&self, _addr: u32, _v: u64) -> u32 { BUS_OK }
+    fn read8(&self, _addr: u64) -> BusRead8 { BusRead8::ok(0) }
+    fn write8(&self, _addr: u64, _v: u8) -> u32 { BUS_OK }
+    fn read16(&self, _addr: u64) -> BusRead16 { BusRead16::ok(0) }
+    fn write16(&self, _addr: u64, _v: u16) -> u32 { BUS_OK }
+    fn read32(&self, _addr: u64) -> BusRead32 { BusRead32::ok(0) }
+    fn write32(&self, _addr: u64, _v: u32) -> u32 { BUS_OK }
+    fn read64(&self, _addr: u64) -> BusRead64 { BusRead64::ok(0) }
+    fn write64(&self, _addr: u64, _v: u64) -> u32 { BUS_OK }
 }
 
 #[cfg(test)]
@@ -485,19 +485,19 @@ mod tests {
         // Seed unique data via the bus interface so storage layout matches
         // production access patterns.
         for i in 0..32 {
-            let addr = (i * 4) as u32;
+            let addr = (i * 4) as u64;
             m.write32(addr, 0xDEAD0000 + i as u32);
         }
         let snap = m.snapshot_words();
         // Mutate in place.
         for i in 0..32 {
-            let addr = (i * 4) as u32;
+            let addr = (i * 4) as u64;
             m.write32(addr, 0xCAFEBABE);
         }
         // Restore from snapshot, verify original data returns.
         m.restore_words(&snap);
         for i in 0..32 {
-            let addr = (i * 4) as u32;
+            let addr = (i * 4) as u64;
             let v = m.read32(addr).data;
             assert_eq!(v, 0xDEAD0000 + i as u32, "word {} mismatch after restore", i);
         }
@@ -525,12 +525,12 @@ mod tests {
     fn write_bumps_page_generation_only_for_touched_page() {
         let m = Memory::new(1); // 1 MB = 256 pages of 4KB
         let gen0_before = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
-        let gen1_before = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u32)).load(Ordering::Relaxed) };
+        let gen1_before = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) };
 
         m.write32(0, 0x1234); // page 0 only
 
         let gen0_after = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
-        let gen1_after = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u32)).load(Ordering::Relaxed) };
+        let gen1_after = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) };
         assert_eq!(gen0_after, gen0_before + 1, "written page must bump gen");
         assert_eq!(gen1_after, gen1_before, "untouched page must not bump gen");
     }
@@ -550,14 +550,14 @@ mod tests {
     fn write_block_bumps_every_page_it_spans() {
         let m = Memory::new(1);
         // Straddle the page-0/page-1 boundary: last qword lands in page 1.
-        let start = (JITV2_PAGE_SIZE - 8) as u32;
+        let start = (JITV2_PAGE_SIZE - 8) as u64;
         let gen0_before = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
-        let gen1_before = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u32)).load(Ordering::Relaxed) };
+        let gen1_before = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) };
 
         m.write_block(start, &[0u64, 0u64]);
 
         let gen0_after = unsafe { (*m.gen_ptr(0)).load(Ordering::Relaxed) };
-        let gen1_after = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u32)).load(Ordering::Relaxed) };
+        let gen1_after = unsafe { (*m.gen_ptr(JITV2_PAGE_SIZE as u64)).load(Ordering::Relaxed) };
         assert_eq!(gen0_after, gen0_before + 1);
         assert_eq!(gen1_after, gen1_before + 1);
     }

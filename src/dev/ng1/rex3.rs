@@ -41,6 +41,8 @@ pub trait Renderer: Send {
     fn switch_compositor(&mut self, _use_gl: bool) -> &'static str { "sw" }
     /// Return a short status string: "compositor=gl shader=integer" etc.
     fn compositor_status(&self) -> String { "compositor=sw shader=n/a".to_string() }
+    /// Whether the GL compositor is in use, or is about to be.
+    fn gl_compositor(&self) -> bool { false }
 }
 
 pub const REX3_SIZE: u32 = 0x2000; // 8KB
@@ -632,6 +634,21 @@ pub const OCTANT_XMAJOR: u32 = 1 << 2;
 // per-pixel walk) — both interpreter code paths, but setup() also gates what the
 // JIT sees (see setup()'s doc comment on why the fractional correction lives there).
 #[rustfmt::skip]
+/// Bit of BRESRNDINC2's BRESROUND byte (bits 31:24) for each hardware
+/// octant. The spec numbers octants 1-8 with octant 1 in the msb; hardware
+/// octant {XMAJOR, XDEC, YDEC} 5,1,3,7,6,2,0,4 is spec octant 1..8.
+/// A set bit steps straight only when d < 0, a clear one when d <= 0
+/// (rex3.pdf §3.6, "BRESROUND"); it only matters when d is exactly 0.
+pub(crate) const BRESROUND_BIT: [u32; 8] = [1, 6, 2, 5, 0, 7, 3, 4];
+
+/// Whether a Bresenham step with d == 0 goes straight (BRESROUND clear for
+/// the line's octant). IRIS GL's lines run with BRESROUND = 0; the X server
+/// loads 0xff.
+#[inline(always)]
+pub(crate) fn bres_straight_on_zero(ctx: &Rex3Context, octant: u32) -> bool {
+    (ctx.bresrndinc2.rnd() >> BRESROUND_BIT[(octant & 7) as usize]) & 1 == 0
+}
+
 pub(crate) const REX3_BRES_OCTANTS: [(i32, i32, i32, i32, bool); 8] = [
     ( 0,  1, -1, -1, true ),  // octant 0
     ( 0,  1,  1,  1, true ),  // octant 1
@@ -1339,11 +1356,11 @@ pub struct Rex3 {
     fb_dirty: AtomicBool,
     pub screen: Arc<Mutex<Rex3Screen>>,
     /// Drives the real REX3 `VV_INT_N` pin (vertical retrace / Kaleidoscope).
-    pub vblank_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    pub vblank_cb: Mutex<Option<crate::irq::IrqLine>>,
     /// Drives the real REX3 `FIFO_INT_N` pin (GFIFO/BFIFO above/below
     /// interrupt — one physical pin for both directions, selected by
     /// `CONFIG_GFIFOABOVEINT`; see `update_gfifo_irqs`).
-    pub fifo_full_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    pub fifo_full_cb: Mutex<Option<crate::irq::IrqLine>>,
     /// Perfetto edge trackers: guest sees GFXBUSY, CPU stalled on a full
     /// GFIFO, GFIFO level as STATUS reports it.
     pf_wait: crate::PfLevel,
@@ -1456,6 +1473,12 @@ pub struct Rex3 {
     pub screenshot_pending: AtomicBool,
     /// Monotonically incrementing screenshot counter for unique filenames.
     pub screenshot_counter: AtomicU32,
+    /// One-shot "compose the next frame into `screen.rgba`" (no file), for
+    /// the CI socket and the monitor's `screen` commands.
+    frame_request: AtomicBool,
+    /// Frame consumers (VNC) that want `screen.rgba` kept current; while
+    /// non-zero every full frame is read back and the compositor is software.
+    capture_users: AtomicUsize,
     /// Atomic shadow of MipsCore::count_hz — updated by CPU thread, read by refresh thread.
     /// Wrapped in Mutex so machine.rs can swap in the real Arc from MipsCore after construction.
     #[cfg(feature = "developer")]
@@ -1616,6 +1639,8 @@ impl Rex3 {
             show_disp_debug: AtomicBool::new(false),
             screenshot_pending: AtomicBool::new(false),
             screenshot_counter: AtomicU32::new(0),
+            frame_request: AtomicBool::new(false),
+            capture_users: AtomicUsize::new(0),
             #[cfg(feature = "developer")]
             count_hz_atomic: Mutex::new(Arc::new(AtomicU64::new(crate::cpu::mips_core::DEFAULT_COUNT_HZ))),
         }
@@ -1656,12 +1681,14 @@ impl Rex3 {
     pub const DIAG_LOOP_DRAW_BLOCK:   u64 = 1 << 24;
     pub const DIAG_LOOP_EXECUTE_GO:   u64 = 1 << 25;
 
-    pub fn set_vblank_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
-        *self.vblank_cb.lock() = Some(cb);
+    /// Wire `VV_INT_N` (vertical retrace) to `irq`.
+    pub fn set_vblank_irq(&self, irq: crate::irq::IrqLine) {
+        *self.vblank_cb.lock() = Some(irq);
     }
 
-    pub fn set_fifo_full_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
-        *self.fifo_full_cb.lock() = Some(cb);
+    /// Wire `FIFO_INT_N` to `irq`.
+    pub fn set_fifo_full_irq(&self, irq: crate::irq::IrqLine) {
+        *self.fifo_full_cb.lock() = Some(irq);
     }
 
     /// Program VC2 with a host-side Newport timing preset (see `[graphics] resolution`).
@@ -1717,8 +1744,8 @@ impl Rex3 {
             self.config.status.fetch_and(!STATUS_GFIFO_INT, Ordering::Relaxed);
         }
 
-        if let Some(cb) = self.fifo_full_cb.lock().clone() {
-            cb(crossed);
+        if let Some(irq) = self.fifo_full_cb.lock().clone() {
+            irq.set(crossed);
         }
     }
 
@@ -1736,6 +1763,15 @@ impl Rex3 {
     }
 
     fn setup(&self, ctx: &mut Rex3Context) {
+        // F_LINE/A_LINE set up from the fixed-point endpoints. Done here, not
+        // at draw time: the JIT never calls back into interpreter draw code,
+        // it walks whatever octant/incr/d/start setup() leaves in ctx.
+        let adrmode = ctx.drawmode0.adrmode();
+        if adrmode == DRAWMODE0_ADRMODE_F_LINE || adrmode == DRAWMODE0_ADRMODE_A_LINE {
+            crate::dev::ng1::rex3_generic::fline_setup(ctx);
+            return;
+        }
+
         let dx = ctx.xend - ctx.xstart;
         let dy = ctx.yend - ctx.ystart;
 
@@ -1755,33 +1791,12 @@ impl Rex3 {
         //   d     = incr1 - major       (initial decision variable, I_LINE formula)
         let incr1: i32 = 2 * minor;
         let incr2: i32 = 2 * (minor - major);
-        let mut d: i32 = incr1 - major;
+        let d: i32 = incr1 - major;
 
         // Store as plain two's-complement integers masked to register field widths.
         ctx.bresoctinc1.set_octant(octant);
         ctx.bresoctinc1.set_incr1((incr1 as u32) & 0xFFFFF);     // 20-bit, always positive
         ctx.bresrndinc2.set_incr2((incr2 as u32) & 0x1FFFFF);    // 21-bit signed
-
-        // F_LINE/A_LINE: apply the fractional-endpoint correction HERE, not at draw
-        // time. This must happen in setup() (not draw_line_bresenham/fline_apply_fract)
-        // because setup() is the only Bresenham-state derivation shared by both the
-        // interpreter and the JIT — the JIT-compiled entry point never calls back into
-        // interpreter draw functions, it just replays whatever bresd/bresoctinc1/
-        // bresrndinc2/xstart/ystart setup() already wrote into ctx. Applying the
-        // correction only in draw_line_bresenham (the old approach) left the JIT
-        // silently drawing plain-I_LINE trajectories for F_LINE/A_LINE, since the
-        // JIT never reaches that interpreter-only code path.
-        let adrmode = ctx.drawmode0.adrmode();
-        let is_fractional = adrmode == DRAWMODE0_ADRMODE_F_LINE || adrmode == DRAWMODE0_ADRMODE_A_LINE;
-        if is_fractional {
-            let (_incrx1, incrx2, _incry1, incry2, y_major) = REX3_BRES_OCTANTS[(octant & 7) as usize];
-            let mut x = ctx.xstart >> 11;
-            let mut y = ctx.ystart >> 11;
-            crate::dev::ng1::rex3_generic::fline_apply_fract(ctx, &mut d, &mut x, &mut y, incrx2, incry2, y_major);
-            ctx.xstart = x << 11;
-            ctx.ystart = y << 11;
-        }
-
         ctx.bresd = (d as u32) & 0x7FF_FFFF;                     // 27-bit signed
     }
 
@@ -2698,11 +2713,10 @@ impl Rex3 {
         } else {
             // Continuation GO: re-derive Bresenham when the segment axis disagrees with
             // the persisted octant (e.g. degenerate setup point, then horizontal cont).
-            let adrmode = ctx.drawmode0.adrmode();
-            let is_line = adrmode == DRAWMODE0_ADRMODE_I_LINE
-                || adrmode == DRAWMODE0_ADRMODE_F_LINE
-                || adrmode == DRAWMODE0_ADRMODE_A_LINE;
-            if is_line {
+            // I_LINE only: F_LINE/A_LINE take their octant from the
+            // fixed-point deltas, which integer deltas can disagree with, and
+            // their setup moves the start point, so it must not run twice.
+            if ctx.drawmode0.adrmode() == DRAWMODE0_ADRMODE_I_LINE {
                 let xs = ctx.xstart >> 11;
                 let ys = ctx.ystart >> 11;
                 let xe = ctx.xend >> 11;
@@ -2954,6 +2968,12 @@ impl Rex3 {
         let mut last_topscan: usize = usize::MAX;
         let mut frames_since_render: u32 = u32::MAX;
         let mut full_presents: u32 = 0;
+        // Composes `screen.rgba` when a frame is wanted and no front-end
+        // renderer is installed (`--ci`); made on first use.
+        let mut capture_compositor: Option<crate::compositor::SwCompositor> = None;
+        // While capture forces the renderer onto the software compositor:
+        // whether it used GL before, to switch back when capture ends.
+        let mut restore_gl: Option<bool> = None;
 
         while self.running.load(Ordering::Relaxed) {
             let start = std::time::Instant::now();
@@ -3048,6 +3068,7 @@ impl Rex3 {
                 || dbg_overlay
                 || topscan != last_topscan
                 || self.screenshot_pending.load(Ordering::Relaxed)
+                || self.frame_request.load(Ordering::Relaxed)
                 || frames_since_render >= IDLE_HEARTBEAT_FRAMES;
 
             if should_render {
@@ -3060,7 +3081,8 @@ impl Rex3 {
                     && !fb_was_dirty
                     && !palette_dirty
                     && !dbg_overlay
-                    && !self.screenshot_pending.load(Ordering::Relaxed);
+                    && !self.screenshot_pending.load(Ordering::Relaxed)
+                    && !self.frame_request.load(Ordering::Relaxed);
 
                 // Push debug state into overlay
                 overlay.show_cmap       = self.show_cmap.load(Ordering::Relaxed);
@@ -3094,6 +3116,12 @@ impl Rex3 {
 
                 // Screenshot: grab pixels from the compositor before presenting.
                 let take_screenshot = self.screenshot_pending.swap(false, Ordering::Relaxed);
+                // Frame consumers: a one-shot request, or capture (VNC) on
+                // every full frame. Heartbeats change nothing in the picture.
+                let capture = self.capture_users.load(Ordering::Relaxed) > 0;
+                let want_frame = self.frame_request.load(Ordering::Relaxed)
+                    || (capture && !screen.status_bar_only);
+                let need_readback = take_screenshot || want_frame;
 
                 // Assert VBLANK: device state is now copied into screen caches, so
                 // the CPU gets the maximum window to react before the next refresh.
@@ -3107,9 +3135,12 @@ impl Rex3 {
                 }
                 {
                     self.diag.fetch_or(Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
-                    let cb = self.vblank_cb.lock().clone();
+                    let irq = self.vblank_cb.lock().clone();
                     self.diag.fetch_and(!Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
-                    if let Some(cb) = cb { cb(true); }
+                    if let Some(irq) = irq {
+                        crate::pf_instant!(crate::perfetto::events::REX3_VBLANK);
+                        irq.set(true);
+                    }
                 }
 
                 // Present: compositor → overlay → status bar → swap
@@ -3118,17 +3149,45 @@ impl Rex3 {
                         crate::pf_scope!(crate::perfetto::events::REX3_PRESENT);
                         self.diag.fetch_or(Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
                         let borrow = screen.fb_borrowed;
+                        // Capture reads every frame back: keep it a slice copy
+                        // out of the software compositor, never a GL readback.
+                        if capture {
+                            restore_gl.get_or_insert_with(|| r.gl_compositor());
+                            r.switch_compositor(false);
+                        } else if let Some(gl) = restore_gl.take() {
+                            if gl {
+                                r.switch_compositor(true);
+                            }
+                        }
                         r.present(
                             &mut *screen,
                             &mut overlay,
                             &mut status_bar,
                             &mut sbtex,
                             &bar_stats,
-                            take_screenshot,
+                            need_readback,
                             if borrow { Some(&**fb_rgb) } else { None },
                             if borrow { Some(&**fb_aux) } else { None },
                         );
                         self.diag.fetch_and(!Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
+                    } else if need_readback {
+                        // No front-end (`--ci`): compose the guest screen here.
+                        // No status bar or overlay: this is the guest's screen.
+                        let comp = capture_compositor.get_or_insert_with(crate::compositor::SwCompositor::new);
+                        let borrow = screen.fb_borrowed;
+                        comp.compose_pixels(&screen.compositor_source_from(
+                            if borrow { Some(&**fb_rgb) } else { None },
+                            if borrow { Some(&**fb_aux) } else { None },
+                        ));
+                        let (w, h) = (screen.width, screen.height);
+                        let px = comp.pixels();
+                        for y in 0..h {
+                            let row = y * crate::disp::FB_STRIDE;
+                            screen.rgba[row..row + w].copy_from_slice(&px[row..row + w]);
+                        }
+                    }
+                    if need_readback {
+                        screen.frame_seq = screen.frame_seq.wrapping_add(1);
                     }
 
                     if !screen.status_bar_only {
@@ -3150,6 +3209,9 @@ impl Rex3 {
                     }
                 }
 
+                // Cleared after the copy above, under the screen lock, so a
+                // waiter that sees it clear then reads the finished frame.
+                self.frame_request.store(false, Ordering::Relaxed);
                 self.diag.fetch_and(!(Self::DIAG_LOCK_SCREEN | Self::DIAG_LOCK_RENDERER), Ordering::Relaxed);
             } else {
                 // Nothing visible changed — skip the full refresh + GL upload and
@@ -3167,9 +3229,12 @@ impl Rex3 {
                 }
                 {
                     self.diag.fetch_or(Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
-                    let cb = self.vblank_cb.lock().clone();
+                    let irq = self.vblank_cb.lock().clone();
                     self.diag.fetch_and(!Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
-                    if let Some(cb) = cb { cb(true); }
+                    if let Some(irq) = irq {
+                        crate::pf_instant!(crate::perfetto::events::REX3_VBLANK);
+                        irq.set(true);
+                    }
                 }
             }
 
@@ -3302,7 +3367,15 @@ impl Rex3 {
             REX3_LSMODE => ctx.lsmode = LsMode(val),
             REX3_LSPATTERN => ctx.lspattern = val,
             REX3_LSPATSAVE => ctx.lspatsave = val,
-            REX3_ZPATTERN => ctx.zpattern = val,
+            // ZPATTERN is a recirculating register, "msb = first pixel"
+            // (rex3.pdf register table): writing it reloads the pattern, so
+            // the next pixel tests bit 31 whatever the last primitive left.
+            // IRIS GL's software-Z lines rely on it: each stroke is an F_LINE
+            // without DOSETUP drawn by a ZPATTERN GO with an MSB-aligned mask.
+            REX3_ZPATTERN => {
+                ctx.zpattern = val;
+                ctx.zpat_bit = 31;
+            }
             REX3_LSSAVE => {
                 ctx.lssave = val;
                 ctx.lspatsave = ctx.lspattern;
@@ -3983,6 +4056,9 @@ impl Device for Rex3 {
                 Some("sw") => false,
                 _ => return Err("Usage: disp compositor <gl|sw>".to_string()),
             };
+            if use_gl && self.capture_users.load(Ordering::Relaxed) > 0 {
+                return Err("the VNC server needs the software compositor while it runs".to_string());
+            }
             let active = if let Some(renderer) = self.renderer.lock().as_mut() {
                 renderer.switch_compositor(use_gl)
             } else {
@@ -4128,13 +4204,13 @@ impl Rex3 {
                 if reg_offset == REX3_STATUS {
                     let had_vrint = self.config.status.fetch_and(!STATUS_VRINT, Ordering::Relaxed) & STATUS_VRINT != 0;
                     if had_vrint {
-                        let cb = self.vblank_cb.lock().clone();
-                        if let Some(cb) = cb { cb(false); }
+                        let irq = self.vblank_cb.lock().clone();
+                        if let Some(irq) = irq { irq.set(false); }
                     }
                     let had_gfifo = self.config.status.fetch_and(!STATUS_GFIFO_INT, Ordering::Relaxed) & STATUS_GFIFO_INT != 0;
                     if had_gfifo {
-                        let cb = self.fifo_full_cb.lock().clone();
-                        if let Some(cb) = cb { cb(false); }
+                        let irq = self.fifo_full_cb.lock().clone();
+                        if let Some(irq) = irq { irq.set(false); }
                     }
                     let dcb = self.dcb.lock();
                     if let Some(until) = dcb.backbusy_until {
@@ -4717,7 +4793,8 @@ impl Rex3 {
 }
 
 impl BusDevice for Rex3 {
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn read8(&self, addr: u64) -> BusRead8 {
+        let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
             let tap = self.tap.load(Ordering::Relaxed);
@@ -4728,7 +4805,8 @@ impl BusDevice for Rex3 {
         self.bus_read8(addr)
     }
 
-    fn read16(&self, addr: u32) -> BusRead16 {
+    fn read16(&self, addr: u64) -> BusRead16 {
+        let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
             let tap = self.tap.load(Ordering::Relaxed);
@@ -4739,7 +4817,8 @@ impl BusDevice for Rex3 {
         self.bus_read16(addr)
     }
 
-    fn read32(&self, addr: u32) -> BusRead32 {
+    fn read32(&self, addr: u64) -> BusRead32 {
+        let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
             let tap = self.tap.load(Ordering::Relaxed);
@@ -4750,7 +4829,8 @@ impl BusDevice for Rex3 {
         self.bus_read32(addr)
     }
 
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn read64(&self, addr: u64) -> BusRead64 {
+        let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
             let tap = self.tap.load(Ordering::Relaxed);
@@ -4761,7 +4841,8 @@ impl BusDevice for Rex3 {
         self.bus_read64(addr)
     }
 
-    fn write8(&self, addr: u32, val: u8) -> u32 {
+    fn write8(&self, addr: u64, val: u8) -> u32 {
+        let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
             let tap = self.tap.load(Ordering::Relaxed);
@@ -4772,7 +4853,8 @@ impl BusDevice for Rex3 {
         self.bus_write8(addr, val)
     }
 
-    fn write16(&self, addr: u32, val: u16) -> u32 {
+    fn write16(&self, addr: u64, val: u16) -> u32 {
+        let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
             let tap = self.tap.load(Ordering::Relaxed);
@@ -4783,7 +4865,8 @@ impl BusDevice for Rex3 {
         self.bus_write16(addr, val)
     }
 
-    fn write32(&self, addr: u32, val: u32) -> u32 {
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
             let tap = self.tap.load(Ordering::Relaxed);
@@ -4794,7 +4877,8 @@ impl BusDevice for Rex3 {
         self.bus_write32(addr, val)
     }
 
-    fn write64(&self, addr: u32, val: u64) -> u32 {
+    fn write64(&self, addr: u64, val: u64) -> u32 {
+        let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
             let tap = self.tap.load(Ordering::Relaxed);
@@ -4805,7 +4889,8 @@ impl BusDevice for Rex3 {
         self.bus_write64(addr, val)
     }
 
-    fn dma_read64(&self, addr: u32) -> BusRead64 {
+    fn dma_read64(&self, addr: u64) -> BusRead64 {
+        let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
             let tap = self.tap.load(Ordering::Relaxed);
@@ -4816,7 +4901,8 @@ impl BusDevice for Rex3 {
         self.bus_dma_read64(addr)
     }
 
-    fn dma_write64_bulk(&self, addr: u32, vals: &[u64]) -> u32 {
+    fn dma_write64_bulk(&self, addr: u64, vals: &[u64]) -> u32 {
+        let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
             let tap = self.tap.load(Ordering::Relaxed);
@@ -4827,7 +4913,8 @@ impl BusDevice for Rex3 {
         self.bus_dma_write64_bulk(addr, vals)
     }
 
-    fn dma_read64_bulk(&self, addr: u32, out: &mut [u64]) -> u32 {
+    fn dma_read64_bulk(&self, addr: u64, out: &mut [u64]) -> u32 {
+        let addr = addr as u32; // REX3 decodes only its 8 KB window below 4 GB
         #[cfg(feature = "gputrace")]
         {
             let tap = self.tap.load(Ordering::Relaxed);
@@ -4847,7 +4934,51 @@ impl crate::gfx_display::GfxDisplay for Rex3 {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
     fn screen(&self) -> &Mutex<Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
+    fn screenshot_pending(&self) -> bool { self.screenshot_pending.load(Ordering::Relaxed) }
     fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.cycles.get() }
+    fn request_frame(&self) { self.frame_request.store(true, Ordering::Relaxed); }
+    fn frame_pending(&self) -> bool { self.frame_request.load(Ordering::Relaxed) }
+    fn set_capture(&self, on: bool) {
+        if on {
+            self.capture_users.fetch_add(1, Ordering::Relaxed);
+            // Repaint at once so the new consumer gets a frame.
+            self.fb_dirty.store(true, Ordering::Release);
+        } else {
+            let _ = self.capture_users.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        }
+    }
+    fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
+        use crate::dev::ng1::vc2::{VC2_REG_CURRENT_CURSOR_X, VC2_REG_CURSOR_Y_LOC,
+            VC2_REG_CURSOR_ENTRY_PTR, VC2_REG_DISPLAY_CONTROL, VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE};
+        let x_adjust = self.screen.lock().cursor_x_adjust;
+        let vc2 = self.vc2.lock();
+        let ctrl = vc2.regs[VC2_REG_DISPLAY_CONTROL as usize];
+        if ctrl & VC2_CTRL_CURSOR_EN == 0 {
+            return None;
+        }
+        let entry = vc2.regs[VC2_REG_CURSOR_ENTRY_PTR as usize] as usize;
+        let ram = &vc2.ram;
+        let word = |a: usize| ram.get(a).copied().unwrap_or(0) as u64;
+        // The same glyph layout the compositor draws (compositor.rs).
+        let (size, mask): (usize, Vec<u64>) = if ctrl & VC2_CTRL_CURSOR_SIZE != 0 {
+            (64, (0..64).map(|y| (0..4).fold(0u64, |m, w| {
+                m | (word(entry + y * 4 + w).reverse_bits() >> 48) << (w * 16)
+            })).collect())
+        } else {
+            (32, (0..32).map(|y| (0..2).fold(0u64, |m, w| {
+                let a = entry + y * 2 + w;
+                m | ((word(a) | word(a + 64)).reverse_bits() >> 48) << (w * 16)
+            })).collect())
+        };
+        Some(crate::gfx_display::HwCursor {
+            // The compositor latches Y at retrace; the live location register
+            // is where it will be drawn next.
+            x: vc2.regs[VC2_REG_CURRENT_CURSOR_X as usize] as i32 - 31 + x_adjust,
+            y: vc2.regs[VC2_REG_CURSOR_Y_LOC as usize] as i32 - 31,
+            size,
+            mask,
+        })
+    }
 }
 
 impl Resettable for Rex3 {

@@ -141,7 +141,7 @@ pub struct ShadowCache<
 > {
     downstream: Arc<dyn BusDevice>,
     llbit: UnsafeCell<bool>,
-    lladdr: UnsafeCell<u32>,
+    lladdr: UnsafeCell<u64>,
     /// CP0 ECC on the way in to a store, and on the way out of a load.
     ecc_in: UnsafeCell<u32>,
     ecc_out: UnsafeCell<u32>,
@@ -220,7 +220,7 @@ impl<
     /// set bit also means the base is valid.
     #[inline(always)]
     fn ram(&self, phys: u64) -> Option<*mut u8> {
-        if unsafe { *self.tc_bitmap.get() } & (1u64 << (phys >> crate::ppmem::BITMAP_SHIFT)) != 0 {
+        if crate::ppmem::bitmap_maps(unsafe { *self.tc_bitmap.get() }, phys) {
             Some(unsafe { *self.tc_base.get() })
         } else {
             None
@@ -330,6 +330,7 @@ impl<
     // 40; the shadow cache is only used for it, but key this off the same flag
     // that selects its cache encodings rather than asserting it unconditionally.
     const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };
+    const PA_BITS: u32 = if MODEL == model::R10000 { 40 } else { 36 };
     // The CPU's name, which snapshots check: the same as the full model's, so
     // a mismatch reads as a cache-kind difference rather than a different CPU.
     // The R10000 keeps its historical "shadow", which existing IP28
@@ -369,6 +370,10 @@ impl<
 
     fn tcache_base_ptr(&self) -> *mut u8 { unsafe { *self.tc_base.get() } }
 
+    /// Tags only: a fetch reads memory through the decode cache and changes
+    /// nothing a guest can see.
+    fn fetch_is_pure(&self) -> bool { true }
+
     #[cfg(feature = "jitv2")]
     fn tcache_gen_ptr(&self) -> *mut u8 { unsafe { *self.tc_gen.get() as *mut u8 } }
 
@@ -397,7 +402,7 @@ impl<
     fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
         // Decoded instructions by physical page — see `decode_cache`.
         let dc = unsafe { &mut *self.decode.get() };
-        let word = |a: u32| {
+        let word = |a: u64| {
             let r = self.downstream.read32(a);
             if r.is_ok() { Ok(r.data) } else { Err(r.status) }
         };
@@ -430,18 +435,17 @@ impl<
             };
             return BusRead64::ok(data);
         }
-        let a = phys_addr as u32;
         if SIZE == 1 {
-            let r = self.downstream.read8(a);
+            let r = self.downstream.read8(phys_addr);
             BusRead64 { status: r.status, data: r.data as u64 }
         } else if SIZE == 2 {
-            let r = self.downstream.read16(a);
+            let r = self.downstream.read16(phys_addr);
             BusRead64 { status: r.status, data: r.data as u64 }
         } else if SIZE == 4 {
-            let r = self.downstream.read32(a);
+            let r = self.downstream.read32(phys_addr);
             BusRead64 { status: r.status, data: r.data as u64 }
         } else {
-            self.downstream.read64(a)
+            self.downstream.read64(phys_addr)
         }
     }
 
@@ -465,15 +469,14 @@ impl<
             self.bump_gen(phys_addr);
             return BUS_OK;
         }
-        let a = phys_addr as u32;
         if SIZE == 1 {
-            self.downstream.write8(a, val as u8)
+            self.downstream.write8(phys_addr, val as u8)
         } else if SIZE == 2 {
-            self.downstream.write16(a, val as u16)
+            self.downstream.write16(phys_addr, val as u16)
         } else if SIZE == 4 {
-            self.downstream.write32(a, val as u32)
+            self.downstream.write32(phys_addr, val as u32)
         } else {
-            self.downstream.write64(a, val)
+            self.downstream.write64(phys_addr, val)
         }
     }
 
@@ -487,7 +490,7 @@ impl<
             self.bump_gen(phys_addr);
             return BUS_OK;
         }
-        let aligned = (phys_addr & !7) as u32;
+        let aligned = phys_addr & !7;
         let r = self.downstream.read64(aligned);
         if !r.is_ok() {
             return r.status;
@@ -657,10 +660,10 @@ impl<
     fn set_llbit(&self, val: bool) {
         unsafe { *self.llbit.get() = val };
     }
-    fn get_lladdr(&self) -> u32 {
+    fn get_lladdr(&self) -> u64 {
         unsafe { *self.lladdr.get() }
     }
-    fn set_lladdr(&self, addr: u32) {
+    fn set_lladdr(&self, addr: u64) {
         unsafe { *self.lladdr.get() = addr };
     }
 }

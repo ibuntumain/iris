@@ -1,0 +1,114 @@
+# What the Octane's PROM insists on
+
+Status: rule (PROM 4.17; each item below was found by a stall or a wrong
+answer in the PROM's own checks).
+
+**What to know.** The IP30 PROM probes the hardware far harder than a
+kernel does. Memory sizing, the Bridge, the IOC3 and the one-wire parts must
+each answer the way the real parts do, or the PROM skips a bus, panics with no
+console, or loops. The bus is `Ip30Bus` (`src/ip30.rs`), the machine's
+`Physical`. `docs/octane-ip30.md` says what the machine covers and
+`docs/Octane/ip30-address-map.md` holds the map every offset came from. The
+monitor's `ip30` command (memory, the Bridge, the graphics link, refused
+Crossbow accesses, unmapped accesses) and `heart unsupported` show what the
+PROM touched that the model does not answer. `IRIS_IP30_TRACE=1` prints the
+accesses nothing answers as they happen.
+
+**What the PROM insists on.**
+
+- *Memory sizing.* The PROM sizes a bank by writing through a temporary
+  2 GiB descriptor (`0x81bf0040`) and checking which address bits alias.
+  HEART's wiring for that probe is not documented, so
+  `heart_mem::bank_offset` projects each fitted size so the PROM picks the
+  right descriptor; that is an approximation. It also probes every bank, so
+  a bank with no DIMMs must take writes and read back zero rather than
+  bus-error.
+- *The Bridge's device windows at reset are memory space at base 0.* The
+  PROM enables the RAD's memory decode and writes through window 3 with
+  neither the RAD's BAR nor device register 3 programmed; the window has
+  to reach PCI address 0, where the unmoved BAR answers
+  (`PciConfig::decode_unmoved`).
+- *The Bridge status register must say PCI.* Bit 5 (PCI, not GIO) clear
+  makes the PROM skip the PCI bus entirely: no IOC3 node in its tree, no
+  serial device, "Cannot open serial(0) for input", "PANIC: Cannot open
+  any console!". Nothing in the trace points at it; the device tree
+  (dumped from the root at 0xa800000020f24040 with the monitor) did.
+- *Empty PCI slots must bus-error on configuration reads.* All ones
+  makes the PROM list "slot 4 vendor 0xffff part 0xffff rev 255" devices.
+- *IOC3 details.* The SuperIO control register's bit 22 (no DMA request
+  in flight) must read set, or the PROM spins after resetting the serial
+  DMA engines; SSCR_A/B's and EMCR's reset bits (31) self-clear. The
+  DS1687's address port is byte bus 1 (IOC3 + 0xa0000) and its data port
+  byte bus 2 (+0xc0000), as OpenBSD's dsrtc.c has it, not the SuperIO RTC
+  slot at 0x20168. The 16550s are at 0x20178 (A, the console) and 0x20170
+  (B), registers at consecutive bytes.
+- *The one-wire parts.* The MAC part is a DS1981U (family 0x91): the PROM
+  reads 14 bytes after Read Memory at 0 (the first the CRC8 of the
+  command) into nic[13..0] and takes the address from nic[2..8], so the MAC
+  sits reversed at memory 5..11 as the end of a TMEX page. The board parts
+  are DS2505s (family 0x0b, 2 KB): Read Status at 0x100 returns the page
+  redirection table in groups of eight bytes each followed by an inverted
+  CRC16 (over the command, address and bytes for the first group, the
+  bytes alone after; the PROM's `nic_read_mfg` checks them: "invalid crc16
+  reading redirection map"), and Read Memory returns the pages with no
+  CRC8 in front. Page layout as OpenBSD's owserial.c reads it: 0x01, the
+  barcode (20), nine characters of the part number; page 1: three more,
+  the revision, six 0xff bytes, the name (14); each page ends in its
+  inverted CRC16. The PROM uses Search ROM on each wire, so several parts
+  share one `w1::Bus`. The system board's part is on the Bridge's wire, the
+  processor module's on HEART's MicroLAN, and the front plane's and power
+  supply's on the IOC3's (with the MAC part).
+- *What the PROM programs in the Bridge.* IOC3 BAR0 = 0x00400000 and
+  device register 2 = 0x1004 (memory space, base 0x004 << 20, no PIO
+  swap); interrupt destination upper 0x09080000 / lower 0x80 (vector 9 for
+  the Bridge's errors, HEART widget 8's ISR); DIR_MAP 0x00800000 (DMA to
+  widget 8, offset 0); RRB even 0x1; INT_RST_STAT 0x7f; interrupt address
+  registers 6 and 7 = 0x29 and 0x39 (the power switch and AC-fail
+  vectors). HEART widget control 0x4008, request timeout 0x28, error type
+  and mask 0x3ff7fc0f.
+- *HEART's widget registers are 64-bit.* Unlike every other widget's
+  (32-bit in the odd word), HEART's are addressed at 8-byte boundaries; the
+  PROM reads the ID at widget offset 0 as a doubleword.
+- *Byte lanes.* The Bridge presents the CPU's view of a device window:
+  the IOC3, wired for a big-endian bus, has its registers at the offsets
+  the CPU uses, and the PROM reaches the ISP1040's 16-bit registers at
+  PCI offset ^ 2 through a window whose swap bit is clear. A
+  little-endian function's model therefore takes CPU-view offsets and
+  applies the ^2/^3 itself; the window's swap bit (device register bit
+  13) is modelled as lane and data swapping.
+- *The device tree.* Finding out why a console device will not open is
+  quickest from the tree: the root pointer is at 0xa800000020f24040, a
+  node's type is at +4, key at +16, peer at +64, child at +72, and one of
+  the doublewords from +24 on points at its name.
+
+**What booting the PROM through to IRIX added.**
+
+- *The PROM's stores into the flash are cached lines.* The PROM keeps its
+  initialised data at flash addresses and stores to it with cached accesses
+  that are never written back, so the Bridge's 16-bit-only flash port never
+  sees them. iris's cache model passes every cached access to memory, so the
+  CPU's view of the bus (`CachedFlashLines`) holds those dirty lines in a
+  per-line copy: the first cached store to a flash line copies it in, and
+  cached loads and stores of that line use the copy from then on. Uncached
+  accesses reach the flash itself. Approximation: write-back and
+  eviction are not modelled.
+- *Low memory needs JIT generation counters.* The kernel writes its
+  exception vectors at physical 0. With no jitv2 page-generation counter
+  there, the JIT treated the page as ROM, compiled it once and ran a stale
+  general exception vector (IRIX livelocked right after "Starting up the
+  system..."). The 16 KB is the start of SDRAM and shares its counters,
+  advanced by every store, including a bus master's at the SDRAM address.
+- *An ISP1040 reset must not wait for the disk.* A soft reset and a queue
+  initialisation waited on the CPU thread for the command in flight, so a
+  slow disk stalled the guest and the scheduler's timer ticks were missed.
+  The reset now moves a generation counter on and the ring thread does the
+  DMA with no lock held.
+- *The PROM console draws on HQ4 before any context switch.* Its graphical
+  console sends direct raster writes and a few other one-word packets to the
+  HQ4's command port before the board has ever selected a context, and a
+  bare bring-up word whose high half is zero comes first. Only whole packets
+  are taken as commands in that state (parsed as a header, the bring-up word
+  would swallow the raster writes after it). One word the PROM sends,
+  `0x001A6804`, addresses a register past 0x1FF; its effect is unknown, so
+  it is dropped and reported. That the board takes the packets without a
+  switch is inferred from the PROM's command stream and OpenBSD's driver.

@@ -10,7 +10,8 @@ headless = false
 # Can also be set with --noaudio.
 no_audio = false
 
-# PROM ROM image (required).
+# PROM ROM image. Indy and Indigo2 have an embedded fallback; the O2 needs its
+# own (ip32prom.rev4.18.bin is tried when this is left as is).
 prom = "prom.bin"
 
 # Window scale factor. Uses logical points (macOS) / DPI-scaled pixels, so
@@ -28,6 +29,8 @@ scale = 1
 # Each bank must be 0 (absent), 8, 16, 32, 64, or 128.
 # The SGI Indy supports up to two populated banks; banks 2 and 3 are
 # typically absent.  Total RAM = sum of non-zero banks.
+# Up to eight entries (four used today). On the O2 each entry is the kit in a
+# DIMM pair: 32, 64, 128 or 256 MB, largest first.
 banks = [128, 128, 0, 0]
 
 # NAT subnet for the internal network (CIDR notation).
@@ -47,6 +50,8 @@ banks = [128, 128, 0, 0]
 path   = "scsi1.raw"
 cdrom  = false
 #overlay = true
+#controller = 0   # Indigo2 and O2 have a second controller (1); on the O2 it is the external bus.
+                  # [scsi.17] is id 1 on controller 1 without this key, so an id can be on both.
 
 # Internal hard disk
 #[scsi.2]
@@ -219,7 +224,8 @@ mode           = "nat"
 
 # Graphics: board "newport" (default), or GR2 "xz" (Indy or Indigo2) /
 # "extreme" (Indigo2) - GR2 is in bring-up (PROM + single-user textport);
-# "solidimpact", "highimpact", "maximpact"
+# "solidimpact", "highimpact", "maximpact". The Octane takes only the
+# IMPACT boards (default "solidimpact") or "none".
 # heads 1 or 2; resolution "guest" (IRIX/PROM programs VC2), "1024x768",
 # "1280x960" or "1280x1024".
 #[graphics]

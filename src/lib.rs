@@ -57,7 +57,7 @@ compile_error!(
      fails mips_cache_v2::tests::cache_op_index_inv_l1i. Refusing to build \
      rather than silently shipping a broken cache model for a machine this \
      emulator doesn't target. See src/cpu/mips_cache_v2.rs and \
-     rules/testing/r5k-l1i-cache-bugs.md."
+     clanker/cpu/r5k-l1i-cache-bugs.md."
 );
 
 #[cfg(feature = "r5ksc")]
@@ -67,7 +67,7 @@ compile_error!(
      r5ksc` fails mips_cache_v2's L1I tests. There is currently no working \
      R5000 secondary-cache configuration. Refusing to build rather than silently \
      shipping a broken cache model. See src/cpu/mips_cache_v2.rs and \
-     rules/testing/r5k-l1i-cache-bugs.md. The R5000 without a secondary \
+     clanker/cpu/r5k-l1i-cache-bugs.md. The R5000 without a secondary \
      cache (`--cpu r5000`) is unaffected."
 );
 
@@ -170,8 +170,20 @@ pub mod prombini2;
 pub mod prombinip28;
 pub mod ppmem;
 pub mod machine;
+pub mod workstation;
+/// The SGI O2 (IP32): its bus and devices -- see `docs/o2-ip32.md` (and, for how it was built, `clanker/devices/ip32-o2-bringup-log.md`).
+/// Not yet wired into `Physical`; `ip32_machine` drives the CPU against it.
+pub mod ip32;
+pub mod ip32_handover;
+pub mod ip32_screen;
+pub mod ip32_machine;
+/// The SGI Octane (IP30): its bus and machine -- see `docs/Octane/ip30-address-map.md`.
+pub mod ip30;
+pub mod ip30_machine;
+pub mod machine_state;
 pub mod platform;
 pub mod physical;
+pub mod ip22_bus;
 pub mod monitor;
 pub mod locks;
 pub mod net;
@@ -180,13 +192,21 @@ pub mod benchsuite;
 pub mod bench_runner;
 pub mod cow_disk;
 pub mod chd_disk;
+pub mod block_node;
 pub mod scsi;
+pub mod scsi_monitor;
+pub mod irq;
+pub mod host_audio;
+pub mod pci;
 pub mod ui;
 pub mod cpu;
 pub mod dev;
 pub mod gfifo;
 pub mod trace_writer;
 pub mod gfx_display;
+pub mod hostinput;
+pub mod keysym;
+pub mod vnc;
 pub mod compositor;
 pub mod gl_compositor;
 pub mod headless_gl;

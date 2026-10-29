@@ -7,7 +7,7 @@ use std::thread;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Signal, Resettable, Saveable, MachineEvent};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
 use crate::dev::eeprom_93c56::Eeprom93c56;
-use crate::dev::ioc::{Ioc, IocInterrupt};
+use crate::irq::IrqLine;
 use std::io::Write as IoWrite;
 
 // The GIO virtual DMA engine — registers, µTLB translation and the transfer
@@ -65,7 +65,8 @@ struct MemoryControllerState {
     cpu_cycle_acc: u64,
     rpss_cycle_acc: u64,
     cpu: Option<Weak<dyn Device>>,
-    ioc: Option<Ioc>,
+    /// The GIO DMA engine's interrupt (the IOC's MC DMA line).
+    dma_irq: Option<IrqLine>,
 }
 
 #[derive(Clone)]
@@ -134,7 +135,7 @@ impl MemoryController {
                 cpu_cycle_acc: 0,
                 rpss_cycle_acc: 0,
                 cpu: None,
-                ioc: None,
+                dma_irq: None,
             })),
             giodma: Arc::new(GioDma::new()),
             phys: Arc::new(OnceLock::new()),
@@ -175,7 +176,7 @@ impl MemoryController {
         // that's clear per the spec — but the IRIX 5.3 vino driver's
         // vino_init() checks bit 4 of SYSID at 0xBFA0001C as a gate before
         // any further probing, and silently bails if it's clear (see
-        // rules/irix/vino-attach-via-sysid-bit4.md). Setting bit 4
+        // clanker/video/vino-attach-via-sysid-bit4.md). Setting bit 4
         // unconditionally lets vino_init proceed; with it set, `vlinfo`
         // reports `vino 0` with 5 nodes (digital input = IndyCam, analog
         // input, two memory drains, controls).
@@ -243,8 +244,9 @@ impl MemoryController {
         self.state.lock().cpu = Some(cpu);
     }
 
-    pub fn set_ioc(&self, ioc: Ioc) {
-        self.state.lock().ioc = Some(ioc);
+    /// Wire the GIO DMA engine's interrupt.
+    pub fn set_dma_irq(&self, irq: IrqLine) {
+        self.state.lock().dma_irq = Some(irq);
     }
 
     pub fn set_phys(&self, phys: Arc<dyn BusDevice>) {
@@ -400,7 +402,7 @@ impl MemoryController {
     /// are synthesized at HIMEM by the MEMCFG0 write itself. No-op once any
     /// bank is valid, so this never overrides what POST decided.
     pub fn post_map_banks(&self) -> bool {
-        use crate::physical::{BANK_SIZE, LOMEM_BASE};
+        use crate::ip22_bus::{BANK_SIZE, LOMEM_BASE};
         let (m0, m1) = self.get_memcfg();
         if m0 != 0 || m1 != 0 {
             return false;
@@ -412,7 +414,7 @@ impl MemoryController {
         if memcfg0 == 0 {
             return false;
         }
-        self.write32(MC_BASE + REG_MEMCFG0, memcfg0) == BUS_OK
+        self.write32((MC_BASE + REG_MEMCFG0) as u64, memcfg0) == BUS_OK
     }
 
     /// Parse MEMCFG0/1 registers into 4 bank (base, addr_mask, limit) triples using the
@@ -430,7 +432,7 @@ impl MemoryController {
     /// If the embedded PROM POSTed lomem (banks 0–1) but skipped himem, synthesize
     /// MEMCFG1 entries for configured banks 2–3 so IRIX sees extended RAM.
     fn synthesize_himem_banks(&self, state: &mut MemoryControllerState) -> bool {
-        use crate::physical::{BANK_SIZE, HIMEM_BASE};
+        use crate::ip22_bus::{BANK_SIZE, HIMEM_BASE};
 
         // Only for a PROM that POSTs lomem and stops. The IP28 PROM sizes all
         // four banks itself, walking them one at a time through a probe window
@@ -498,17 +500,19 @@ impl MemoryController {
         }
     }
 
-    pub fn report_cpu_error(&self, addr: u32) {
+    pub fn report_cpu_error(&self, addr: u64) {
         let mut state = self.state.lock();
-        state.regs[(REG_CPU_ERROR_ADDR / 4) as usize] = addr;
+        state.regs[(REG_CPU_ERROR_ADDR / 4) as usize] = addr as u32;
         state.regs[(REG_CPU_ERROR_STAT / 4) as usize] = 1u32 << 10; // cpu address error
         dlog_dev!(LogModule::Mc, "MC: CPU Error at {:08x}", addr);
         eprintln!("MC: CPU Error at {:08x}", addr);
     }
 
-    pub fn report_gio_timeout(&self, addr: u32) {
+    /// A GIO access nobody answered. Returns whether the MC aborts it with a
+    /// bus error (`CPUCTRL1.ABORT_EN`, which the PROM sets at power-on).
+    pub fn report_gio_timeout(&self, addr: u64) -> bool {
         let mut state = self.state.lock();
-        state.regs[(REG_GIO_ERROR_ADDR / 4) as usize] = addr;
+        state.regs[(REG_GIO_ERROR_ADDR / 4) as usize] = addr as u32;
         // TIME bit (10) only set when ABORT_EN (CPUCTRL1 bit 4) is enabled
         let abort_en = (state.regs[(REG_CPUCTRL1 / 4) as usize] & (1 << 4)) != 0;
         if abort_en {
@@ -516,6 +520,7 @@ impl MemoryController {
         }
         dlog_dev!(LogModule::Mc, "MC: GIO Timeout at {:08x} (abort_en={})", addr, abort_en);
         eprintln!("MC: GIO Timeout at {:08x}", addr);
+        abort_en
     }
 
     // ── Accessors for the DMA engine in mc_vdma.rs ──────────────────────────
@@ -527,7 +532,7 @@ impl MemoryController {
 
     /// The IOC handle, cloned out so the caller does not hold the MC state lock
     /// while raising an interrupt.
-    pub(crate) fn ioc(&self) -> Option<Ioc> { self.state.lock().ioc.clone() }
+    pub(crate) fn dma_irq(&self) -> Option<IrqLine> { self.state.lock().dma_irq.clone() }
 
     /// Current GIO64_ARB value (bus widths / arbitration per GIO slot).
     pub(crate) fn gio64_arb(&self) -> u32 { self.state.lock().regs[(REG_GIO64_ARB / 4) as usize] }
@@ -630,8 +635,8 @@ impl MemoryControllerState {
 }
 
 impl BusDevice for MemoryController {
-    fn read32(&self, addr: u32) -> BusRead32 {
-        let offset = (addr - MC_BASE) as usize;
+    fn read32(&self, addr: u64) -> BusRead32 {
+        let offset = (addr - MC_BASE as u64) as usize;
 
         if offset >= MC_SIZE as usize {
             return BusRead32::err();
@@ -730,8 +735,8 @@ impl BusDevice for MemoryController {
         val
     }
 
-    fn write32(&self, addr: u32, val: u32) -> u32 {
-        let offset = (addr - MC_BASE) as usize;
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        let offset = (addr - MC_BASE as u64) as usize;
         dlog_dev!(LogModule::Mc, "MC: Write addr {:04x} = {:08x}", addr, val);
 
         if offset >= MC_SIZE as usize {
@@ -877,8 +882,8 @@ impl BusDevice for MemoryController {
                 dma.run = (dma.run & !0xF) | (val & 0xF);
                 drop(dma);
                 if val == 0 {
-                    if let Some(ioc) = &state.ioc {
-                        ioc.set_interrupt(IocInterrupt::McDma, false);
+                    if let Some(irq) = &state.dma_irq {
+                        irq.set(false);
                     }
                 }
                 BUS_OK
@@ -994,24 +999,24 @@ impl BusDevice for MemoryController {
     }
 
     // MC is a 32-bit device - 8/16-bit accesses not supported
-    fn read8(&self, _addr: u32) -> BusRead8 {
+    fn read8(&self, _addr: u64) -> BusRead8 {
         unimplemented!("MC does not support 8-bit reads");
     }
 
-    fn write8(&self, _addr: u32, _val: u8) -> u32 {
+    fn write8(&self, _addr: u64, _val: u8) -> u32 {
         unimplemented!("MC does not support 8-bit writes");
     }
 
-    fn read16(&self, _addr: u32) -> BusRead16 {
+    fn read16(&self, _addr: u64) -> BusRead16 {
         unimplemented!("MC does not support 16-bit reads");
     }
 
-    fn write16(&self, _addr: u32, _val: u16) -> u32 {
+    fn write16(&self, _addr: u64, _val: u16) -> u32 {
         unimplemented!("MC does not support 16-bit writes");
     }
 
     // 64-bit access: implement by calling 32-bit ops twice
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn read64(&self, addr: u64) -> BusRead64 {
         let r_hi = self.read32(addr);
         if !r_hi.is_ok() { return BusRead64 { status: r_hi.status, data: 0 }; }
         let r_lo = self.read32(addr + 4);
@@ -1019,7 +1024,7 @@ impl BusDevice for MemoryController {
         BusRead64::ok(((r_hi.data as u64) << 32) | (r_lo.data as u64))
     }
 
-    fn write64(&self, addr: u32, val: u64) -> u32 {
+    fn write64(&self, addr: u64, val: u64) -> u32 {
         let hi = (val >> 32) as u32;
         let lo = val as u32;
         let ws = self.write32(addr, hi);
@@ -1358,15 +1363,15 @@ mod tests {
     fn sysid_matches_guinness_profile() {
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
         let indy = MemoryController::new(eeprom.clone(), true, [0u32; 4]);
-        let sysid = indy.read32(MC_BASE + REG_SYSID).data;
+        let sysid = indy.read32((MC_BASE + REG_SYSID) as u64).data;
         assert_eq!(sysid, 0x0000_0013, "Indy IP24 (guinness) SYSID");
-        let gio_arb = indy.read32(MC_BASE + REG_GIO64_ARB).data;
+        let gio_arb = indy.read32((MC_BASE + REG_GIO64_ARB) as u64).data;
         assert_eq!(gio_arb & 0x400, 0x400, "Indy ONE_GIO set");
 
         let fullhouse = MemoryController::new(eeprom, false, [0u32; 4]);
-        let sysid = fullhouse.read32(MC_BASE + REG_SYSID).data;
+        let sysid = fullhouse.read32((MC_BASE + REG_SYSID) as u64).data;
         assert_eq!(sysid, 0x0000_0013, "Indigo2-class (fullhouse) SYSID — Rev C on both profiles, see MAME mc.cpp");
-        let gio_arb = fullhouse.read32(MC_BASE + REG_GIO64_ARB).data;
+        let gio_arb = fullhouse.read32((MC_BASE + REG_GIO64_ARB) as u64).data;
         assert_eq!(gio_arb & 0x400, 0, "fullhouse dual GIO — ONE_GIO clear");
     }
 
@@ -1377,10 +1382,10 @@ mod tests {
 
         // Write to CPUCTRL0 (offset 0) via BusDevice
         let val = 0x12345678;
-        assert_eq!(mc.write32(MC_BASE + REG_CPUCTRL0, val), BUS_OK); // BusDevice implemented on MemoryController
+        assert_eq!(mc.write32((MC_BASE + REG_CPUCTRL0) as u64, val), BUS_OK); // BusDevice implemented on MemoryController
 
         // Read back via BusDevice
-        { let _r = mc.read32(MC_BASE + REG_CPUCTRL0); assert!(_r.is_ok(), "Failed to read CPUCTRL0"); assert_eq!(_r.data, val); }
+        { let _r = mc.read32((MC_BASE + REG_CPUCTRL0) as u64); assert!(_r.is_ok(), "Failed to read CPUCTRL0"); assert_eq!(_r.data, val); }
     }
 
     /// Phase 1.7 round-trip: a fresh MC loaded from a captured save_state must
@@ -1392,7 +1397,7 @@ mod tests {
         let src = MemoryController::new(eeprom.clone(), true, [128, 128, 0, 0]);
 
         // Mutate registers and DMA state so we're not testing all-default state.
-        let _ = src.write32(MC_BASE + REG_CPUCTRL0, 0xdead_beef);
+        let _ = src.write32((MC_BASE + REG_CPUCTRL0) as u64, 0xdead_beef);
         {
             let mut s = src.state.lock();
             s.sys_semaphore = true;
@@ -1438,7 +1443,7 @@ mod tests {
             crate::platform::get_host_ticks().wrapping_sub(freq * 100);
 
         mc.start();
-        let rpss = mc.read32(MC_BASE + REG_RPSS_CTR).data;
+        let rpss = mc.read32((MC_BASE + REG_RPSS_CTR) as u64).data;
         mc.stop();
 
         // The 100 s stale interval is 1.5e9 counts at 50 MHz through DIV=10
@@ -1449,7 +1454,7 @@ mod tests {
 
     #[test]
     fn memcfg_encode_decode_roundtrip() {
-        use crate::physical::{BANK_SIZE, HIMEM_BASE, LOMEM_BASE};
+        use crate::ip22_bus::{BANK_SIZE, HIMEM_BASE, LOMEM_BASE};
         for (base, size) in [
             (LOMEM_BASE, 128u32),
             (LOMEM_BASE + BANK_SIZE, 128),
@@ -1465,21 +1470,21 @@ mod tests {
 
     #[test]
     fn himem_synthesis_after_lomem_post() {
-        use crate::physical::{BANK_SIZE, LOMEM_BASE};
+        use crate::ip22_bus::{BANK_SIZE, LOMEM_BASE};
 
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
         let mc = MemoryController::new(eeprom, true, [128, 128, 64, 64]);
         let h0 = MemoryController::encode_memcfg_half(LOMEM_BASE, 128).unwrap();
         let h1 = MemoryController::encode_memcfg_half(LOMEM_BASE + BANK_SIZE, 128).unwrap();
         let memcfg0 = ((h0 as u32) << 16) | (h1 as u32);
-        assert_eq!(mc.write32(MC_BASE + REG_MEMCFG0, memcfg0), BUS_OK);
+        assert_eq!(mc.write32((MC_BASE + REG_MEMCFG0) as u64, memcfg0), BUS_OK);
 
         let (m0, m1) = mc.get_memcfg();
         let addrs = mc.parse_memcfg(m0, m1);
         assert!(addrs[0].is_some() && addrs[1].is_some());
         assert!(addrs[2].is_some(), "bank 2 should be synthesized");
         assert!(addrs[3].is_some(), "bank 3 should be synthesized");
-        assert_eq!(addrs[2].unwrap().0, crate::physical::HIMEM_BASE);
+        assert_eq!(addrs[2].unwrap().0, crate::ip22_bus::HIMEM_BASE);
     }
 
     /// The IP28 PROM's own MEMCFG0 write, copied from a POST trace:
@@ -1539,19 +1544,19 @@ mod tests {
         assert_eq!((base, mask, limit), (0x2000_0000, 0x0fff_ffff, 0x2000_0000));
         let bank = PpMemory::new(512);
         bank.set_addr_mask(mask);
-        bank.write32(base, 0x1234_5678);
-        assert_eq!(bank.read32(base + (256 << 20)).data, 0x1234_5678);
+        bank.write32(base as u64, 0x1234_5678);
+        assert_eq!(bank.read32(base as u64 + (256 << 20)).data, 0x1234_5678);
         let (_, mask, limit) = mc.parse_memcfg(0x7f20_0000, 0)[0].unwrap();
         assert_eq!((mask, limit), (0x1fff_ffff, 0x2000_0000));
         bank.set_addr_mask(mask);
-        bank.write32(base + (256 << 20), 0x8765_4321);
-        assert_eq!(bank.read32(base).data, 0x1234_5678);
-        assert_eq!(bank.read32(base + (256 << 20)).data, 0x8765_4321);
-        assert_eq!(bank.read32(base + (512 << 20)).data, 0x1234_5678);
+        bank.write32(base as u64 + (256 << 20), 0x8765_4321);
+        assert_eq!(bank.read32(base as u64).data, 0x1234_5678);
+        assert_eq!(bank.read32(base as u64 + (256 << 20)).data, 0x8765_4321);
+        assert_eq!(bank.read32(base as u64 + (512 << 20)).data, 0x1234_5678);
 
         assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x2000_0000, 512), Some(0x7f20));
         assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x4000_0000, 512), Some(0x7f40));
-        mc.write32(MC_BASE + REG_MEMCFG0, 0x7f20_7f40);
+        mc.write32((MC_BASE + REG_MEMCFG0) as u64, 0x7f20_7f40);
         let (m0, m1) = mc.get_memcfg();
         assert_eq!(m1, 0, "IP28 must leave the other banks to the PROM");
         assert_eq!(mc.parse_memcfg(m0, m1), [
@@ -1568,9 +1573,9 @@ mod tests {
         for (size_mb, want) in [(8, (0, 1)), (16, (3, 0)), (32, (3, 1)), (64, (15, 0)), (128, (15, 1))] {
             assert_eq!(MemoryController::memcfg_size_rank_at(22, size_mb), Some(want), "{size_mb} MB");
         }
-        let half = MemoryController::encode_memcfg_half_at(22, crate::physical::LOMEM_BASE, 64).unwrap();
+        let half = MemoryController::encode_memcfg_half_at(22, crate::ip22_bus::LOMEM_BASE, 64).unwrap();
         let (base, _, limit) = MemoryController::memcfg_bank_info_at(22, half, 64).unwrap();
-        assert_eq!(base, crate::physical::LOMEM_BASE);
+        assert_eq!(base, crate::ip22_bus::LOMEM_BASE);
         assert_eq!(limit, 64 << 20);
     }
 }

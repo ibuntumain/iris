@@ -217,7 +217,7 @@ impl ShaderCompiler {
         //
         // This was invisible until rex3_simd::try_fastclear_block was removed:
         // that pre-loop bailout also ignored CID, so both engines wrote
-        // COLORVRAM and agreed. See rules/rex3/fastclear-cid-divergence.md.
+        // COLORVRAM and agreed. See clanker/rex3/fastclear-cid-divergence.md.
         let dm1_val = if (clipmode_key >> CLIPMODE_CIDMATCH_SHIFT) & 0xF != 0xF {
             dm1_val & !(1 << 17)
         } else {
@@ -1221,7 +1221,7 @@ fn emit_shader(
             // fb_rgb and fb_aux share the same stride/layout (2048 u32 entries per row),
             // so the byte offset into fb_aux is the same as into fb_rgb. Subtracting
             // the wrong base is a wild pointer, not a wrong pixel — see
-            // rules/rex3/cidmatch-aux-plane-base.md.
+            // clanker/rex3/cidmatch-aux-plane-base.md.
             let byte_off64 = b.ins().isub(px_ptr, pctx.fb_rgb);
             b.ins().iadd(pctx.fb_aux, byte_off64)
         };
@@ -1601,8 +1601,12 @@ fn emit_shader(
         b.ins().ishl(shifter, pad_bits)
     };
 
-    if !stopony {
-        // Span / block without stopony: primitive done after one row
+    // A SPAN never steps y: at its end XSTART is left one past XEND and
+    // YSTART is untouched (rex3.pdf §3.5.3; draw_span; MAME writes back only
+    // x). Only a BLOCK row end wraps x to XSAVE and steps y.
+    let is_span = dm0.adrmode() == DRAWMODE0_ADRMODE_SPAN;
+    if !stopony || is_span {
+        // Span, or block without stopony: primitive done after one row
         let zero8 = b.ins().iconst(types::I8, 0);
         st_bool!(ctx_off!(mid_primitive), zero8);
         // For HOSTR: flush accumulated shifter to ctx.hostrw before returning.
@@ -1613,8 +1617,10 @@ fn emit_shader(
         if is_hostw || is_hostr {
             b.ins().store(mem, hostcnt_row_reset, ctx_ptr, ir::immediates::Offset32::new(ctx_off!(hostcnt) as i32));
         }
-        emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
+        let (end_x, end_y) = if is_span { (xstart_next, ystart_v) } else { (xsave_v, ystart_next) };
+        emit_writeback(&mut b, ctx_ptr, &mem, end_x, end_y,
             dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
+        emit_row_end_pattern_reset(&mut b, ctx_ptr, &mem, dm0);
         b.ins().jump(loop_end, &[]);
     } else {
         // Block with stopony: advance y and check y_end
@@ -1638,6 +1644,7 @@ fn emit_shader(
         }
         emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
             dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
+        emit_row_end_pattern_reset(&mut b, ctx_ptr, &mem, dm0);
         b.ins().jump(loop_end, &[]);
 
         b.switch_to_block(y_cont_block); b.seal_block(y_cont_block);
@@ -1659,6 +1666,7 @@ fn emit_shader(
             b.ins().store(mem, hostcnt_row_reset, ctx_ptr, ir::immediates::Offset32::new(ctx_off!(hostcnt) as i32));
             emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
                 dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
+        emit_row_end_pattern_reset(&mut b, ctx_ptr, &mem, dm0);
             b.ins().jump(loop_end, &[]);
         } else {
             // Continue loop: reset x to xsave, new row
@@ -1866,6 +1874,29 @@ fn emit_draw_iline(
         b.ins().band_imm_s(shifted, 7)
     };
 
+    // BRESROUND bit for this octant (BRESRNDINC2[31:24], see BRESROUND_BIT):
+    // set = a step with d == 0 goes diagonal, clear = straight. The bit
+    // position per octant is packed one nibble per octant into a constant.
+    let round_set_v = {
+        const PACKED: u32 = {
+            let mut k = 0u32;
+            let mut o = 0;
+            while o < 8 {
+                k |= crate::dev::ng1::rex3::BRESROUND_BIT[o] << (o * 4);
+                o += 1;
+            }
+            k
+        };
+        let packed = b.ins().iconst(types::I32, PACKED as i64);
+        let sh = b.ins().ishl_imm_s(octant_v, 2);
+        let bitpos = b.ins().ushr(packed, sh);
+        let bitpos = b.ins().band_imm_s(bitpos, 0xF);
+        let rnd = b.ins().ushr_imm_s(bres2_v, 24);
+        let bit = b.ins().ushr(rnd, bitpos);
+        let bit = b.ins().band_imm_s(bit, 1);
+        b.ins().icmp_imm_s(IntCC::NotEqual, bit, 0)
+    };
+
     // incr1: 20-bit, always positive
     let incr1_v = b.ins().band_imm_s(bres_v, 0xFFFFF);
 
@@ -1918,8 +1949,15 @@ fn emit_draw_iline(
         let is_neg = b.ins().icmp_imm_s(IntCC::SignedLessThan, d, 0);
         b.ins().select(is_neg, neg, d)
     };
-    let dx_gt_dy = b.ins().icmp(IntCC::SignedGreaterThan, dx_abs, dy_abs);
-    let major_v = b.ins().select(dx_gt_dy, dx_abs, dy_abs);
+    // F_LINE/A_LINE: the length along the octant's major axis (their octant
+    // comes from the fixed-point deltas); I_LINE: the longer integer delta.
+    let fract = matches!(dm0.adrmode(), DRAWMODE0_ADRMODE_F_LINE | DRAWMODE0_ADRMODE_A_LINE);
+    let major_v = if fract {
+        b.ins().select(y_major_v, dy_abs, dx_abs)
+    } else {
+        let dx_gt_dy = b.ins().icmp(IntCC::SignedGreaterThan, dx_abs, dy_abs);
+        b.ins().select(dx_gt_dy, dx_abs, dy_abs)
+    };
     let pixel_count_v = b.ins().iadd_imm_s(major_v, 1);
 
     // iterate_one = !stoponx && !stopony (step-mode: always draw exactly 1 pixel)
@@ -2260,7 +2298,7 @@ fn emit_draw_iline(
     // MAME is no reference: newport.cpp models the stipple as a local
     // `bit = 31` per draw with no persistent cursor, no lsrcount, and no
     // LSADVLAST (it only logs bit 14). Spec text for bit 14 is just "Enables
-    // stipple advance at the end of a line" (docs/rex3.md). To be checked
+    // stipple advance at the end of a line" (docs/Indy/rex3.md). To be checked
     // against a real XL Indy before treating either behaviour as settled.
     let advance_pattern: Value = if dm0.lsadvlast() || iterate_one {
         b.ins().iconst(types::I8, 1)
@@ -2393,8 +2431,10 @@ fn emit_draw_iline(
         // incry2: ±1 based on YDEC (inverted: YDEC=0→-1, YDEC=1→+1)
         let incry2 = b.ins().select(ydec_v, cp1i, cm1i);
 
-        // Choose step 1 or step 2 based on d < 0
-        let d_neg   = b.ins().icmp_imm_s(IntCC::SignedLessThan, d_v, 0);
+        // Step 1 (straight) when d < 0, or d <= 0 with BRESROUND clear.
+        let d_lt    = b.ins().icmp_imm_s(IntCC::SignedLessThan, d_v, 0);
+        let d_le    = b.ins().icmp_imm_s(IntCC::SignedLessThanOrEqual, d_v, 0);
+        let d_neg   = b.ins().select(round_set_v, d_lt, d_le);
         let dx_step = b.ins().select(d_neg, incrx1, incrx2);
         let dy_step = b.ins().select(d_neg, incry1, incry2);
         let d_incr  = b.ins().select(d_neg, incr1_v, incr2_v);
@@ -2586,6 +2626,21 @@ fn emit_logic_op(b: &mut FunctionBuilder, logicop: u32, src: Value, dst: Value) 
 }
 
 /// Write back all mutable per-draw state from IR values to ctx.
+/// At a row or primitive end the interpreter restarts both pattern bit
+/// positions at 31 whether or not this draw uses the patterns (draw_block,
+/// draw_span); `emit_writeback` stores only the enabled ones, so store the
+/// others here. A later draw that enables a pattern without DOSETUP starts
+/// from them.
+fn emit_row_end_pattern_reset(b: &mut FunctionBuilder, ctx_ptr: Value, mem: &MemFlagsData, dm0: &Dm0) {
+    let c31 = b.ins().iconst(types::I8, 31);
+    if !dm0.enzpattern() {
+        b.ins().store(*mem, c31, ctx_ptr, ir::immediates::Offset32::new(ctx_off!(zpat_bit) as i32));
+    }
+    if !dm0.enlspattern() {
+        b.ins().store(*mem, c31, ctx_ptr, ir::immediates::Offset32::new(ctx_off!(pat_bit) as i32));
+    }
+}
+
 fn emit_writeback(
     b: &mut FunctionBuilder,
     ctx_ptr: Value,

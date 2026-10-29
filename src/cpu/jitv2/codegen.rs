@@ -73,7 +73,7 @@ pub struct Codegen {
     /// that invalidates such a measurement: `developer` flips `opt_level` to
     /// `none` and injects a per-instruction trace callout, so its emitted
     /// code is not the code production runs (see
-    /// `rules/jitv2/block-fragmentation-blocks-cse.md`, where this cost a
+    /// `clanker/jitv2/block-fragmentation-blocks-cse.md`, where this cost a
     /// whole wrong conclusion once). `zz_corpus_sizes` consequently reported
     /// `total_bytes=0` in exactly the build it was supposed to measure. It's
     /// one `u32` written once per compile off the hot path, so gating it
@@ -411,7 +411,7 @@ static CODEGEN_OPT_LEVEL_SPEED: std::sync::atomic::AtomicBool = std::sync::atomi
 /// (`split_plain`) exactly as it does within one block — so merging the
 /// per-word blocks buys nothing on its own, and isn't done. Only the
 /// preamble's frequency matters. This corrects the ranking in
-/// `rules/jitv2/block-fragmentation-blocks-cse.md`, which inferred
+/// `clanker/jitv2/block-fragmentation-blocks-cse.md`, which inferred
 /// "fragmentation" from block-boundary-separated duplicate loads without
 /// testing whether a boundary alone blocks forwarding.
 ///
@@ -486,7 +486,7 @@ impl Codegen {
     /// won't show up in emitted code there without `IRIS_OPT_SPEED=1`. The
     /// deferral itself is still exercised, which is what a correctness boot
     /// is for.) See
-    /// `rules/jitv2/interrupt-check-frequency-gates-gpr-forwarding.md`.
+    /// `clanker/jitv2/interrupt-check-frequency-gates-gpr-forwarding.md`.
     pub fn interrupt_run() -> u32 {
         if cfg!(feature = "jitv2_lockstep") {
             return 1;
@@ -2314,7 +2314,7 @@ impl Codegen {
         // match back to the FuncId that actually owned them).
         // `IRIS_JIT_DISASM=1` dumps every compiled region's machine code to
         // stdout — the tool for answering "what did codegen actually emit?"
-        // without guessing (see rules/jitv2/callout-arg0-is-core-ptr.md, where
+        // without guessing (see clanker/jitv2/callout-arg0-is-core-ptr.md, where
         // it found a 2152-reload spill storm that byte counts alone had
         // mis-attributed). Cranelift only fills `CompiledCode::vcode` when
         // asked *before* compiling, hence the flag here rather than at the
@@ -4113,12 +4113,17 @@ fn emit_tc_mapped(ctx: &mut EmitCtx, phys: Value) -> Value {
     // form and 4.0 s with this one.
     //
     // Cranelift's `ishl` masks the shift count to 6 bits, as x86 and aarch64
-    // do, so an out-of-range `region` wraps rather than being undefined.
+    // do, so a page at or above 4GB (the Octane's memory reaches past it)
+    // would wrap onto region `phys >> 26 & 63`: bound it, as `bitmap_maps`
+    // does. That keeps such pages in the nutlb, where the interpreter wants
+    // them, at the cost of one compare here.
     let region = ctx.builder.ins().ushr_imm_s(phys, crate::ppmem::BITMAP_SHIFT as i64);
     let one = ctx.builder.ins().iconst(i64t, 1);
     let bit = ctx.builder.ins().ishl(one, region);
     let hit = ctx.builder.ins().band(bits, bit);
-    ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, hit, 0)
+    let hit = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, hit, 0);
+    let in_window = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedLessThan, region, 64);
+    ctx.builder.ins().band(hit, in_window)
 }
 
 /// The tcache inline path for a tagless cache (`JitDcGeometry::tagless`, the
@@ -4128,9 +4133,8 @@ fn emit_tc_mapped(ctx: &mut EmitCtx, phys: Value) -> Value {
 /// byte lanes and (for stores, in `emit_mem_write_split`) generation bump as
 /// the tagged path, less the tag match, LRU and dirty bit.
 ///
-/// `phys` is cut to 32 bits first, as the callout does: the shadow cache
-/// hands `phys as u32` to the bus, so an address above 4GB aliases here
-/// exactly as it does there.
+/// `phys` is below 4GB: `nutlb_fill` keeps pages above it out of the nutlb,
+/// so they never reach an inline path.
 fn emit_tagless_tail(
     ctx: &mut EmitCtx, phys: Value, size: MemSize,
     fast_block: ir::Block, slow_block: ir::Block, join_block: ir::Block,
@@ -4138,7 +4142,6 @@ fn emit_tagless_tail(
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
-    let phys = ctx.builder.ins().band_imm_s(phys, 0xFFFF_FFFF);
     let mapped = emit_tc_mapped(ctx, phys);
     ctx.builder.ins().brif(mapped, fast_block, &[], slow_block, &[]);
 
@@ -4197,7 +4200,7 @@ impl<'a, 'b> EmitCtx<'a, 'b> {
 ///
 /// `addr` is baked as an immediate — a call target is the one place a
 /// constant beats a load, because the operand has to reach a register anyway
-/// (see `rules/jitv2/`; measured 1137 -> 916 bytes on a 40-call microbench).
+/// (see `clanker/jitv2/`; measured 1137 -> 916 bytes on a 40-call microbench).
 fn emit_mem_helper_call(ctx: &mut EmitCtx, addr: i64, vaddr: Value, third: Value) -> Value {
     let ptr_ty = ctx.module.target_config().pointer_type();
     let callee = ctx.builder.ins().iconst(ptr_ty, addr);
@@ -5084,7 +5087,7 @@ fn emit_ctc1(ctx: &mut EmitCtx, _fr_mode: FrMode) {
 
 /// After an FP arithmetic op has computed its result but *before* it is
 /// committed: fold in caller-computed exception flags (never read from the
-/// host FPU — see `rules/jitv2/fpu-flags-are-computed-not-read.md`), update
+/// host FPU — see `clanker/jitv2/fpu-flags-are-computed-not-read.md`), update
 /// `core.fpu_fcsr`'s Cause bits (rewritten every instruction, never OR'd —
 /// R4000/VR5000 manuals: "the results of only one instruction"), and either
 /// commit the result via `write_result` and raise `EXC_FPE` if any enabled
@@ -5176,6 +5179,46 @@ fn emit_fpu_update_fcsr(ctx: &mut EmitCtx, flags: Value, write_result: impl Fn(&
 
     ctx.builder.switch_to_block(continue_block);
     ctx.builder.seal_block(continue_block);
+}
+
+/// `emit_fpu_update_fcsr` for an instruction whose caller has proved `flags`
+/// is zero (see `emit_is_normal_s`/`_d`: ordinary finite operands cannot
+/// raise Invalid or Divide-by-Zero, and this model raises no other flag for
+/// ADD/SUB/MUL/DIV/SQRT). Cause must still end up clear — it reflects only
+/// the last instruction — but the store is skipped when Cause is already
+/// clear: writing back the value that is already in memory is not
+/// observable to the guest, and skipping it keeps consecutive FP
+/// instructions from serialising on a store-to-load dependency through
+/// `core.fpu_fcsr`. Cause is clear in the steady state (every arithmetic
+/// instruction either clears it here or set it from an instruction that has
+/// already been followed by a clear), so the common path is one load, one
+/// test and the destination write.
+fn emit_fpu_update_fcsr_no_flags(ctx: &mut EmitCtx, write_result: impl Fn(&mut EmitCtx)) {
+    let mem = MemFlagsData::trusted();
+    let i32t = ir::types::I32;
+    const FCSR_CM: i64 = 0x0001_f000;
+
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let cause = ctx.builder.ins().band_imm_s(fcsr, FCSR_CM);
+    let cause_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, cause, 0);
+
+    let clear_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(cause_set, clear_block, &[], continue_block, &[]);
+
+    // Cold: only the first arithmetic instruction after one that left Cause
+    // set comes here; every instruction that follows has Cause already clear.
+    ctx.builder.switch_to_block(clear_block);
+    ctx.builder.set_cold_block(clear_block);
+    ctx.builder.seal_block(clear_block);
+    let cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
+    ctx.builder.ins().store(mem, cleared, ctx.core_ptr, fcsr_off);
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+    write_result(ctx);
 }
 
 /// Unimplemented Operation (Cause.E): R4000/VR5000 manuals — no Enable or
@@ -5385,6 +5428,25 @@ fn emit_is_subnormal_or_qnan_d(ctx: &mut EmitCtx, bits: Value) -> Value {
     b.ins().bor(is_subnormal, is_qnan)
 }
 
+/// `bits` is an ordinary finite number of the given format: biased exponent
+/// neither zero (zero or subnormal) nor all ones (infinity or NaN). Exactly
+/// the operand class for which a computational instruction provably takes no
+/// Unimplemented Operation (`emit_check_denorm_operand` is false for both
+/// operand checks), has no signalling-NaN operand (`fpu_arith_flags_*` is
+/// zero), and — for DIV — cannot divide by zero (the divisor is nonzero).
+/// One unsigned range test on the exponent field: `e - 1 < 0xFE` in exponent
+/// units, i.e. `(bits & EXP_MASK) - BIAS < MAX_EXP_BITS`.
+fn emit_is_normal_s(ctx: &mut EmitCtx, bits: Value) -> Value {
+    let e = ctx.builder.ins().band_imm_s(bits, 0x7F80_0000);
+    let biased = ctx.builder.ins().iadd_imm_s(e, -(0x0080_0000i64));
+    ctx.builder.ins().icmp_imm_s(IntCC::UnsignedLessThan, biased, 0x7F00_0000)
+}
+fn emit_is_normal_d(ctx: &mut EmitCtx, bits: Value) -> Value {
+    let e = ctx.builder.ins().band_imm_s(bits, 0x7FF0_0000_0000_0000u64 as i64);
+    let biased = ctx.builder.ins().iadd_imm_s(e, -(0x0010_0000_0000_0000i64));
+    ctx.builder.ins().icmp_imm_s(IntCC::UnsignedLessThan, biased, 0x7FE0_0000_0000_0000u64 as i64)
+}
+
 /// Result-only half: subnormal-and-nonzero, no NaN check (a computed
 /// arithmetic result's denormal-ness is what finding 7's Table 9-1 gates on;
 /// zero itself, exponent==0 mantissa==0, is explicitly not denormal).
@@ -5417,9 +5479,16 @@ fn emit_is_subnormal_d(ctx: &mut EmitCtx, bits: Value) -> Value {
 /// `write_result`/`write_zero` are each called on exactly one path — the
 /// real result when not flushing, a signed zero of the given width when
 /// flushing.
+///
+/// `flags` is `Some` for the general case and `None` when the caller has
+/// proved the instruction raises no flag (the fast path of
+/// `emit_fbinop_s`/`_d` and `emit_fsqrt_s`/`_d`, whose operands passed
+/// `emit_is_normal_s`/`_d`). `None` selects `emit_fpu_update_fcsr_no_flags`
+/// for the not-denormal case; the denormal-result rule below is identical
+/// either way because it ignores `flags` entirely.
 fn emit_fpu_update_fcsr_arith(
     ctx: &mut EmitCtx,
-    flags: Value,
+    flags: Option<Value>,
     result_is_denorm: Value,
     result_is_negative: Value,
     write_result: impl Fn(&mut EmitCtx),
@@ -5471,7 +5540,10 @@ fn emit_fpu_update_fcsr_arith(
 
     ctx.builder.switch_to_block(normal_block);
     ctx.builder.seal_block(normal_block);
-    emit_fpu_update_fcsr(ctx, flags, &write_result);
+    match flags {
+        Some(flags) => emit_fpu_update_fcsr(ctx, flags, &write_result),
+        None => emit_fpu_update_fcsr_no_flags(ctx, &write_result),
+    }
     ctx.builder.ins().jump(continue_block, &[]);
 
     ctx.builder.switch_to_block(continue_block);
@@ -5481,7 +5553,7 @@ fn emit_fpu_update_fcsr_arith(
 /// IR counterparts of `mips_exec.rs`'s `fpu_arith_flags_*` free functions —
 /// same bit-pattern checks, no host FPU status read, feeding `flags` into
 /// `emit_fpu_update_fcsr`/`emit_fpu_update_fcsr_arith`. See
-/// `rules/jitv2/fpu-flags-are-computed-not-read.md`.
+/// `clanker/jitv2/fpu-flags-are-computed-not-read.md`.
 const FCSR_FV_I64: i64 = 0x0000_0040;
 const FCSR_FZ_I64: i64 = 0x0000_0020;
 
@@ -5938,7 +6010,7 @@ fn emit_regjump(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], r
 /// (offset 0x68) was the single hottest address in the whole region: **79
 /// loads, 0 stores** — 33% of all GPR-range loads, all of them reading a
 /// constant. See
-/// `rules/jitv2/interrupt-check-frequency-gates-gpr-forwarding.md`, where
+/// `clanker/jitv2/interrupt-check-frequency-gates-gpr-forwarding.md`, where
 /// these showed up as "loads with nothing to forward from" before the cause
 /// was understood.
 fn emit_read_gpr(ctx: &mut EmitCtx, reg: u32) -> Value {
@@ -6235,7 +6307,7 @@ fn emit_vbase(ctx: &mut EmitCtx) -> Value {
 ///   next physical page's word 0, recorded as `StopReason::ForeignPageSlot`.
 ///   Indexing `instrs` here is not merely wrong, it panics; that is the bug
 ///   this helper exists to make unrepresentable (see
-///   `rules/jitv2/nested-delay-slot-across-page-boundary.md`).
+///   `clanker/jitv2/nested-delay-slot-across-page-boundary.md`).
 /// - **Forbidden.** `Classify::Excluded` (with fallback admission off) or
 ///   `Classify::RegionBoundary` — `visit` returns `false` without marking, and
 ///   the caller records `StopReason::Excluded` on its own edge.
@@ -6380,7 +6452,7 @@ fn emit_absolute_pc_exit_block_body(
     // which are the hot branch/jump transfer paths. Paid deliberately: the
     // alternative is a correctness hazard on a real, non-debug path.
     //
-    // See rules/jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md — the
+    // See clanker/jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md — the
     // upstream guarantee this used to rely on was removed on 2026-09-02 and
     // immediately broke `emit_foreign_page_annulled_not_taken_exit`, which had
     // been silently inheriting `in_delay_slot = 1`.
@@ -6464,7 +6536,7 @@ fn emit_foreign_page_annulled_not_taken_exit(ctx: &mut EmitCtx, word: WordOffset
     // (head). That bracket is now lockstep/developer-only — its other
     // reader, `deliver_exception`, takes BD as an argument — so this exit
     // owns the state it depends on. Exactly the fragility
-    // `rules/jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md` flagged
+    // `clanker/jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md` flagged
     // for the mirror-image case. Caught by
     // `nested_likely_at_last_word_not_taken_annuls_foreign_slot_like_interpreter`
     // and `beql_not_taken_at_0xffc_skips_slot_and_lands_on_fallthrough_directly`.
@@ -7495,6 +7567,58 @@ type SemanticsEmitter = fn(&mut EmitCtx);
 // bindings for readability.
 type Cp1Emitter = fn(&mut EmitCtx, fr_mode: FrMode);
 
+/// Result of a binary FP arithmetic op, in the current block: the raw result
+/// bits plus the two properties `emit_fpu_update_fcsr_arith` needs (whether
+/// the result is a denormalized nonzero, and whether its sign bit is set).
+/// Shared by both arms of `emit_fbinop_s`/`_d`'s operand split, so the
+/// arithmetic and its result checks cannot drift between them.
+fn emit_fbinop_result_s(
+    ctx: &mut EmitCtx,
+    op: fn(&mut FunctionBuilder, Value, Value) -> Value,
+    fs_bits: Value,
+    ft_bits: Value,
+) -> (Value, Value, Value) {
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
+    let ft_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), ft_bits);
+    let result = op(ctx.builder, fs_val, ft_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    let is_denorm = emit_is_subnormal_s(ctx, result_bits);
+    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
+    (result_bits, is_denorm, is_negative)
+}
+fn emit_fbinop_result_d(
+    ctx: &mut EmitCtx,
+    op: fn(&mut FunctionBuilder, Value, Value) -> Value,
+    fs_bits: Value,
+    ft_bits: Value,
+) -> (Value, Value, Value) {
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
+    let ft_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), ft_bits);
+    let result = op(ctx.builder, fs_val, ft_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    let is_denorm = emit_is_subnormal_d(ctx, result_bits);
+    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
+    (result_bits, is_denorm, is_negative)
+}
+
+/// Write the signed zero the Table 9-1/7-1 underflow-flush path delivers:
+/// `negative` selects the sign, the magnitude is always zero. Split out
+/// because both the operand-class arms of an emitter pass the same closure.
+fn emit_write_signed_zero_s(ctx: &mut EmitCtx, fd: u32, negative: Value, fr_mode: FrMode) {
+    let zero = ctx.builder.ins().iconst(ir::types::I32, 0);
+    let neg32 = ctx.builder.ins().uextend(ir::types::I32, negative);
+    let sign = ctx.builder.ins().ishl_imm_s(neg32, 31);
+    let signed_zero = ctx.builder.ins().bor(zero, sign);
+    emit_write_fpr_w(ctx, fd, signed_zero, fr_mode)
+}
+fn emit_write_signed_zero_d(ctx: &mut EmitCtx, fd: u32, negative: Value, fr_mode: FrMode) {
+    let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
+    let neg64 = ctx.builder.ins().uextend(ir::types::I64, negative);
+    let sign = ctx.builder.ins().ishl_imm_s(neg64, 63);
+    let signed_zero = ctx.builder.ins().bor(zero, sign);
+    emit_write_fpr_l(ctx, fd, signed_zero, fr_mode)
+}
+
 /// Binary FP arithmetic op shape shared by ADD/SUB/MUL/DIV, S or D format:
 /// read fs/ft, apply `op`, write fd, then `emit_fpu_update_fcsr`. Mirrors
 /// `exec_fadd_s`/`exec_fsub_d`/etc.'s common structure exactly — CU1 is
@@ -7502,6 +7626,18 @@ type Cp1Emitter = fn(&mut EmitCtx, fr_mode: FrMode);
 /// instruction. `flags_fn` computes the [6:2] flags `Value` from the raw
 /// operand bits (`emit_fpu_arith_flags_snan_only_s/d` for ADD/SUB/MUL,
 /// `emit_fpu_arith_flags_div_s/d` for DIV) — never read from the host FPU.
+///
+/// The operands are classified once, before anything else: if both are
+/// ordinary finite numbers (`emit_is_normal_s`/`_d`), no operand check can
+/// trap, no signalling NaN can be present and the divisor cannot be zero, so
+/// this instruction provably raises no flag and the fast arm only has to
+/// clear Cause (and even that store is skipped when Cause is already clear —
+/// see `emit_fpu_update_fcsr_no_flags`). Everything else — zero, denormal,
+/// infinity, NaN — takes the cold arm, which is the full previous body
+/// verbatim: per-operand Unimplemented checks, the by-value flags, the
+/// result-denormal rule and the full FCSR update. The result-denormal check
+/// stays on both arms because an underflowing result is reachable from
+/// ordinary finite operands.
 fn emit_fbinop_s(
     ctx: &mut EmitCtx,
     fr_mode: FrMode,
@@ -7515,26 +7651,41 @@ fn emit_fbinop_s(
 
     let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
     let ft_bits = emit_read_fpr_w(ctx, ft, fr_mode);
+
+    let fs_normal = emit_is_normal_s(ctx, fs_bits);
+    let ft_normal = emit_is_normal_s(ctx, ft_bits);
+    let operands_normal = ctx.builder.ins().band(fs_normal, ft_normal);
+    let fast_block = ctx.builder.create_block();
+    let slow_block = ctx.builder.create_block();
+    let done_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(operands_normal, fast_block, &[], slow_block, &[]);
+
+    ctx.builder.switch_to_block(slow_block);
+    ctx.builder.set_cold_block(slow_block);
+    ctx.builder.seal_block(slow_block);
     emit_check_denorm_operand(ctx, fs_bits, false);
     emit_check_denorm_operand(ctx, ft_bits, false);
     let flags = flags_fn(ctx, fs_bits, ft_bits);
-    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
-    let ft_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), ft_bits);
-    let result = op(ctx.builder, fs_val, ft_val);
-    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-    let is_denorm = emit_is_subnormal_s(ctx, result_bits);
-    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
+    let (result_bits, is_denorm, is_negative) = emit_fbinop_result_s(ctx, op, fs_bits, ft_bits);
     emit_fpu_update_fcsr_arith(
-        ctx, flags, is_denorm, is_negative,
+        ctx, Some(flags), is_denorm, is_negative,
         |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode),
-        |ctx, neg| {
-            let zero = ctx.builder.ins().iconst(ir::types::I32, 0);
-            let neg32 = ctx.builder.ins().uextend(ir::types::I32, neg);
-            let sign = ctx.builder.ins().ishl_imm_s(neg32, 31);
-            let signed_zero = ctx.builder.ins().bor(zero, sign);
-            emit_write_fpr_w(ctx, fd, signed_zero, fr_mode)
-        },
+        |ctx, neg| emit_write_signed_zero_s(ctx, fd, neg, fr_mode),
     );
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(fast_block);
+    ctx.builder.seal_block(fast_block);
+    let (result_bits, is_denorm, is_negative) = emit_fbinop_result_s(ctx, op, fs_bits, ft_bits);
+    emit_fpu_update_fcsr_arith(
+        ctx, None, is_denorm, is_negative,
+        |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode),
+        |ctx, neg| emit_write_signed_zero_s(ctx, fd, neg, fr_mode),
+    );
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(done_block);
+    ctx.builder.seal_block(done_block);
 }
 fn emit_fbinop_d(
     ctx: &mut EmitCtx,
@@ -7549,26 +7700,41 @@ fn emit_fbinop_d(
 
     let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
     let ft_bits = emit_read_fpr_l(ctx, ft, fr_mode);
+
+    let fs_normal = emit_is_normal_d(ctx, fs_bits);
+    let ft_normal = emit_is_normal_d(ctx, ft_bits);
+    let operands_normal = ctx.builder.ins().band(fs_normal, ft_normal);
+    let fast_block = ctx.builder.create_block();
+    let slow_block = ctx.builder.create_block();
+    let done_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(operands_normal, fast_block, &[], slow_block, &[]);
+
+    ctx.builder.switch_to_block(slow_block);
+    ctx.builder.set_cold_block(slow_block);
+    ctx.builder.seal_block(slow_block);
     emit_check_denorm_operand(ctx, fs_bits, true);
     emit_check_denorm_operand(ctx, ft_bits, true);
     let flags = flags_fn(ctx, fs_bits, ft_bits);
-    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
-    let ft_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), ft_bits);
-    let result = op(ctx.builder, fs_val, ft_val);
-    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    let is_denorm = emit_is_subnormal_d(ctx, result_bits);
-    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
+    let (result_bits, is_denorm, is_negative) = emit_fbinop_result_d(ctx, op, fs_bits, ft_bits);
     emit_fpu_update_fcsr_arith(
-        ctx, flags, is_denorm, is_negative,
+        ctx, Some(flags), is_denorm, is_negative,
         |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode),
-        |ctx, neg| {
-            let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
-            let neg64 = ctx.builder.ins().uextend(ir::types::I64, neg);
-            let sign = ctx.builder.ins().ishl_imm_s(neg64, 63);
-            let signed_zero = ctx.builder.ins().bor(zero, sign);
-            emit_write_fpr_l(ctx, fd, signed_zero, fr_mode)
-        },
+        |ctx, neg| emit_write_signed_zero_d(ctx, fd, neg, fr_mode),
     );
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(fast_block);
+    ctx.builder.seal_block(fast_block);
+    let (result_bits, is_denorm, is_negative) = emit_fbinop_result_d(ctx, op, fs_bits, ft_bits);
+    emit_fpu_update_fcsr_arith(
+        ctx, None, is_denorm, is_negative,
+        |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode),
+        |ctx, neg| emit_write_signed_zero_d(ctx, fd, neg, fr_mode),
+    );
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(done_block);
+    ctx.builder.seal_block(done_block);
 }
 
 fn fop_add(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fadd(a, b) }
@@ -7588,10 +7754,27 @@ fn emit_fdiv_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode,
 /// SQRT.S/D fd, fs: fd = sqrt(fs). Unlike the binary ops, only one operand
 /// (`fs`; `ft`/`d.rt` is unused/ignored, matching the interpreter). Still
 /// goes through `emit_fpu_update_fcsr` (sqrt of a negative raises Invalid).
+///
+/// The fast arm requires a normal *and non-negative* operand: a negative
+/// nonzero operand raises Invalid, and every other special value (zero,
+/// denormal, infinity, NaN) is outside the class `emit_is_normal_s`/`_d`
+/// proves flag-free. The cold arm is the previous body verbatim.
 fn emit_fsqrt_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
     let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+
+    let fs_normal = emit_is_normal_s(ctx, fs_bits);
+    let fs_nonneg = ctx.builder.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, fs_bits, 0);
+    let flag_free = ctx.builder.ins().band(fs_normal, fs_nonneg);
+    let fast_block = ctx.builder.create_block();
+    let slow_block = ctx.builder.create_block();
+    let done_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(flag_free, fast_block, &[], slow_block, &[]);
+
+    ctx.builder.switch_to_block(slow_block);
+    ctx.builder.set_cold_block(slow_block);
+    ctx.builder.seal_block(slow_block);
     emit_check_denorm_operand(ctx, fs_bits, false);
     let flags = emit_fpu_arith_flags_sqrt_s(ctx, fs_bits);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
@@ -7600,21 +7783,45 @@ fn emit_fsqrt_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let is_denorm = emit_is_subnormal_s(ctx, result_bits);
     let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
     emit_fpu_update_fcsr_arith(
-        ctx, flags, is_denorm, is_negative,
+        ctx, Some(flags), is_denorm, is_negative,
         |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode),
-        |ctx, neg| {
-            let zero = ctx.builder.ins().iconst(ir::types::I32, 0);
-            let neg32 = ctx.builder.ins().uextend(ir::types::I32, neg);
-            let sign = ctx.builder.ins().ishl_imm_s(neg32, 31);
-            let signed_zero = ctx.builder.ins().bor(zero, sign);
-            emit_write_fpr_w(ctx, fd, signed_zero, fr_mode)
-        },
+        |ctx, neg| emit_write_signed_zero_s(ctx, fd, neg, fr_mode),
     );
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(fast_block);
+    ctx.builder.seal_block(fast_block);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
+    let result = ctx.builder.ins().sqrt(fs_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
+    let is_denorm = emit_is_subnormal_s(ctx, result_bits);
+    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
+    emit_fpu_update_fcsr_arith(
+        ctx, None, is_denorm, is_negative,
+        |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode),
+        |ctx, neg| emit_write_signed_zero_s(ctx, fd, neg, fr_mode),
+    );
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(done_block);
+    ctx.builder.seal_block(done_block);
 }
 fn emit_fsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
     let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+
+    let fs_normal = emit_is_normal_d(ctx, fs_bits);
+    let fs_nonneg = ctx.builder.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, fs_bits, 0);
+    let flag_free = ctx.builder.ins().band(fs_normal, fs_nonneg);
+    let fast_block = ctx.builder.create_block();
+    let slow_block = ctx.builder.create_block();
+    let done_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(flag_free, fast_block, &[], slow_block, &[]);
+
+    ctx.builder.switch_to_block(slow_block);
+    ctx.builder.set_cold_block(slow_block);
+    ctx.builder.seal_block(slow_block);
     emit_check_denorm_operand(ctx, fs_bits, true);
     let flags = emit_fpu_arith_flags_sqrt_d(ctx, fs_bits);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
@@ -7623,16 +7830,28 @@ fn emit_fsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let is_denorm = emit_is_subnormal_d(ctx, result_bits);
     let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
     emit_fpu_update_fcsr_arith(
-        ctx, flags, is_denorm, is_negative,
+        ctx, Some(flags), is_denorm, is_negative,
         |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode),
-        |ctx, neg| {
-            let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
-            let neg64 = ctx.builder.ins().uextend(ir::types::I64, neg);
-            let sign = ctx.builder.ins().ishl_imm_s(neg64, 63);
-            let signed_zero = ctx.builder.ins().bor(zero, sign);
-            emit_write_fpr_l(ctx, fd, signed_zero, fr_mode)
-        },
+        |ctx, neg| emit_write_signed_zero_d(ctx, fd, neg, fr_mode),
     );
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(fast_block);
+    ctx.builder.seal_block(fast_block);
+    let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
+    let result = ctx.builder.ins().sqrt(fs_val);
+    let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
+    let is_denorm = emit_is_subnormal_d(ctx, result_bits);
+    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
+    emit_fpu_update_fcsr_arith(
+        ctx, None, is_denorm, is_negative,
+        |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode),
+        |ctx, neg| emit_write_signed_zero_d(ctx, fd, neg, fr_mode),
+    );
+    ctx.builder.ins().jump(done_block, &[]);
+
+    ctx.builder.switch_to_block(done_block);
+    ctx.builder.seal_block(done_block);
 }
 
 /// ABS.S/D, NEG.S/D, MOV.S/D fd, fs: unlike ADD/SUB/MUL/DIV/SQRT, these
@@ -8013,24 +8232,211 @@ fn emit_round_to_int_mode(builder: &mut FunctionBuilder, x: Value, rm: Value) ->
 #[derive(Clone, Copy)]
 enum RoundMode { Fixed(i64), Dynamic }
 
+/// Clear FCSR's Cause field, skipping the store entirely when it is already
+/// clear — the same load/test/cold-store shape `emit_fpu_update_fcsr_no_flags`
+/// uses, and observationally identical to the interpreter's unconditional
+/// `fpu_fcsr &= !FCSR_CM` (writing back the value already in memory has no
+/// guest-visible effect). Leaves `builder` in a fresh sealed block.
+fn emit_fpu_clear_cause_if_set(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let i32t = ir::types::I32;
+    const FCSR_CM: i64 = 0x0001_f000;
+
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let cause = ctx.builder.ins().band_imm_s(fcsr, FCSR_CM);
+    let cause_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, cause, 0);
+
+    let clear_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(cause_set, clear_block, &[], continue_block, &[]);
+
+    ctx.builder.switch_to_block(clear_block);
+    ctx.builder.set_cold_block(clear_block);
+    ctx.builder.seal_block(clear_block);
+    let cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
+    ctx.builder.ins().store(mem, cleared, ctx.core_ptr, fcsr_off);
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
+/// The exact inclusive/exclusive bounds `cvt_f32/64_to_int_by_value` tests an
+/// already-rounded value against for a W or L destination: `>= MIN` and
+/// `<= MAX` for W (both bounds exact as f32/f64 — note `i32::MAX as f32`
+/// rounds *up* to 2^31, so 2^31 counts as in range for an F32 source and the
+/// saturating cast below reproduces the interpreter's i32::MAX there), and
+/// `>= -2^63 && < 2^63` for L (2^63 is exact in both formats and is the
+/// first value that does not fit). Returned as `(min, max, max_inclusive)`.
+fn cvt_int_bounds(ctx: &mut EmitCtx, src_f64: bool, dst_i64: bool) -> (Value, Value, bool) {
+    if src_f64 {
+        if dst_i64 {
+            let min = ctx.builder.ins().f64const(-(9223372036854775808.0f64));
+            let max = ctx.builder.ins().f64const(9223372036854775808.0f64);
+            (min, max, false)
+        } else {
+            let min = ctx.builder.ins().f64const(i32::MIN as f64);
+            let max = ctx.builder.ins().f64const(i32::MAX as f64);
+            (min, max, true)
+        }
+    } else if dst_i64 {
+        let min = ctx.builder.ins().f32const(-(9223372036854775808.0f32));
+        let max = ctx.builder.ins().f32const(9223372036854775808.0f32);
+        (min, max, false)
+    } else {
+        let min = ctx.builder.ins().f32const(i32::MIN as f32);
+        let max = ctx.builder.ins().f32const(i32::MAX as f32);
+        (min, max, true)
+    }
+}
+
 /// Shared body for every float-source rounding conversion (ROUND/TRUNC/
-/// CEIL/FLOOR/CVT.W/CVT.L, source format S or D, dest width W(i32) or
-/// L(i64)). Unlike the old Cranelift-IR-side rounding/saturation, this is a
-/// single `call_indirect` into `core.fpu_cvt_to_int_fn`
-/// (`mips_exec.rs::jit_cvt_to_int`, which calls the same
-/// `cvt_to_int_and_commit` the interpreter's `fpu_cvt_to_int` calls) — no
-/// Cranelift-side rounding math, no host MXCSR/FPSR read at all. See
-/// `cvt_to_int_and_commit`'s doc comment for the full rationale: reading
-/// host FP status after a hardware conversion instruction races the flag
-/// write against the read on out-of-order hardware (found live via this
-/// file's own equivalence tests), and this also fixes the result itself to
-/// real MIPS saturation (always the largest-magnitude representable
-/// integer, e.g. 0x7FFFFFFF for a negative overflow too) instead of
-/// Rust/Cranelift's own saturate-toward-sign convention. The function reads/
-/// writes `core.fpr`/`core.fpu_fcsr` directly, so nothing computed here
-/// needs to survive across the call as a cached `Value` — only the plain
-/// scalar register indices and mode flags are passed in.
+/// CEIL/FLOOR/CVT.W/CVT.L, source format S or D, dest width W(i32) or L(i64)).
+///
+/// **Inlined fast path.** For a finite source that rounds to a value inside
+/// the destination's range, the interpreter's `cvt_to_int_and_commit` reduces
+/// to "cast the rounded value to int, clear Cause, write the destination":
+///
+/// * Saturation is unreachable: the range test is the interpreter's own, so
+///   the cast operates on a value that fits — with the single deliberate
+///   exception of an F32 source at exactly +2^31, which
+///   `cvt_f32_to_int_by_value` also admits and both sides answer with
+///   i32::MAX (`fcvt_to_sint_sat`'s saturating cast, same as Rust's `as`).
+/// * Inexact is unreachable in range. `x` is integral after rounding (either
+///   the dynamic-mode magic-number pair or `emit_round_to_int_mode` below),
+///   hence exactly representable in its own format, so the interpreter's
+///   round-trip test `(result as f32/f64) != x` can never fire (including the
+///   ±2^31 edge, where the *integer* round trip `x as i32 as i64` and the
+///   RN-even float cast back agree).
+///
+/// Everything else — NaN, ±infinity, out-of-range finite values, and every
+/// Invalid/Cause/Flag/trap consequence — is *not* proven here and branches to
+/// the original `core.fpu_cvt_to_int_fn` callout, unchanged: `jit_cvt_to_int`
+/// runs the very `cvt_to_int_and_commit` the interpreter calls, so the cold
+/// path's model is identical by construction rather than by reimplementation.
+/// The callout is entered before either path has written any guest state.
+///
+/// `fcvt_to_sint_sat` (not a bare `fcvt_to_sint`) because the value is
+/// integral and in range: the truncating saturation semantics are exact
+/// there, and — unlike a hardware conversion followed by a host MXCSR status
+/// read, the hazard `cvt_to_int_and_commit`'s doc comment describes — no
+/// host FP status is read.
+///
+/// **Rounding.** The two dynamic-RM converts (plain CVT.W/CVT.L) get a
+/// cheap RN-even rounding when FCSR.RM is 0: add and subtract a
+/// format-appropriate power of two in the source's sign direction
+/// (`x + copysign(2^23|2^52, x) - copysign(...)`), which forces the sum's
+/// ulp to 1 and therefore rounds `x` to the nearest integral value, ties to
+/// even — the exact operation `round_f32/64_to_int_mode` performs for
+/// RM_NEAREST_EVEN, for every finite magnitude including the `[0.5, 1)`
+/// ties and values already >= 2^mantissa_bits. It relies on host FP add/sub
+/// rounding to nearest-even, which is exactly what MXCSR holds whenever
+/// FCSR.RM is 0 (`emit_fpu_set_mode` syncs MXCSR from FCSR), so — as in
+/// `emit_fcvt_from_int` — every other rounding mode takes the callout. The
+/// fixed ROUND/TRUNC/CEIL/FLOOR variants keep the mode-independent
+/// `emit_round_to_int_mode` bit manipulation instead: their mode is a
+/// compile-time constant, so it is (measured) cheaper than a gate plus the
+/// magic-number pair, and they are never emitted by compiled C.
 fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: bool, mode: RoundMode) {
+    use cranelift_codegen::ir::condcodes::FloatCC;
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let mem = MemFlagsData::trusted();
+    let i32t = ir::types::I32;
+    let float_ty = if src_f64 { ir::types::F64 } else { ir::types::F32 };
+    let int_ty = if dst_i64 { ir::types::I64 } else { i32t };
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+
+    let src_bits = if src_f64 {
+        emit_read_fpr_l(ctx, fs, fr_mode)
+    } else {
+        emit_read_fpr_w(ctx, fs, fr_mode)
+    };
+    let x = ctx.builder.ins().bitcast(float_ty, MemFlagsData::new(), src_bits);
+
+    let fast_block = ctx.builder.create_block();
+    let invalid_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+
+    let rounded = match mode {
+        RoundMode::Fixed(rm) => {
+            let rm = ctx.builder.ins().iconst(ir::types::I8, rm);
+            emit_round_to_int_mode(ctx.builder, x, rm)
+        }
+        RoundMode::Dynamic => {
+            let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+            let rm = ctx.builder.ins().band_imm_s(fcsr, 0x3);
+            let rn_even = ctx.builder.ins().icmp_imm_s(IntCC::Equal, rm, 0);
+            let round_block = ctx.builder.create_block();
+            ctx.builder.ins().brif(rn_even, round_block, &[], invalid_block, &[]);
+
+            ctx.builder.switch_to_block(round_block);
+            ctx.builder.seal_block(round_block);
+            // |x| < 2^mantissa_bits: force the sum's ulp to 1 and round to
+            // nearest-even. At or above it every value is already integral,
+            // so `x` itself is the answer — and using the trick there would
+            // be wrong, because the biased sum crosses into the next binade
+            // where the ulp is 2 (found by `cvt_to_int_range_edges_...`:
+            // 2^23+1 came back as 2^23).
+            let magic = if src_f64 {
+                ctx.builder.ins().f64const(4503599627370496.0) // 2^52
+            } else {
+                ctx.builder.ins().f32const(8388608.0) // 2^23
+            };
+            let abs_x = ctx.builder.ins().fabs(x);
+            let small = ctx.builder.ins().fcmp(FloatCC::LessThan, abs_x, magic);
+            let signed_magic = ctx.builder.ins().fcopysign(magic, x);
+            let biased = ctx.builder.ins().fadd(x, signed_magic);
+            let rounded_small = ctx.builder.ins().fsub(biased, signed_magic);
+            ctx.builder.ins().select(small, rounded_small, x)
+        }
+    };
+
+    let (min, max, max_inclusive) = cvt_int_bounds(ctx, src_f64, dst_i64);
+    let ge_min = ctx.builder.ins().fcmp(FloatCC::GreaterThanOrEqual, rounded, min);
+    let le_max = if max_inclusive {
+        ctx.builder.ins().fcmp(FloatCC::LessThanOrEqual, rounded, max)
+    } else {
+        ctx.builder.ins().fcmp(FloatCC::LessThan, rounded, max)
+    };
+    // NaN fails both comparisons, so it takes the callout path with every
+    // other not-provably-in-range value.
+    let in_range = ctx.builder.ins().band(ge_min, le_max);
+    ctx.builder.ins().brif(in_range, fast_block, &[], invalid_block, &[]);
+
+    ctx.builder.switch_to_block(fast_block);
+    ctx.builder.seal_block(fast_block);
+    let result = ctx.builder.ins().fcvt_to_sint_sat(int_ty, rounded);
+    emit_fpu_clear_cause_if_set(ctx);
+    if dst_i64 {
+        emit_write_fpr_l(ctx, fd, result, fr_mode);
+    } else {
+        emit_write_fpr_w(ctx, fd, result, fr_mode);
+    }
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    // Cold: NaN / infinity / out-of-range, plus (for the dynamic modes) every
+    // rounding mode other than RN-even. Not proven inline — see this
+    // function's doc comment.
+    ctx.builder.switch_to_block(invalid_block);
+    ctx.builder.set_cold_block(invalid_block);
+    ctx.builder.seal_block(invalid_block);
+    emit_fcvt_to_int_callout(ctx, fr_mode, src_f64, dst_i64, mode);
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
+/// The original callout form of [`emit_fcvt_to_int`]: one `call_indirect`
+/// into `core.fpu_cvt_to_int_fn` (`mips_exec.rs::jit_cvt_to_int`, which calls
+/// the same `cvt_to_int_and_commit` the interpreter's `fpu_cvt_to_int` calls)
+/// and `EXC_FPE` if it reports a trap. Still every not-provably-inline case —
+/// NaN, ±infinity and out-of-range for all twenty conversion instructions,
+/// and every non-RN-even rounding mode for the two dynamic ones — so those
+/// consequences are the interpreter's own model by construction.
+fn emit_fcvt_to_int_callout(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: bool, mode: RoundMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
     let mem = MemFlagsData::trusted();
@@ -8081,16 +8487,121 @@ fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: 
     emit_trap_if_nonzero(ctx, trapped);
 }
 
-/// Shared body for int-source-to-float conversions (CVT.S.W/D.W/S.L/D.L):
-/// a single `call_indirect` into `core.fpu_cvt_int_to_float_fn`
-/// (`mips_exec.rs::jit_cvt_int_to_float`, calling the same
-/// `cvt_int_to_float_and_commit` the interpreter's `fpu_cvt_int_to_float`
-/// calls) — no Cranelift-side `fcvt_from_sint` + host MXCSR/FPSR read, same
-/// race-avoidance shape as `emit_fcvt_to_int`/`cvt_to_int_and_commit`.
+/// Shared body for int-source-to-float conversions (CVT.S.W/D.W/S.L/D.L).
+///
+/// **Inlined fast path, gated on host rounding mode.** `cvt_int_to_float_and_commit`
+/// is small by value — convert, write the destination, then report Inexact
+/// iff converting back changes the value — but its `src as f32/f64` is a
+/// round-to-nearest-even conversion in the *interpreter*, while the JIT's
+/// `fcvt_from_sint` lowers to `cvtsi2ss`/`cvtsi2sd`, which round per the
+/// host MXCSR. The JIT syncs MXCSR from FCSR.RM on every FCSR write
+/// (`emit_fpu_set_mode`), so the host mode is only known to be RN-even when
+/// `FCSR.RM == 0`; every other mode takes the callout, which computes by
+/// value and is therefore unconditionally correct. Under RM == 0 the two
+/// agree exactly: both round to nearest, ties to even.
+///
+/// The Inexact test is the interpreter's own `(result as i64) != src`,
+/// reproduced as a truncating saturating cast back to i64 (exact for the
+/// integral result, and saturating at ±2^63 exactly as Rust's `as` does).
+/// Note the ordering this preserves from `cvt_int_to_float_and_commit`: the
+/// destination is written *before* the exception check, so a trapping
+/// conversion still leaves the converted value in the FPR.
 fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64: bool) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
     let mem = MemFlagsData::trusted();
+    let i32t = ir::types::I32;
+    let i64t = ir::types::I64;
+    let float_ty = if dst_f64 { ir::types::F64 } else { ir::types::F32 };
+    let bits_ty = if dst_f64 { ir::types::I64 } else { i32t };
+    const FCSR_CM: i64 = 0x0001_f000;
+    const FCSR_CI: i64 = 0x0000_1000;
+    const FCSR_IM: i64 = 0x0000_0080;
+    const FCSR_FI: i64 = 0x0000_0004;
+
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr0 = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let rm = ctx.builder.ins().band_imm_s(fcsr0, 0x3);
+    let rn_even = ctx.builder.ins().icmp_imm_s(IntCC::Equal, rm, 0);
+
+    let inline_block = ctx.builder.create_block();
+    let callout_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(rn_even, inline_block, &[], callout_block, &[]);
+
+    ctx.builder.switch_to_block(inline_block);
+    ctx.builder.seal_block(inline_block);
+    // src: W sign-extends from 32 bits, exactly like `read_fpr_w(..) as i32
+    // as i64` in cvt_int_to_float_and_commit.
+    let src = if src_i64 {
+        emit_read_fpr_l(ctx, fs, fr_mode)
+    } else {
+        let w = emit_read_fpr_w(ctx, fs, fr_mode);
+        ctx.builder.ins().sextend(i64t, w)
+    };
+    let result = ctx.builder.ins().fcvt_from_sint(float_ty, src);
+    let bits = ctx.builder.ins().bitcast(bits_ty, MemFlagsData::new(), result);
+    // Destination write happens first — including on the trapping path below.
+    if dst_f64 {
+        emit_write_fpr_l(ctx, fd, bits, fr_mode);
+    } else {
+        emit_write_fpr_w(ctx, fd, bits, fr_mode);
+    }
+    let back = ctx.builder.ins().fcvt_to_sint_sat(i64t, result);
+    let inexact = ctx.builder.ins().icmp(IntCC::NotEqual, back, src);
+
+    let inexact_block = ctx.builder.create_block();
+    let exact_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(inexact, inexact_block, &[], exact_block, &[]);
+
+    // Exact: only Cause has to be rewritten (to zero).
+    ctx.builder.switch_to_block(exact_block);
+    ctx.builder.seal_block(exact_block);
+    emit_fpu_clear_cause_if_set(ctx);
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    // Cold: the conversion lost precision.
+    ctx.builder.switch_to_block(inexact_block);
+    ctx.builder.set_cold_block(inexact_block);
+    ctx.builder.seal_block(inexact_block);
+    let fcsr1 = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let cleared = ctx.builder.ins().band_imm_s(fcsr1, !FCSR_CM);
+    let with_cause = ctx.builder.ins().bor_imm_s(cleared, FCSR_CI);
+    ctx.builder.ins().store(mem, with_cause, ctx.core_ptr, fcsr_off);
+    let im_set = ctx.builder.ins().band_imm_s(with_cause, FCSR_IM);
+    let im_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, im_set, 0);
+    let raise_block = ctx.builder.create_block();
+    let flag_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(im_set, raise_block, &[], flag_block, &[]);
+
+    ctx.builder.switch_to_block(raise_block);
+    ctx.builder.seal_block(raise_block);
+    let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_FPE);
+    let status_val = ctx.builder.ins().iconst(i32t, status as i64);
+    emit_exception_exit(ctx, status_val);
+
+    ctx.builder.switch_to_block(flag_block);
+    ctx.builder.seal_block(flag_block);
+    let with_flag = ctx.builder.ins().bor_imm_s(with_cause, FCSR_FI);
+    ctx.builder.ins().store(mem, with_flag, ctx.core_ptr, fcsr_off);
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(callout_block);
+    ctx.builder.set_cold_block(callout_block);
+    ctx.builder.seal_block(callout_block);
+    emit_fcvt_from_int_callout(ctx, fr_mode, src_i64, dst_f64);
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
+/// The original callout form of [`emit_fcvt_from_int`] — still the whole
+/// implementation for every non-RN-even rounding mode; see that function's
+/// doc comment for why the host-mode gate exists.
+fn emit_fcvt_from_int_callout(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64: bool) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
     let ptr_ty = ctx.module.target_config().pointer_type();
     let i32t = ir::types::I32;
 
@@ -8101,7 +8612,7 @@ fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64
     let dst_f64_val = ctx.builder.ins().iconst(i32t, dst_f64 as i64);
 
     // arg 0 is `ctx.core_ptr`; the helper recovers its executor via
-    // `exec_from_core`. See `emit_fcvt_to_int`'s matching comment.
+    // `exec_from_core`. See `emit_fcvt_to_int_callout`'s matching comment.
     let callee = emit_hook_callee(ctx, core_offset_of_fpu_cvt_int_to_float_fn());
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty));
@@ -10253,7 +10764,7 @@ mod tests {
 
     /// `is_inlinable` must reject on *both* of its conditions, not just the
     /// bounds one. The bounds half is what panicked
-    /// (`rules/jitv2/nested-delay-slot-across-page-boundary.md`); the
+    /// (`clanker/jitv2/nested-delay-slot-across-page-boundary.md`); the
     /// `visited` half is the stronger guarantee the four slot sites were
     /// missing — an unvisited word never went through
     /// `compile_region_uncommitted`'s upfront emitter-rejection loop (it

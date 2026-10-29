@@ -60,16 +60,16 @@ impl Default for NewMachineDialog {
 }
 
 /// Greedy-fill banks 0..3 with the largest valid bank size that fits.
-/// `ip28` gates the 256/512 MB sizes, which only the IP28 MC can express
-/// (`validate()` rejects them on other machine profiles) — pass
-/// `cfg.machine.profile.ip28()`.
-pub fn distribute_ram(total: u32, ip28: bool) -> [u32; 4] {
+/// `profile` limits the sizes to what `validate()` accepts there: 256/512 MB
+/// only on the IP28 and Octane, and nothing under 64 MB on the Octane.
+pub fn distribute_ram(total: u32, profile: MachineProfile) -> [u32; iris::config::MAX_BANKS] {
     let mut remaining = total;
-    let mut banks = [0u32; 4];
-    for slot in &mut banks {
+    let mut banks = [0u32; iris::config::MAX_BANKS];
+    // The MC has four banks; the array has room for machines with more.
+    for slot in banks.iter_mut().take(4) {
         // Pick the largest size in VALID_BANK_SIZES that is <= remaining.
         let pick = VALID_BANK_SIZES.iter()
-            .filter(|&&s| s > 0 && s <= remaining && (s <= 128 || ip28))
+            .filter(|&&s| s > 0 && s <= remaining && profile.bank_sizes().contains(&s))
             .max().copied().unwrap_or(0);
         *slot = pick;
         remaining -= pick;
@@ -125,6 +125,14 @@ impl NewMachineDialog {
                             self.cpu = CpuModel::R10000;
                             // Newport resolution presets don't apply to IMPACT.
                             self.resolution = NewportResolution::Guest;
+                        } else if self.profile == MachineProfile::OctaneIp30 {
+                            // An R10000 machine with no built-in PROM; its RAM
+                            // is matched pairs of 64 to 512 MB in bank 0 up.
+                            self.cpu = CpuModel::R10000;
+                            self.use_embedded_prom = false;
+                            self.ram_total_mb = 128;
+                            self.ram_banks = [128, 0, 0, 0];
+                            self.resolution = NewportResolution::Guest;
                         } else if profile_before == MachineProfile::Indigo2Ip28 {
                             self.cpu = CpuModel::default();
                             self.ram_total_mb = self.ram_total_mb.min(512);
@@ -136,25 +144,30 @@ impl NewMachineDialog {
                     }
                     ui.end_row();
 
+                    let octane = self.profile == MachineProfile::OctaneIp30;
                     ui.label(t!("dialog-new-machine-cpu"));
-                    ComboBox::from_id_salt("nm_cpu")
-                        .selected_text(self.cpu.label())
-                        .show_ui(ui, |ui| {
-                            for c in CpuModel::ALL {
-                                ui.selectable_value(&mut self.cpu, c, c.label());
-                            }
-                        });
+                    ui.add_enabled_ui(!octane, |ui| {
+                        ComboBox::from_id_salt("nm_cpu")
+                            .selected_text(self.cpu.label())
+                            .show_ui(ui, |ui| {
+                                for c in CpuModel::ALL {
+                                    ui.selectable_value(&mut self.cpu, c, c.label());
+                                }
+                            });
+                    });
                     ui.end_row();
 
-                    ui.label(t!("dialog-new-machine-resolution"));
-                    ComboBox::from_id_salt("nm_resolution")
-                        .selected_text(self.resolution.label())
-                        .show_ui(ui, |ui| {
-                            for mode in NewportResolution::ALL {
-                                ui.selectable_value(&mut self.resolution, mode, mode.label());
-                            }
-                        });
-                    ui.end_row();
+                    if !octane {
+                        ui.label(t!("dialog-new-machine-resolution"));
+                        ComboBox::from_id_salt("nm_resolution")
+                            .selected_text(self.resolution.label())
+                            .show_ui(ui, |ui| {
+                                for mode in NewportResolution::ALL {
+                                    ui.selectable_value(&mut self.resolution, mode, mode.label());
+                                }
+                            });
+                        ui.end_row();
+                    }
 
                     ui.label(t!("dialog-new-machine-prom"));
                     ui.horizontal(|ui| {
@@ -173,7 +186,8 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
                     ui.label("");
-                    ui.checkbox(&mut self.use_embedded_prom, t!("dialog-new-machine-embedded-prom"));
+                    // The Octane's PROM is not built in.
+                    ui.add_enabled(!octane, egui::Checkbox::new(&mut self.use_embedded_prom, t!("dialog-new-machine-embedded-prom")));
                     ui.end_row();
 
                     ui.label(t!("dialog-new-machine-nvram"));
@@ -192,6 +206,7 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
 
+                    if !octane {
                     ui.label(t!("dialog-new-machine-eeprom"))
                         .tip(t!("dialog-new-machine-eeprom-tip"));
                     ui.horizontal(|ui| {
@@ -208,28 +223,28 @@ impl NewMachineDialog {
                         }
                     });
                     ui.end_row();
+                    }
 
                     if !self.ram_advanced {
                         ui.label(t!("dialog-new-machine-ram"));
                         ComboBox::from_id_salt("ram_total")
                             .selected_text(t!("dialog-new-machine-mb", size = self.ram_total_mb))
                             .show_ui(ui, |ui| {
-                                for &s in ram_presets(self.profile.ip28()) {
+                                for &s in ram_presets(self.profile) {
                                     ui.selectable_value(&mut self.ram_total_mb, s, t!("dialog-new-machine-mb", size = s));
                                 }
                             });
                         ui.end_row();
                     } else {
-                        let ip28_banks = self.profile.ip28();
                         for i in 0..4 {
                             ui.label(t!("dialog-new-machine-bank", bank = i));
                             ComboBox::from_id_salt(("nm_bank", i))
                                 .selected_text(t!("dialog-new-machine-mb", size = self.ram_banks[i]))
                                 .show_ui(ui, |ui| {
                                     for &sz in VALID_BANK_SIZES {
-                                        ui.add_enabled_ui(sz <= 128 || ip28_banks, |ui| {
+                                        ui.add_enabled_ui(self.profile.bank_sizes().contains(&sz), |ui| {
                                             ui.selectable_value(&mut self.ram_banks[i], sz, t!("dialog-new-machine-mb", size = sz))
-                                                .on_disabled_hover_text(t!("dialog-new-machine-bank-ip28-only"));
+                                                .on_disabled_hover_text(crate::ram::bank_size_tip(self.profile));
                                         });
                                     }
                                 });
@@ -249,6 +264,15 @@ impl NewMachineDialog {
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(t!("dialog-new-machine-ip28-note"))
+                        .color(Color32::from_rgb(220, 170, 90))
+                        .small(),
+                    );
+                }
+
+                if self.profile == MachineProfile::OctaneIp30 {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(t!("dialog-new-machine-octane-note"))
                         .color(Color32::from_rgb(220, 170, 90))
                         .small(),
                     );
@@ -322,15 +346,19 @@ impl NewMachineDialog {
                         cfg.nvram = self.nvram_path.clone();
                         cfg.nveeprom = self.nveeprom_path.clone();
                         cfg.banks = if self.ram_advanced {
-                            self.ram_banks
+                            iris::config::banks_from4(self.ram_banks)
                         } else {
-                            distribute_ram(self.ram_total_mb, self.profile.ip28())
+                            distribute_ram(self.ram_total_mb, self.profile)
                         };
                         // The IP28 IRIX kernel carries no Newport driver at all —
                         // default straight to IMPACT so a fresh machine has a working
                         // display instead of a blank Newport head.
                         if self.profile == MachineProfile::Indigo2Ip28 {
-                            cfg.graphics.board = iris::config::GraphicsBoard::SolidImpact;
+                            cfg.graphics.board = Some(iris::config::GraphicsBoard::SolidImpact);
+                        }
+                        // Keep the PROM's flash records between runs.
+                        if self.profile == MachineProfile::OctaneIp30 {
+                            cfg.octane.flash = Some("flash-ip30.bin".into());
                         }
                         // SCSI defaults: drop the built-in entries unless the
                         // user explicitly opted in.
@@ -360,12 +388,27 @@ impl NewMachineDialog {
 
 #[cfg(test)]
 mod ram_tests {
-    use super::distribute_ram;
+    use super::{distribute_ram, MachineProfile};
 
     #[test]
     fn ip28_gigabyte_uses_two_banks() {
-        assert_eq!(distribute_ram(1024, true), [512, 512, 0, 0]);
-        assert_eq!(distribute_ram(768, true), [512, 256, 0, 0]);
-        assert_eq!(distribute_ram(512, false), [128, 128, 128, 128]);
+        assert_eq!(distribute_ram(1024, MachineProfile::Indigo2Ip28), iris::config::banks_from4([512, 512, 0, 0]));
+        assert_eq!(distribute_ram(768, MachineProfile::Indigo2Ip28), iris::config::banks_from4([512, 256, 0, 0]));
+        assert_eq!(distribute_ram(512, MachineProfile::IndyIp24), iris::config::banks_from4([128, 128, 128, 128]));
+    }
+
+    #[test]
+    fn octane_banks_are_valid_pairs_from_bank_zero() {
+        let octane = MachineProfile::OctaneIp30;
+        assert_eq!(distribute_ram(128, octane), iris::config::banks_from4([128, 0, 0, 0]));
+        assert_eq!(distribute_ram(192, octane), iris::config::banks_from4([128, 64, 0, 0]));
+        assert_eq!(distribute_ram(2048, octane), iris::config::banks_from4([512, 512, 512, 512]));
+        for &total in crate::ram::ram_presets(octane) {
+            let mut cfg = iris::config::MachineConfig::default();
+            cfg.machine.profile = octane;
+            cfg.machine.cpu = iris::config::CpuModel::R10000;
+            cfg.banks = distribute_ram(total, octane);
+            cfg.validate().unwrap_or_else(|e| panic!("{total} MB: {e}"));
+        }
     }
 }

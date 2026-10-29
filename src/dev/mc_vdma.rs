@@ -69,7 +69,6 @@ use std::io::Write as IoWrite;
 
 use crate::devlog::LogModule;
 use crate::traits::BUS_BUSY;
-use crate::dev::ioc::IocInterrupt;
 use crate::dev::mc::MemoryController;
 
 // ── DMA register offsets (MC base 0x1FA00000) ───────────────────────────────
@@ -411,8 +410,8 @@ pub struct VdmaResult {
 
 impl MemoryController {
     pub(crate) fn signal_dma_interrupt(&self) {
-        if let Some(ioc) = self.ioc() {
-            ioc.set_interrupt(IocInterrupt::McDma, true);
+        if let Some(irq) = self.dma_irq() {
+            irq.set(true);
         }
     }
 
@@ -456,10 +455,10 @@ impl MemoryController {
         // Read PTE — 4 or 8 bytes. For 8-byte PTEs, read64 and take the low word.
         let pte = self.phys().and_then(|phys| {
             if pte_8byte {
-                let r = phys.read64(pte_addr);
+                let r = phys.read64(pte_addr as u64);
                 r.is_ok().then_some(r.data as u32)
             } else {
-                let r = phys.read32(pte_addr);
+                let r = phys.read32(pte_addr as u64);
                 r.is_ok().then_some(r.data)
             }
         });
@@ -626,7 +625,7 @@ impl MemoryController {
                 let mut bc = byte_count;
                 let mut addr = mem_vaddr;
                 while bc > 0 {
-                    phys.write32(addr, pattern);
+                    phys.write32(addr as u64, pattern);
                     addr = addr.wrapping_add(4);
                     bc -= 4;
                 }
@@ -680,7 +679,7 @@ impl MemoryController {
                 let Some(phys_addr) = self.dma_xlate_qword(job, mem_vaddr, false) else {
                     return VdmaResult { mem_vaddr, exc: true };
                 };
-                *slot = { let r = phys.read64(phys_addr); if r.is_ok() { r.data } else { 0 } };
+                *slot = { let r = phys.read64(phys_addr as u64); if r.is_ok() { r.data } else { 0 } };
                 mem_vaddr = mem_vaddr.wrapping_add(8);
             }
 
@@ -695,13 +694,13 @@ impl MemoryController {
             // Hand off the whole chunk. BUS_ERR means the device declined to
             // batch this address, so fall back to the scalar loop for it rather
             // than failing the transfer.
-            let st = phys.dma_write64_bulk(job.gio_addr, &stage[..chunk]);
+            let st = phys.dma_write64_bulk(job.gio_addr as u64, &stage[..chunk]);
             if st == crate::traits::BUS_ERR {
                 for &data in stage[..chunk].iter() {
                     // Spin on BUS_BUSY — the DMA worker has no EXEC_RETRY
                     // mechanism, so dropping the status here would silently
                     // lose pixel data whenever REX3's GFIFO is full.
-                    while phys.dma_write64(job.gio_addr, data) == BUS_BUSY {
+                    while phys.dma_write64(job.gio_addr as u64, data) == BUS_BUSY {
                         std::hint::spin_loop();
                     }
                 }
@@ -709,7 +708,7 @@ impl MemoryController {
                 let mut st = st;
                 while st == BUS_BUSY {
                     std::hint::spin_loop();
-                    st = phys.dma_write64_bulk(job.gio_addr, &stage[..chunk]);
+                    st = phys.dma_write64_bulk(job.gio_addr as u64, &stage[..chunk]);
                 }
             }
 
@@ -748,12 +747,12 @@ impl MemoryController {
         while remaining >= 8 {
             let chunk = ((remaining / 8) as usize).min(VDMA_CHUNK_QWORDS);
 
-            let st = phys.dma_read64_bulk(job.gio_addr, &mut stage[..chunk]);
+            let st = phys.dma_read64_bulk(job.gio_addr as u64, &mut stage[..chunk]);
             if st == crate::traits::BUS_ERR {
                 // Device declined to batch — scalar fallback for this chunk.
                 for slot in stage[..chunk].iter_mut() {
                     *slot = loop {
-                        let r = phys.dma_read64(job.gio_addr);
+                        let r = phys.dma_read64(job.gio_addr as u64);
                         if r.is_ok() { break r.data; }
                         if r.status != BUS_BUSY { break 0u64; }
                         std::hint::spin_loop();
@@ -763,7 +762,7 @@ impl MemoryController {
                 let mut st = st;
                 while st == BUS_BUSY {
                     std::hint::spin_loop();
-                    st = phys.dma_read64_bulk(job.gio_addr, &mut stage[..chunk]);
+                    st = phys.dma_read64_bulk(job.gio_addr as u64, &mut stage[..chunk]);
                 }
             }
 
@@ -780,7 +779,7 @@ impl MemoryController {
                 let Some(phys_addr) = self.dma_xlate_qword(job, mem_vaddr, true) else {
                     return VdmaResult { mem_vaddr, exc: true };
                 };
-                phys.write64(phys_addr, data);
+                phys.write64(phys_addr as u64, data);
                 mem_vaddr = mem_vaddr.wrapping_add(8);
             }
 
@@ -863,7 +862,7 @@ impl MemoryController {
                         let Some(pa) = self.dma_xlate_qword(job, addr, false) else {
                             return VdmaResult { mem_vaddr: addr, exc: true };
                         };
-                        let byte = { let r = phys.read8(pa); if r.is_ok() { r.data as u64 } else { 0 } };
+                        let byte = { let r = phys.read8(pa as u64); if r.is_ok() { r.data as u64 } else { 0 } };
                         data |= byte << shift;
                         addr = addr.wrapping_add(1);
                         shift = shift.wrapping_sub(8);
@@ -926,10 +925,10 @@ impl MemoryController {
     /// Hand a staged chunk to the device, falling back to scalar writes if it
     /// declines to batch this port.
     fn bulk_write_chunk(&self, phys: &dyn crate::traits::BusDevice, job: &VdmaJob, buf: &[u64]) {
-        let st = phys.dma_write64_bulk(job.gio_addr, buf);
+        let st = phys.dma_write64_bulk(job.gio_addr as u64, buf);
         if st == crate::traits::BUS_ERR {
             for &data in buf {
-                while phys.dma_write64(job.gio_addr, data) == BUS_BUSY {
+                while phys.dma_write64(job.gio_addr as u64, data) == BUS_BUSY {
                     std::hint::spin_loop();
                 }
             }
@@ -937,18 +936,18 @@ impl MemoryController {
             let mut st = st;
             while st == BUS_BUSY {
                 std::hint::spin_loop();
-                st = phys.dma_write64_bulk(job.gio_addr, buf);
+                st = phys.dma_write64_bulk(job.gio_addr as u64, buf);
             }
         }
     }
 
     /// Fill a staged chunk from the device, falling back to scalar reads.
     fn bulk_read_chunk(&self, phys: &dyn crate::traits::BusDevice, job: &VdmaJob, buf: &mut [u64]) {
-        let st = phys.dma_read64_bulk(job.gio_addr, buf);
+        let st = phys.dma_read64_bulk(job.gio_addr as u64, buf);
         if st == crate::traits::BUS_ERR {
             for slot in buf.iter_mut() {
                 *slot = loop {
-                    let r = phys.dma_read64(job.gio_addr);
+                    let r = phys.dma_read64(job.gio_addr as u64);
                     if r.is_ok() { break r.data; }
                     if r.status != BUS_BUSY { break 0u64; }
                     std::hint::spin_loop();
@@ -958,7 +957,7 @@ impl MemoryController {
             let mut st = st;
             while st == BUS_BUSY {
                 std::hint::spin_loop();
-                st = phys.dma_read64_bulk(job.gio_addr, buf);
+                st = phys.dma_read64_bulk(job.gio_addr as u64, buf);
             }
         }
     }
@@ -996,7 +995,7 @@ impl MemoryController {
                     let Some(pa) = self.dma_xlate_qword(job, addr, true) else {
                         return Some(addr);
                     };
-                    phys.write8(pa, byte);
+                    phys.write8(pa as u64, byte);
                     addr = addr.wrapping_add(1);
                     shift = shift.wrapping_sub(8);
                 }
@@ -1040,7 +1039,7 @@ impl MemoryController {
                                     None => { exc = true; break 'dma_loop; }
                                 }
                             } else { mem_vaddr };
-                            phys.write32(phys_addr, job.gio_addr);
+                            phys.write32(phys_addr as u64, job.gio_addr);
                             if job.dir_up { mem_vaddr = mem_vaddr.wrapping_add(4); }
                             else          { mem_vaddr = mem_vaddr.wrapping_sub(4); }
                             byte_count = byte_count.saturating_sub(4);
@@ -1050,7 +1049,7 @@ impl MemoryController {
                             // thread has no EXEC_RETRY mechanism, so we busy-wait here.
                             let length = byte_count.min(8);
                             let data = loop {
-                                let r = phys.dma_read64(job.gio_addr);
+                                let r = phys.dma_read64(job.gio_addr as u64);
                                 if r.is_ok() { break r.data; }
                                 if r.status != BUS_BUSY { break 0u64; }
                                 std::hint::spin_loop();
@@ -1064,7 +1063,7 @@ impl MemoryController {
                                         None => { exc = true; break 'dma_loop; }
                                     }
                                 } else { mem_vaddr };
-                                phys.write8(phys_addr, byte);
+                                phys.write8(phys_addr as u64, byte);
                                 if job.dir_up { mem_vaddr = mem_vaddr.wrapping_add(1); }
                                 else          { mem_vaddr = mem_vaddr.wrapping_sub(1); }
                                 shift = shift.wrapping_sub(8);
@@ -1083,7 +1082,7 @@ impl MemoryController {
                                     None => { exc = true; break 'dma_loop; }
                                 }
                             } else { mem_vaddr };
-                            let byte = { let _r = phys.read8(phys_addr); if _r.is_ok() { let b = _r.data as _; b } else { 0 } };
+                            let byte = { let _r = phys.read8(phys_addr as u64); if _r.is_ok() { let b = _r.data as _; b } else { 0 } };
                             data |= (byte as u64) << shift;
                             if job.dir_up { mem_vaddr = mem_vaddr.wrapping_add(1); }
                             else          { mem_vaddr = mem_vaddr.wrapping_sub(1); }
@@ -1096,7 +1095,7 @@ impl MemoryController {
                         // is full (write64 reports BUS_BUSY rather than
                         // blocking, so the CPU can retry — but only a
                         // caller that checks it actually retries).
-                        while phys.dma_write64(job.gio_addr, data) == BUS_BUSY {
+                        while phys.dma_write64(job.gio_addr as u64, data) == BUS_BUSY {
                             std::hint::spin_loop();
                         }
                         byte_count = byte_count.saturating_sub(length);
@@ -1134,25 +1133,25 @@ impl MemoryController {
                     let length = byte_count.min(4);
                     if job.to_host {
                         let data = loop {
-                            let r = phys.read32(job.gio_addr32);
+                            let r = phys.read32(job.gio_addr32 as u64);
                             if r.is_ok() { break r.data; }
                             if r.status != BUS_BUSY { break 0; }
                             std::hint::spin_loop();
                         };
                         for k in 0..length {
                             let Some(pa) = self.dma_mem_addr(job, mem_vaddr, true) else { exc = true; break 'dma; };
-                            phys.write8(pa, (data >> (24 - 8 * k)) as u8);
+                            phys.write8(pa as u64, (data >> (24 - 8 * k)) as u8);
                             mem_vaddr = step(mem_vaddr);
                         }
                     } else {
                         let mut data = 0u32;
                         for k in 0..length {
                             let Some(pa) = self.dma_mem_addr(job, mem_vaddr, false) else { exc = true; break 'dma; };
-                            let b = phys.read8(pa);
+                            let b = phys.read8(pa as u64);
                             data |= (if b.is_ok() { b.data as u32 } else { 0 }) << (24 - 8 * k);
                             mem_vaddr = step(mem_vaddr);
                         }
-                        while phys.write32(job.gio_addr32, data) == BUS_BUSY {
+                        while phys.write32(job.gio_addr32 as u64, data) == BUS_BUSY {
                             std::hint::spin_loop();
                         }
                     }
@@ -1325,7 +1324,7 @@ mod tests {
     fn read64_matches_msb_first_byte_assembly() {
         let mem = Memory::new(1);
         for (i, b) in (0u8..8).enumerate() {
-            mem.write8(0x100 + i as u32, 0x10 + b);
+            mem.write8(0x100 + i as u64, 0x10 + b);
         }
 
         // What the generic mem->GIO loop would pack.
@@ -1424,7 +1423,7 @@ mod tests {
         // PTE: PFN in bits [29:6] such that (pte & 0x03ffffc0) << 6 == PBASE,
         // plus valid (bit 1) and dirty/write (bit 2).
         let pte = ((PBASE >> 6) & 0x03ff_ffc0) | 0x2 | 0x4;
-        mem.write32(PT, pte);
+        mem.write32(PT as u64, pte);
 
         {
             let mut st = mc.giodma().state.lock();
@@ -1436,7 +1435,7 @@ mod tests {
 
         // Seed the *physical* page with a recognisable pattern.
         for i in 0..64u32 {
-            mem.write8(PBASE + i, (0xA0 + i) as u8);
+            mem.write8((PBASE + i) as u64, (0xA0 + i) as u8);
         }
 
         let j = job(|j| {
@@ -1454,7 +1453,7 @@ mod tests {
             let pa = mc.dma_xlate_qword(&j, va, false)
                 .unwrap_or_else(|| panic!("translation failed for {va:#x}"));
             assert_eq!(pa, PBASE + q * 8, "vaddr {va:#x} must map into the physical page");
-            assert_eq!(mem.read64(pa).data, mem.read64(PBASE + q * 8).data);
+            assert_eq!(mem.read64(pa as u64).data, mem.read64((PBASE + q * 8) as u64).data);
         }
 
         // And the untranslated identity still holds when xlate is off.
@@ -1520,13 +1519,13 @@ mod zoom_semantics_tests {
     }
 
     impl BusDevice for GioSink {
-        fn read8(&self, a: u32) -> crate::traits::BusRead8 { self.mem.read8(a) }
-        fn write8(&self, a: u32, v: u8) -> u32 { self.mem.write8(a, v) }
-        fn read32(&self, a: u32) -> crate::traits::BusRead32 { self.mem.read32(a) }
-        fn write32(&self, a: u32, v: u32) -> u32 { self.mem.write32(a, v) }
-        fn read64(&self, a: u32) -> BusRead64 { self.mem.read64(a) }
-        fn write64(&self, a: u32, v: u64) -> u32 { self.mem.write64(a, v) }
-        fn dma_write64(&self, _a: u32, v: u64) -> u32 {
+        fn read8(&self, a: u64) -> crate::traits::BusRead8 { self.mem.read8(a) }
+        fn write8(&self, a: u64, v: u8) -> u32 { self.mem.write8(a, v) }
+        fn read32(&self, a: u64) -> crate::traits::BusRead32 { self.mem.read32(a) }
+        fn write32(&self, a: u64, v: u32) -> u32 { self.mem.write32(a, v) }
+        fn read64(&self, a: u64) -> BusRead64 { self.mem.read64(a) }
+        fn write64(&self, a: u64, v: u64) -> u32 { self.mem.write64(a, v) }
+        fn dma_write64(&self, _a: u64, v: u64) -> u32 {
             self.seen.lock().unwrap().push(v);
             BUS_OK
         }
@@ -1547,9 +1546,9 @@ mod zoom_semantics_tests {
 
         let sink = Arc::new(GioSink { mem: Memory::new(1), seen: StdMutex::new(Vec::new()) });
         // One 8-byte line at 0x100: bytes 1..8.
-        for i in 0..8u32 { sink.mem.write8(0x100 + i, (i + 1) as u8); }
+        for i in 0..8u32 { sink.mem.write8(0x100 + i as u64, (i + 1) as u8); }
         // A different line right after it, to catch a walk-forward bug.
-        for i in 0..8u32 { sink.mem.write8(0x108 + i, (0xF0 + i) as u8); }
+        for i in 0..8u32 { sink.mem.write8(0x108 + i as u64, (0xF0 + i) as u8); }
 
         let phys: Arc<dyn BusDevice> = sink.clone();
         let mc = MemoryController::new(
@@ -1659,34 +1658,34 @@ mod rex3_e2e_tests {
         /// inside that same window (bit 11), so masking the window size is
         /// enough — masking a coarser range misses it entirely and silently
         /// routes every register write to RAM.
-        fn is_rex(a: u32) -> bool { (a & !(REX3_SIZE - 1)) == REX3_BASE }
+        fn is_rex(a: u64) -> bool { (a & !(REX3_SIZE as u64 - 1)) == REX3_BASE as u64 }
     }
 
     impl BusDevice for Bus {
-        fn read8(&self, a: u32) -> crate::traits::BusRead8 { self.mem.read8(a) }
-        fn write8(&self, a: u32, v: u8) -> u32 { self.mem.write8(a, v) }
-        fn read32(&self, a: u32) -> crate::traits::BusRead32 {
+        fn read8(&self, a: u64) -> crate::traits::BusRead8 { self.mem.read8(a) }
+        fn write8(&self, a: u64, v: u8) -> u32 { self.mem.write8(a, v) }
+        fn read32(&self, a: u64) -> crate::traits::BusRead32 {
             if Self::is_rex(a) { self.rex.read32(a) } else { self.mem.read32(a) }
         }
-        fn write32(&self, a: u32, v: u32) -> u32 {
+        fn write32(&self, a: u64, v: u32) -> u32 {
             if Self::is_rex(a) { self.rex.write32(a, v) } else { self.mem.write32(a, v) }
         }
-        fn read64(&self, a: u32) -> crate::traits::BusRead64 {
+        fn read64(&self, a: u64) -> crate::traits::BusRead64 {
             if Self::is_rex(a) { self.rex.read64(a) } else { self.mem.read64(a) }
         }
-        fn write64(&self, a: u32, v: u64) -> u32 {
+        fn write64(&self, a: u64, v: u64) -> u32 {
             if Self::is_rex(a) { self.rex.write64(a, v) } else { self.mem.write64(a, v) }
         }
-        fn dma_read64(&self, a: u32) -> crate::traits::BusRead64 {
+        fn dma_read64(&self, a: u64) -> crate::traits::BusRead64 {
             if Self::is_rex(a) { self.rex.dma_read64(a) } else { self.mem.read64(a) }
         }
-        fn dma_write64(&self, a: u32, v: u64) -> u32 {
+        fn dma_write64(&self, a: u64, v: u64) -> u32 {
             if Self::is_rex(a) { self.rex.dma_write64(a, v) } else { self.mem.write64(a, v) }
         }
-        fn dma_read64_bulk(&self, a: u32, out: &mut [u64]) -> u32 {
+        fn dma_read64_bulk(&self, a: u64, out: &mut [u64]) -> u32 {
             if Self::is_rex(a) { self.rex.dma_read64_bulk(a, out) } else { crate::traits::BUS_ERR }
         }
-        fn dma_write64_bulk(&self, a: u32, vals: &[u64]) -> u32 {
+        fn dma_write64_bulk(&self, a: u64, vals: &[u64]) -> u32 {
             if Self::is_rex(a) { self.rex.dma_write64_bulk(a, vals) } else { crate::traits::BUS_ERR }
         }
     }
@@ -1745,7 +1744,7 @@ mod rex3_e2e_tests {
     }
 
     fn reg(bus: &Bus, offset: u32, value: u32) {
-        bus.rex.write32(REX3_BASE | offset, value);
+        bus.rex.write32((REX3_BASE | offset) as u64, value);
     }
 
     /// The baseline `rex3_tests.rs` establishes before every draw. Without at
@@ -1796,7 +1795,7 @@ mod rex3_e2e_tests {
                         let byte = if x < w as usize {
                             counter_byte(r * w as usize + x)
                         } else { 0 };
-                        bus.mem.write8(src + ((r * per_row + c) * 8 + k) as u32, byte);
+                        bus.mem.write8((src + ((r * per_row + c) * 8 + k) as u32) as u64, byte);
                     }
                 }
             }
@@ -1894,23 +1893,23 @@ mod line_bulk_tests_support {
     }
 
     impl BusDevice for GioSink {
-        fn read8(&self, a: u32) -> crate::traits::BusRead8 { self.mem.read8(a) }
-        fn write8(&self, a: u32, v: u8) -> u32 { self.mem.write8(a, v) }
-        fn read32(&self, a: u32) -> crate::traits::BusRead32 { self.mem.read32(a) }
-        fn write32(&self, a: u32, v: u32) -> u32 { self.mem.write32(a, v) }
-        fn read64(&self, a: u32) -> BusRead64 { self.mem.read64(a) }
-        fn write64(&self, a: u32, v: u64) -> u32 { self.mem.write64(a, v) }
-        fn dma_write64(&self, _a: u32, v: u64) -> u32 {
+        fn read8(&self, a: u64) -> crate::traits::BusRead8 { self.mem.read8(a) }
+        fn write8(&self, a: u64, v: u8) -> u32 { self.mem.write8(a, v) }
+        fn read32(&self, a: u64) -> crate::traits::BusRead32 { self.mem.read32(a) }
+        fn write32(&self, a: u64, v: u32) -> u32 { self.mem.write32(a, v) }
+        fn read64(&self, a: u64) -> BusRead64 { self.mem.read64(a) }
+        fn write64(&self, a: u64, v: u64) -> u32 { self.mem.write64(a, v) }
+        fn dma_write64(&self, _a: u64, v: u64) -> u32 {
             self.seen.lock().unwrap().push(v);
             BUS_OK
         }
-        fn dma_read64(&self, _a: u32) -> BusRead64 { BusRead64::ok(self.next_feed()) }
-        fn dma_write64_bulk(&self, _a: u32, vals: &[u64]) -> u32 {
+        fn dma_read64(&self, _a: u64) -> BusRead64 { BusRead64::ok(self.next_feed()) }
+        fn dma_write64_bulk(&self, _a: u64, vals: &[u64]) -> u32 {
             if !self.allow_bulk { return BUS_ERR; }
             self.seen.lock().unwrap().extend_from_slice(vals);
             BUS_OK
         }
-        fn dma_read64_bulk(&self, _a: u32, out: &mut [u64]) -> u32 {
+        fn dma_read64_bulk(&self, _a: u64, out: &mut [u64]) -> u32 {
             if !self.allow_bulk { return BUS_ERR; }
             for slot in out.iter_mut() { *slot = self.next_feed(); }
             BUS_OK
@@ -1974,8 +1973,8 @@ mod line_bulk_tests_support {
         let span = 0x40_0000u32.min(u32::MAX);
         for i in 0..span.min(0x40_0000) {
             let v = pattern(i);
-            a.mem.write8(0x2000u32.wrapping_add(i), v);
-            b.mem.write8(0x2000u32.wrapping_add(i), v);
+            a.mem.write8(0x2000u32.wrapping_add(i) as u64, v);
+            b.mem.write8(0x2000u32.wrapping_add(i) as u64, v);
         }
         let mc_a = mc_with(a.clone());
         let mc_b = mc_with(b.clone());
@@ -2019,8 +2018,8 @@ mod line_bulk_tests_support {
         let mut diffs = 0;
         for i in 0..span {
             let addr = 0x2000u32.wrapping_add(i);
-            let x = b.mem.read8(addr).data;
-            let y = a.mem.read8(addr).data;
+            let x = b.mem.read8(addr as u64).data;
+            let y = a.mem.read8(addr as u64).data;
             if x != y {
                 if diffs < 8 { eprintln!("{name}: mem[{addr:#x}] bulk={x:#04x} generic={y:#04x}"); }
                 diffs += 1;
@@ -2029,7 +2028,7 @@ mod line_bulk_tests_support {
         assert_eq!(diffs, 0, "{name}: {diffs} bytes differ from the reference engine");
         assert_eq!(rb.exc, ra.exc, "{name}: fault flag differs");
         assert_eq!(rb.mem_vaddr, ra.mem_vaddr, "{name}: final mem_vaddr differs");
-        let touched = (0..span).any(|i| a.mem.read8(0x2000u32.wrapping_add(i)).data != 0);
+        let touched = (0..span).any(|i| a.mem.read8(0x2000u32.wrapping_add(i) as u64).data != 0);
         assert!(touched, "{name}: reference wrote nothing — test is vacuous");
     }
 
@@ -2043,13 +2042,13 @@ mod line_bulk_tests_support {
 
             // Reference.
             let a = Arc::new(GioSink::new(false));
-            for i in 0..0x4000u32 { a.mem.write8(0x2000 + i, pattern(i)); }
+            for i in 0..0x4000u32 { a.mem.write8(0x2000 + i as u64, pattern(i)); }
             let mc_a = mc_with(a.clone());
             let ra = mc_a.dma_generic_bytes(a.as_ref(), &job);
 
             // Under test.
             let b = Arc::new(GioSink::new(true));
-            for i in 0..0x4000u32 { b.mem.write8(0x2000 + i, pattern(i)); }
+            for i in 0..0x4000u32 { b.mem.write8(0x2000 + i as u64, pattern(i)); }
             let mc_b = mc_with(b.clone());
             let rb = mc_b.dma_lines_bulk(b.as_ref(), &job);
 
@@ -2094,8 +2093,8 @@ mod line_bulk_tests_support {
             // place fails even if every byte value is individually plausible.
             let mut diffs = 0;
             for i in 0..0x4000u32 {
-                let x = b.mem.read8(0x2000 + i).data;
-                let y = a.mem.read8(0x2000 + i).data;
+                let x = b.mem.read8(0x2000 + i as u64).data;
+                let y = a.mem.read8(0x2000 + i as u64).data;
                 if x != y {
                     if diffs < 8 {
                         eprintln!("{name}: mem[{:#x}] bulk={x:#04x} generic={y:#04x}", 0x2000 + i);
@@ -2108,7 +2107,7 @@ mod line_bulk_tests_support {
             assert_eq!(rb.mem_vaddr, ra.mem_vaddr, "{name}: final mem_vaddr differs");
 
             // Vacuity guard: the reference must actually have written something.
-            let touched = (0..0x4000u32).any(|i| a.mem.read8(0x2000 + i).data != 0);
+            let touched = (0..0x4000u32).any(|i| a.mem.read8(0x2000 + i as u64).data != 0);
             assert!(touched, "{name}: reference wrote nothing — test is vacuous");
         }
     }
@@ -2334,16 +2333,16 @@ mod gio32_tests {
         reads: PlMutex<Vec<u32>>,
     }
     impl BusDevice for Bus {
-        fn read8(&self, a: u32) -> crate::traits::BusRead8 { self.mem.read8(a) }
-        fn write8(&self, a: u32, v: u8) -> u32 { self.mem.write8(a, v) }
-        fn read32(&self, a: u32) -> BusRead32 {
-            if a == PORT { BusRead32::ok(self.reads.lock().remove(0)) } else { self.mem.read32(a) }
+        fn read8(&self, a: u64) -> crate::traits::BusRead8 { self.mem.read8(a) }
+        fn write8(&self, a: u64, v: u8) -> u32 { self.mem.write8(a, v) }
+        fn read32(&self, a: u64) -> BusRead32 {
+            if a == PORT as u64 { BusRead32::ok(self.reads.lock().remove(0)) } else { self.mem.read32(a) }
         }
-        fn write32(&self, a: u32, v: u32) -> u32 {
-            if a == PORT { self.writes.lock().push(v); BUS_OK } else { self.mem.write32(a, v) }
+        fn write32(&self, a: u64, v: u32) -> u32 {
+            if a == PORT as u64 { self.writes.lock().push(v); BUS_OK } else { self.mem.write32(a, v) }
         }
-        fn read64(&self, a: u32) -> BusRead64 { self.mem.read64(a) }
-        fn write64(&self, a: u32, v: u64) -> u32 { self.mem.write64(a, v) }
+        fn read64(&self, a: u64) -> BusRead64 { self.mem.read64(a) }
+        fn write64(&self, a: u64, v: u64) -> u32 { self.mem.write64(a, v) }
     }
 
     fn setup() -> (Arc<Bus>, MemoryController) {
@@ -2367,7 +2366,7 @@ mod gio32_tests {
         // Indy default: only ONE_GIO; the graphics slot is 32 bits wide.
         assert!(mc.gio_slot_is_32bit(PORT));
         // Ng1Probe (Newport) sets GRX_SIZE_64 before touching REX3.
-        mc.write32(crate::dev::mc::MC_BASE + 0x84, 0x400 | 0x2);
+        mc.write32(crate::dev::mc::MC_BASE as u64 + 0x84, 0x400 | 0x2);
         assert!(!mc.gio_slot_is_32bit(PORT));
         assert!(mc.gio_slot_is_32bit(0x1f40_0000), "EXP0 still 32-bit");
         assert!(!mc.gio_slot_is_32bit(0x0800_0000), "non-GIO addresses keep 64-bit behaviour");
@@ -2377,7 +2376,7 @@ mod gio32_tests {
     fn mem_to_gio32_packs_msb_first_with_short_tail() {
         let (bus, mc) = setup();
         for i in 0..10u32 {
-            bus.mem.write8(0x2000 + i, 0x10 + i as u8);
+            bus.mem.write8(0x2000 + i as u64, 0x10 + i as u8);
         }
         let r = mc.dma_dispatch(&job(10, false));
         assert!(!r.exc);
@@ -2394,9 +2393,9 @@ mod gio32_tests {
         let (bus, mc) = setup();
         mc.start();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let reg = |r: u32, v: u32| { mc.write32(crate::dev::mc::MC_BASE + r, v); };
+        let reg = |r: u32, v: u32| { mc.write32((crate::dev::mc::MC_BASE + r) as u64, v); };
         for i in 0..8u32 {
-            bus.mem.write8(0x2000 + i, i as u8);
+            bus.mem.write8(0x2000 + i as u64, i as u8);
         }
         reg(REG_DMA_CTL, 0); // no IE, no XLATE
         reg(REG_DMA_MEMADR, 0x2000);
@@ -2407,7 +2406,7 @@ mod gio32_tests {
         reg(REG_DMA_GIO_ADRS, PORT); // starts the transfer
         let t = std::time::Instant::now();
         let run = loop {
-            let r = mc.read32(crate::dev::mc::MC_BASE + REG_DMA_RUN).data;
+            let r = mc.read32((crate::dev::mc::MC_BASE + REG_DMA_RUN) as u64).data;
             if r & 0x40 == 0 {
                 break r;
             }

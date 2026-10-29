@@ -222,22 +222,22 @@ pub struct RecordingMem {
 }
 
 impl BusDevice for RecordingMem {
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn read8(&self, addr: u64) -> BusRead8 {
         let r = self.inner.read8(addr);
-        self.rec.lock().put(Rec::MemRead { bits: 8, addr, val: if r.is_ok() { r.data as u32 } else { 0 } });
+        self.rec.lock().put(Rec::MemRead { bits: 8, addr: addr as u32, val: if r.is_ok() { r.data as u32 } else { 0 } });
         if r.is_ok() { r } else { BusRead8::ok(0) }
     }
-    fn read32(&self, addr: u32) -> BusRead32 {
+    fn read32(&self, addr: u64) -> BusRead32 {
         let r = self.inner.read32(addr);
-        self.rec.lock().put(Rec::MemRead { bits: 32, addr, val: if r.is_ok() { r.data } else { 0 } });
+        self.rec.lock().put(Rec::MemRead { bits: 32, addr: addr as u32, val: if r.is_ok() { r.data } else { 0 } });
         if r.is_ok() { r } else { BusRead32::ok(0) }
     }
-    fn write8(&self, addr: u32, val: u8) -> u32 {
-        self.rec.lock().put(Rec::MemWrite { bits: 8, addr, val: val as u32 });
+    fn write8(&self, addr: u64, val: u8) -> u32 {
+        self.rec.lock().put(Rec::MemWrite { bits: 8, addr: addr as u32, val: val as u32 });
         self.inner.write8(addr, val)
     }
-    fn write32(&self, addr: u32, val: u32) -> u32 {
-        self.rec.lock().put(Rec::MemWrite { bits: 32, addr, val });
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        self.rec.lock().put(Rec::MemWrite { bits: 32, addr: addr as u32, val });
         self.inner.write32(addr, val)
     }
 }
@@ -281,10 +281,10 @@ impl ReplayMem {
 }
 
 impl BusDevice for ReplayMem {
-    fn read8(&self, addr: u32) -> BusRead8 { BusRead8::ok(self.take(8, addr) as u8) }
-    fn read32(&self, addr: u32) -> BusRead32 { BusRead32::ok(self.take(32, addr)) }
-    fn write8(&self, _addr: u32, _val: u8) -> u32 { BUS_OK }
-    fn write32(&self, _addr: u32, _val: u32) -> u32 { BUS_OK }
+    fn read8(&self, addr: u64) -> BusRead8 { BusRead8::ok(self.take(8, addr as u32) as u8) }
+    fn read32(&self, addr: u64) -> BusRead32 { BusRead32::ok(self.take(32, addr as u32)) }
+    fn write8(&self, _addr: u64, _val: u8) -> u32 { BUS_OK }
+    fn write32(&self, _addr: u64, _val: u32) -> u32 { BUS_OK }
 }
 
 #[cfg(test)]
@@ -305,14 +305,14 @@ pub(super) mod tests {
     /// A board of kind `kind` with its engine threads running (no display).
     pub fn live_board_of(kind: GraphicsBoard) -> Arc<Mgras> {
         let hb = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let m = Mgras::new(kind, crate::dev::ioc::Ioc::new(false), hb.clone(), hb);
+        let m = Mgras::new(kind, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), hb.clone(), hb);
         m.start_engines();
         m
     }
 
     /// Store, retrying on bus back-pressure like the CPU does.
     pub fn write(m: &Mgras, bits: u8, off: u32, val: u64) {
-        let a = MGRAS_SLOT_GFX_BASE + off;
+        let a = (MGRAS_SLOT_GFX_BASE + off) as u64;
         loop {
             let st = match bits {
                 8 => m.write8(a, val as u8),
@@ -329,7 +329,7 @@ pub(super) mod tests {
 
     /// Load, retrying while the board answers busy.
     pub fn read(m: &Mgras, bits: u8, off: u32) -> u64 {
-        let a = MGRAS_SLOT_GFX_BASE + off;
+        let a = (MGRAS_SLOT_GFX_BASE + off) as u64;
         loop {
             let (st, v) = match bits {
                 8 => { let r = m.read8(a); (r.status, r.data as u64) }
