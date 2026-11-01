@@ -1198,8 +1198,13 @@ impl MemoryController {
 
         let mut state = lock.lock();
         while self.dma_running() {
-            // Wait for run signal
-            cvar.wait(&mut state);
+            // Wait for run signal. A trigger sets `run_real` under the lock
+            // before it notifies, so test it before sleeping: one that lands
+            // before the worker first waits (right after `start`) would
+            // otherwise be lost, and the guest would poll RUNNING forever.
+            while !state.run_real && self.dma_running() {
+                cvar.wait(&mut state);
+            }
 
             if !self.dma_running() { break; }
 
@@ -1694,11 +1699,7 @@ mod rex3_e2e_tests {
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(|| {
-                let rex = Box::leak(Box::new(Rex3::new(
-                    Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)),
-                    Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)),
-                    Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)),
-                )));
+                let rex = Box::leak(Box::new(Rex3::new(crate::disp::StatusSource::detached())));
                 unsafe {
                     (*rex.fb_rgb.get()).fill(0);
                     (*rex.fb_aux.get()).fill(0);
@@ -2389,10 +2390,25 @@ mod gio32_tests {
     /// DMA_RUN even though the completion interrupt is disabled.
     #[test]
     fn polled_vdma_reports_complete_without_interrupt_enable() {
+        polled_vdma(false);
+    }
+
+    /// The trigger lands before the worker thread exists, so the worker has
+    /// nobody to notify it: it must see the pending run flag on its own
+    /// instead of sleeping until a second trigger that never comes.
+    #[test]
+    fn a_trigger_written_before_the_worker_starts_still_runs() {
+        polled_vdma(true);
+    }
+
+    /// Program one 8-byte transfer and poll DMA_RUN until it finishes. With
+    /// `start_late` the worker is started after the trigger write.
+    fn polled_vdma(start_late: bool) {
         use crate::traits::Device;
         let (bus, mc) = setup();
-        mc.start();
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        if !start_late {
+            mc.start();
+        }
         let reg = |r: u32, v: u32| { mc.write32((crate::dev::mc::MC_BASE + r) as u64, v); };
         for i in 0..8u32 {
             bus.mem.write8(0x2000 + i as u64, i as u8);
@@ -2404,17 +2420,44 @@ mod gio32_tests {
         reg(REG_DMA_STRIDE, 1 << 16);
         reg(REG_DMA_COUNT, (1 << 16) | 8);
         reg(REG_DMA_GIO_ADRS, PORT); // starts the transfer
+        if start_late {
+            mc.start();
+        }
         let t = std::time::Instant::now();
         let run = loop {
             let r = mc.read32((crate::dev::mc::MC_BASE + REG_DMA_RUN) as u64).data;
             if r & 0x40 == 0 {
                 break r;
             }
-            assert!(t.elapsed() < std::time::Duration::from_secs(2), "DMA never finished");
+            // A hang detector, not a speed bound: the worker is a thread, and
+            // on a loaded host it can wait a long time for a core.
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "DMA never finished");
+            std::thread::yield_now();
         };
         assert_ne!(run & 0x08, 0, "VDMA_R_COMPLETE missing: DMA_RUN = {run:#x}");
         assert_eq!(*bus.writes.lock(), vec![0x0001_0203, 0x0405_0607]);
         mc.stop();
+    }
+
+    /// `stop` must clear the running flag under the state lock, the lock the
+    /// worker holds between testing the flag and waiting on the condition
+    /// variable. Without it a stop landing in that gap notifies nobody and
+    /// `join` hangs. Hold the lock here, as the worker does in the gap, and
+    /// check `stop` cannot get past it.
+    #[test]
+    fn stop_waits_for_the_state_lock_before_clearing_the_running_flag() {
+        use crate::traits::Device;
+        let (_bus, mc) = setup();
+        mc.start();
+        std::thread::scope(|s| {
+            let held = mc.giodma().state.lock();
+            let stopper = s.spawn(|| mc.stop());
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(mc.dma_running(), "stop cleared the flag without taking the state lock");
+            drop(held);
+            stopper.join().unwrap();
+        });
+        assert!(!mc.dma_running());
     }
 
     #[test]

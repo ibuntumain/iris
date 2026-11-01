@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use glow::HasContext;
@@ -493,11 +494,38 @@ impl StatusBarTexture {
     }
 }
 
+/// CPUs the status bar shows beyond the first.
+pub const MORE_CPUS: usize = crate::cpu::smp::MAX_CPUS - 1;
+
+/// The bar's MIPS and Hz figures: one per CPU, the first as it always was
+/// ("95.1|94.8", " 100|100").
+fn rate_figures(mips: f64, hz: f64, more: &[Option<(f64, f64)>]) -> (String, String) {
+    let mut m = format!("{mips:5.1}");
+    let mut h = format!("{hz:4.0}");
+    for (cpu_mips, cpu_hz) in more.iter().flatten() {
+        m.push_str(&format!("|{cpu_mips:.1}"));
+        h.push_str(&format!("|{cpu_hz:.0}"));
+    }
+    (m, h)
+}
+
+/// How far a cycle counter moved between two samples. A counter that went
+/// backwards was set to 0 by a CPU reset inside the window, so it moved by
+/// its new value; a wrapping difference would show a reset as about 18
+/// trillion MIPS.
+pub fn cycles_moved(prev: u64, cur: u64) -> u64 {
+    if cur >= prev { cur - prev } else { cur }
+}
+
 /// Snapshot of CPU counters and wall-clock time captured once per refresh loop iteration.
 pub struct BarStats {
     pub now:            std::time::Instant,
+    /// Cycles that retired instructions (`CyclesPtr::retired`): a parked
+    /// CPU adds none, so an idle guest reads near 0 MIPS.
     pub cycles:         u64,
     pub fasttick:       u64,
+    /// The other CPUs' `cycles` and `fasttick`, if the machine has any.
+    pub more_cpus:      [Option<(u64, u64)>; MORE_CPUS],
     pub decoded_delta:  u64,
     pub l1i_hits:       u64,
     pub l1i_fetches:    u64,
@@ -505,6 +533,121 @@ pub struct BarStats {
     pub hb:             u64,
     pub count_hz:       u64,
     pub gfifo_pending:  usize,
+}
+
+/// The machine-level inputs of the status bar, shared by every graphics board
+/// on the machine.
+///
+/// The machine builds one and hands it to its board(s) at construction. A
+/// board's display thread calls [`snapshot`](Self::snapshot) once per frame
+/// and gets back a [`BarStats`] with the heartbeat, cycle counter and the
+/// rest already filled in, so a board cannot forget the front-panel LEDs or
+/// the activity lights, and the rule for clearing them lives here only.
+///
+/// What stays with the board is what only the board knows: the depth of its
+/// command queue (`gfifo_pending`).
+pub struct StatusSource {
+    /// LEDs and SCSI/network activity bits (`Rex3::HB_*`). Devices set bits;
+    /// `snapshot` clears the activity bits once they have been shown.
+    heartbeat: Arc<AtomicU64>,
+    /// CP0 Compare-match counter, for the bar's Hz figure.
+    fasttick: Arc<AtomicU64>,
+    /// The CPU's cycle counter; wired once the CPU exists, because the boards
+    /// are built first (see `CyclesPtr::dangling`).
+    cycles: Mutex<crate::cpu::mips_core::CyclesPtr>,
+    /// CPU Count rate, for the developer bar. Replaced when the CPU exists.
+    count_hz: Mutex<Arc<AtomicU64>>,
+    /// The other CPUs' cycle counters and Compare-match counts, one per CPU
+    /// after the first.
+    more_cpus: Mutex<Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)>>,
+    /// Fetch counters the CPU bumps, read and cleared per frame by the
+    /// developer bar. Zero on machines whose CPU does not feed them.
+    decoded: Arc<AtomicU64>,
+    l1i_hits: Arc<AtomicU64>,
+    l1i_fetches: Arc<AtomicU64>,
+    uncached: Arc<AtomicU64>,
+}
+
+impl StatusSource {
+    /// Heartbeat bits that stay lit between frames (the front-panel LEDs).
+    /// Everything else in the heartbeat is activity and clears once shown.
+    pub const PERSISTENT: u64 = Rex3::HB_PERSISTENT;
+
+    pub fn new(heartbeat: Arc<AtomicU64>, fasttick: Arc<AtomicU64>) -> Arc<Self> {
+        Arc::new(Self {
+            heartbeat,
+            fasttick,
+            cycles: Mutex::new(crate::cpu::mips_core::CyclesPtr::dangling()),
+            count_hz: Mutex::new(Arc::new(AtomicU64::new(crate::cpu::mips_core::DEFAULT_COUNT_HZ))),
+            more_cpus: Mutex::new(Vec::new()),
+            decoded: Arc::new(AtomicU64::new(0)),
+            l1i_hits: Arc::new(AtomicU64::new(0)),
+            l1i_fetches: Arc::new(AtomicU64::new(0)),
+            uncached: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// A source with its own counters and no CPU, for tests and boards run
+    /// outside a machine.
+    pub fn detached() -> Arc<Self> {
+        Self::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+    }
+
+    /// The CPU's pre-decoded-instruction, L1-I hit, L1-I fetch and uncached
+    /// fetch counters, in that order: the Arcs the CPU is given to bump.
+    pub fn fetch_counters(&self) -> [Arc<AtomicU64>; 4] {
+        [self.decoded.clone(), self.l1i_hits.clone(), self.l1i_fetches.clone(), self.uncached.clone()]
+    }
+
+    pub fn set_cpu_cycles(&self, ptr: crate::cpu::mips_core::CyclesPtr) {
+        *self.cycles.lock() = ptr;
+    }
+
+    pub fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr {
+        *self.cycles.lock()
+    }
+
+    pub fn set_count_hz(&self, hz: Arc<AtomicU64>) {
+        *self.count_hz.lock() = hz;
+    }
+
+    /// One more CPU for the bar's MIPS and Hz columns.
+    pub fn add_cpu_stats(&self, cycles: crate::cpu::mips_core::CyclesPtr, fasttick: Arc<AtomicU64>) {
+        self.more_cpus.lock().push((cycles, fasttick));
+    }
+
+    fn more_cpu_stats(&self) -> [Option<(u64, u64)>; MORE_CPUS] {
+        let more = self.more_cpus.lock();
+        std::array::from_fn(|i| more.get(i).map(|(c, f)| (c.retired(), f.load(Ordering::Relaxed))))
+    }
+
+    /// One frame's stats. Clears the heartbeat's activity bits and the fetch
+    /// counters, so call it once per presented frame.
+    pub fn snapshot(&self, now: std::time::Instant, gfifo_pending: usize) -> BarStats {
+        #[cfg(feature = "developer")]
+        let (decoded_delta, l1i_hits, l1i_fetches, uncached, count_hz) = (
+            self.decoded.swap(0, Ordering::Relaxed),
+            self.l1i_hits.swap(0, Ordering::Relaxed),
+            self.l1i_fetches.swap(0, Ordering::Relaxed),
+            self.uncached.swap(0, Ordering::Relaxed),
+            self.count_hz.lock().load(Ordering::Relaxed),
+        );
+        #[cfg(not(feature = "developer"))]
+        let (decoded_delta, l1i_hits, l1i_fetches, uncached, count_hz) = (0, 0, 0, 0, 0);
+        BarStats {
+            now,
+            cycles: self.cycles().retired(),
+            fasttick: self.fasttick.load(Ordering::Relaxed),
+            more_cpus: self.more_cpu_stats(),
+            decoded_delta,
+            l1i_hits,
+            l1i_fetches,
+            uncached,
+            hb: self.heartbeat.fetch_and(Self::PERSISTENT, Ordering::Relaxed),
+            count_hz,
+            gfifo_pending,
+        }
+    }
 }
 
 const FADE_FRAMES: u8 = 15;
@@ -546,6 +689,9 @@ pub struct StatusBar {
     led_green: bool,
     prev_cycles: u64,
     prev_fasttick: u64,
+    prev_more: [(u64, u64); MORE_CPUS],
+    /// The other CPUs' MIPS and Hz, as `mips` and `fasthz` are for the first.
+    more_rates: [Option<(f64, f64)>; MORE_CPUS],
     prev_time: std::time::Instant,
     mips: f64,
     fasthz: f64,
@@ -578,7 +724,7 @@ pub struct StatusBar {
 impl StatusBar {
     pub fn new() -> Self {
         Self {
-            font: crate::vga_font::VGA_8X16.to_vec(),
+            font: crate::vga_font::SCREEN_8X16.to_vec(),
             enet_tx_fade: 0,
             enet_rx_fade: 0,
             scsi_fade: [0; 7],
@@ -586,6 +732,8 @@ impl StatusBar {
             led_green: false,
             prev_cycles: 0,
             prev_fasttick: 0,
+            prev_more: [(0, 0); MORE_CPUS],
+            more_rates: [None; MORE_CPUS],
             prev_time: std::time::Instant::now(),
             mips: 0.0,
             fasthz: 0.0,
@@ -636,7 +784,7 @@ impl StatusBar {
     pub fn render(&mut self, rgba: &mut Vec<u32>, width: usize, bar_y: usize, stats: &BarStats) {
         let dt = stats.now.duration_since(self.prev_time).as_secs_f64();
         if dt >= 0.1 {
-            let dc = stats.cycles.wrapping_sub(self.prev_cycles);
+            let dc = cycles_moved(self.prev_cycles, stats.cycles);
             let df = stats.fasttick.wrapping_sub(self.prev_fasttick);
             self.mips   = (dc as f64 / dt / 1_000_000.0 * 10.0).round() / 10.0;
             #[cfg(feature = "developer")] {
@@ -648,16 +796,24 @@ impl StatusBar {
             self.fasthz = (df as f64 / dt).round();
             self.prev_cycles   = stats.cycles;
             self.prev_fasttick = stats.fasttick;
+            for (i, more) in stats.more_cpus.iter().enumerate() {
+                self.more_rates[i] = more.map(|(c, f)| {
+                    let (pc, pf) = self.prev_more[i];
+                    self.prev_more[i] = (c, f);
+                    ((cycles_moved(pc, c) as f64 / dt / 1_000_000.0 * 10.0).round() / 10.0, (f.wrapping_sub(pf) as f64 / dt).round())
+                });
+            }
             self.prev_time     = stats.now;
         }
 
         let tx_color = if self.enet_tx_fade > 0 { BAR_ACTIVE } else { BAR_DIM };
         let rx_color = if self.enet_rx_fade > 0 { BAR_ACTIVE } else { BAR_DIM };
 
+        let (mips, hz) = rate_figures(self.mips, self.fasthz, &self.more_rates);
         #[cfg(feature = "developer")]
-        let line = format!(" {:5.1} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {:4.0}Hz cnt:{:5.1}MHz g{:04X} NET:", self.mips, self.decode_pct, self.l1i_hit_pct, self.uncached_pct, self.fasthz, stats.count_hz as f64 / 1e6, stats.gfifo_pending);
+        let line = format!(" {mips} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {hz}Hz cnt:{:5.1}MHz g{:04X} NET:", self.decode_pct, self.l1i_hit_pct, self.uncached_pct, stats.count_hz as f64 / 1e6, stats.gfifo_pending);
         #[cfg(not(feature = "developer"))]
-        let line = format!(" {:5.1} MIPS {:4.0}Hz NET:", self.mips, self.fasthz);
+        let line = format!(" {mips} MIPS {hz}Hz NET:");
 
         let row_stride = 2048;
         for row in 0..STATUS_BAR_HEIGHT {
@@ -869,4 +1025,74 @@ pub fn save_screenshot(path: &str, rgba: &[u32], width: usize, height: usize) ->
         }
     }
     writer.write_image_data(&rows).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod rate_figure_tests {
+    use super::rate_figures;
+
+    #[test]
+    fn one_cpu_reads_as_it_always_did() {
+        assert_eq!(rate_figures(95.1, 100.0, &[None, None, None]), (" 95.1".to_string(), " 100".to_string()));
+    }
+
+    #[test]
+    fn each_further_cpu_adds_a_figure() {
+        assert_eq!(rate_figures(95.1, 100.0, &[Some((94.8, 99.0)), None, None]), (" 95.1|94.8".to_string(), " 100|99".to_string()));
+    }
+
+    /// A CPU reset sets the cycle counter back to 0 mid-window. The bar shows
+    /// what ran since, not a wrapped difference, for the first CPU and the
+    /// others alike.
+    #[test]
+    fn a_reset_in_the_window_counts_from_zero() {
+        let mut bar = super::StatusBar::new();
+        let t0 = bar.prev_time;
+        let stats = |now, cycles: u64| super::BarStats {
+            now, cycles, fasttick: 0,
+            more_cpus: std::array::from_fn(|i| (i == 0).then_some((cycles, 0))),
+            decoded_delta: 0, l1i_hits: 0, l1i_fetches: 0, uncached: 0, hb: 0, count_hz: 0, gfifo_pending: 0,
+        };
+        let mut rgba = vec![0u32; 2048 * super::STATUS_BAR_HEIGHT];
+        bar.render(&mut rgba, 640, 0, &stats(t0 + std::time::Duration::from_secs(1), 900_000_000));
+        bar.render(&mut rgba, 640, 0, &stats(t0 + std::time::Duration::from_secs(2), 40_000_000));
+        assert_eq!(bar.mips, 40.0);
+        assert_eq!(bar.more_rates[0], Some((40.0, 0.0)));
+    }
+}
+
+#[cfg(test)]
+mod status_source_tests {
+    use super::StatusSource;
+    use crate::cpu::mips_core::CyclesPtr;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// The bar's figures count retired cycles, so a parked CPU adds nothing
+    /// to its MIPS: not the first CPU's, not a further CPU's.
+    #[test]
+    fn snapshot_leaves_out_parked_cycles() {
+        let src = StatusSource::detached();
+        let (cycles, parked) = (Box::new(2_000u64), Box::new(500u64));
+        src.set_cpu_cycles(CyclesPtr::with_parked(&*cycles, &*parked));
+        let (more_cycles, more_parked) = (Box::new(900u64), Box::new(100u64));
+        src.add_cpu_stats(CyclesPtr::with_parked(&*more_cycles, &*more_parked), Arc::new(AtomicU64::new(7)));
+        let s = src.snapshot(Instant::now(), 3);
+        assert_eq!(s.cycles, 1_500);
+        assert_eq!(s.more_cpus[0], Some((800, 7)));
+        assert_eq!(s.more_cpus[1], None);
+        assert_eq!(s.gfifo_pending, 3);
+    }
+
+    /// Activity bits clear once shown; the LEDs stay lit.
+    #[test]
+    fn snapshot_clears_activity_but_keeps_the_leds() {
+        let hb = Arc::new(AtomicU64::new(StatusSource::PERSISTENT | !StatusSource::PERSISTENT));
+        let src = StatusSource::new(hb.clone(), Arc::new(AtomicU64::new(0)));
+        let first = src.snapshot(Instant::now(), 0);
+        assert_eq!(first.hb, u64::MAX);
+        let second = src.snapshot(Instant::now(), 0);
+        assert_eq!(second.hb, StatusSource::PERSISTENT);
+    }
 }

@@ -304,11 +304,31 @@ pub(super) mod tests {
 
     /// A board of kind `kind` with its engine threads running (no display).
     pub fn live_board_of(kind: GraphicsBoard) -> Arc<Mgras> {
-        let hb = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let m = Mgras::new(kind, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), hb.clone(), hb);
+        let m = Mgras::new(kind, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::disp::StatusSource::detached());
         m.start_engines();
         m
     }
+
+    /// Poll `f` until it returns `Some`, giving up after `POLL_LIMIT`. The
+    /// engine threads run asynchronously and the test binary runs many
+    /// boards at once, so a thread can wait hundreds of milliseconds for
+    /// a core; a poll counted in iterations gave up after about 200 ms of
+    /// that. Time bounds the wait on the thing being awaited, not on how
+    /// fast the polling loop spins.
+    pub fn poll_until<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
+        let end = std::time::Instant::now() + POLL_LIMIT;
+        loop {
+            if let Some(v) = f() {
+                return Some(v);
+            }
+            if std::time::Instant::now() >= end {
+                return None;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    const POLL_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Store, retrying on bus back-pressure like the CPU does.
     pub fn write(m: &Mgras, bits: u8, off: u32, val: u64) {

@@ -1342,11 +1342,9 @@ pub struct Rex3 {
     /// True while the REX3-Processor thread is parked on an empty gfifo. The
     /// producer (`gfifo_push`) checks this and unparks the consumer so a fresh
     /// command is picked up immediately instead of after the park timeout.
-    #[cfg(any(feature = "idle-pause", test))]
     processor_parked: AtomicBool,
     /// Handle to the REX3-Processor thread, set once when it starts, used by
     /// `gfifo_push` to unpark it. OnceLock gives lock-free reads on the hot path.
-    #[cfg(any(feature = "idle-pause", test))]
     processor_unparker: std::sync::OnceLock<thread::Thread>,
     /// Set by the gfifo consumer whenever it processes activity that may have
     /// changed the framebuffer. The refresh thread renders only when this (or a
@@ -1390,6 +1388,7 @@ pub struct Rex3 {
     pub diag: AtomicU64,
     debug_state: Mutex<DebugState>,
     pub renderer: Mutex<Option<Box<dyn Renderer>>>,
+    display_stop: crate::gfx_display::DisplayStop,
     /// Compiled shaders, keyed by `(dm0, dm1_normalized, clipmode_key)`.
     ///
     /// Always present, not gated on `rex-jit`: the LLVM-compiled shaders in
@@ -1430,26 +1429,9 @@ pub struct Rex3 {
     /// the same as the previous GO.  Only accessed from the GFIFO consumer thread — no sync needed.
     #[cfg(feature = "rex-jit")]
     pub jit_last: std::cell::Cell<(u32, u32, u32, Option<unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>)>,
-    /// Shared activity heartbeat — set by all devices, polled+cleared by the refresh thread.
-    /// bit 0 = enet TX, bit 1 = enet RX, bits 2-3 = red/green LED (persistent), bits 8-13 = SCSI IDs 0-5
-    pub heartbeat: Arc<AtomicU64>,
-    /// Pointer into the CPU's `MipsCore.hot.cycles` word (see
-    /// `CyclesPtr`/`Hot::cycles`'s doc comments). Set exactly once, from
-    /// `set_cpu_cycles`, during single-threaded `Machine::new` setup — after
-    /// the CPU exists (`Rex3::new` runs before it does, so this can't be a
-    /// constructor parameter; see `MipsCpu::cycles_ptr`) but strictly before
-    /// any device thread (including this struct's own refresh thread) is
-    /// spawned, so a plain `Cell` is
-    /// enough — no atomicity needed for the pointer variable itself.
-    /// `CyclesPtr::dangling()` until `set_cpu_cycles` runs; its own `get()`
-    /// treats that as "not wired up yet" and reports 0.
-    pub cycles: std::cell::Cell<crate::cpu::mips_core::CyclesPtr>,
-    /// CP0 Count==Compare match counter — incremented every fastick interrupt.
-    pub fasttick_count: Arc<AtomicU64>,
-    pub decoded_count: Arc<AtomicU64>,
-    pub l1i_hit_count: Arc<AtomicU64>,
-    pub l1i_fetch_count: Arc<AtomicU64>,
-    pub uncached_fetch_count: Arc<AtomicU64>,
+    /// The machine's status-bar inputs (heartbeat, cycle counter, ...), shared
+    /// with every other board on it.
+    pub status: Arc<crate::disp::StatusSource>,
     /// Optional log file for block/span draws (set when block_debug is enabled).
     #[cfg(feature = "developer")]
     block_log: Mutex<Option<std::fs::File>>,
@@ -1479,10 +1461,6 @@ pub struct Rex3 {
     /// Frame consumers (VNC) that want `screen.rgba` kept current; while
     /// non-zero every full frame is read back and the compositor is software.
     capture_users: AtomicUsize,
-    /// Atomic shadow of MipsCore::count_hz — updated by CPU thread, read by refresh thread.
-    /// Wrapped in Mutex so machine.rs can swap in the real Arc from MipsCore after construction.
-    #[cfg(feature = "developer")]
-    pub count_hz_atomic: Mutex<Arc<AtomicU64>>,
 }
 
 unsafe impl Sync for Rex3 {}
@@ -1502,7 +1480,7 @@ pub struct ShaderRow {
 }
 
 impl Rex3 {
-    pub fn new(heartbeat: Arc<AtomicU64>, fasttick_count: Arc<AtomicU64>, decoded_count: Arc<AtomicU64>, l1i_hit_count: Arc<AtomicU64>, l1i_fetch_count: Arc<AtomicU64>, uncached_fetch_count: Arc<AtomicU64>) -> Self {
+    pub fn new(status: Arc<crate::disp::StatusSource>) -> Self {
         // The dispatch map, shared with the Cranelift compiler thread so both
         // shader sources publish into one place.
         //
@@ -1559,9 +1537,7 @@ impl Rex3 {
             gfxbusy: Arc::new(AtomicBool::new(false)),
             processor_thread: Mutex::new(None),
             refresh_thread: Mutex::new(None),
-            #[cfg(any(feature = "idle-pause", test))]
             processor_parked: AtomicBool::new(false),
-            #[cfg(any(feature = "idle-pause", test))]
             processor_unparker: std::sync::OnceLock::new(),
             fb_dirty: AtomicBool::new(true),
             screen,
@@ -1586,6 +1562,7 @@ impl Rex3 {
             debug_state: Mutex::new(DebugState::default()),
             diag: AtomicU64::new(0),
             renderer: Mutex::new(None),
+            display_stop: Default::default(),
             // IRIS_NO_JIT (set by the sandboxed Mac App Store GUI build) forces
             // the interpreter: Cranelift's mmap+mprotect executable pages aren't
             // MAP_JIT, so the App Sandbox kills the process with SIGKILL/
@@ -1620,13 +1597,7 @@ impl Rex3 {
             seen_shapes: Mutex::new(crate::dev::ng1::rex3_shape::ShapeSet::default()),
             #[cfg(feature = "rex-jit")]
             jit_last: std::cell::Cell::new((0, 0, 0, None)),
-            heartbeat,
-            cycles: std::cell::Cell::new(crate::cpu::mips_core::CyclesPtr::dangling()),
-            fasttick_count,
-            decoded_count,
-            l1i_hit_count,
-            l1i_fetch_count,
-            uncached_fetch_count,
+            status,
             #[cfg(feature = "developer")]
             block_log: Mutex::new(None),
             #[cfg(feature = "gputrace")]
@@ -1641,8 +1612,6 @@ impl Rex3 {
             screenshot_counter: AtomicU32::new(0),
             frame_request: AtomicBool::new(false),
             capture_users: AtomicUsize::new(0),
-            #[cfg(feature = "developer")]
-            count_hz_atomic: Mutex::new(Arc::new(AtomicU64::new(crate::cpu::mips_core::DEFAULT_COUNT_HZ))),
         }
     }
 
@@ -1747,19 +1716,6 @@ impl Rex3 {
         if let Some(irq) = self.fifo_full_cb.lock().clone() {
             irq.set(crossed);
         }
-    }
-
-    #[cfg(feature = "developer")]
-    pub fn set_count_hz_atomic(&self, arc: Arc<AtomicU64>) {
-        *self.count_hz_atomic.lock() = arc;
-    }
-
-    /// Wire up the CPU cycle counter — called from `Machine::new` once
-    /// `MipsCpu` exists (`Rex3::new` runs before it does, so this can't be a
-    /// constructor parameter; see `Hot::cycles`'s doc comment for why it's a
-    /// raw pointer at all, not a shared `Arc<AtomicU64>`).
-    pub fn set_cpu_cycles(&self, ptr: crate::cpu::mips_core::CyclesPtr) {
-        self.cycles.set(ptr);
     }
 
     fn setup(&self, ctx: &mut Rex3Context) {
@@ -2464,7 +2420,6 @@ impl Rex3 {
         // Wake the consumer if it parked on an empty fifo (idle desktop). Cheap
         // on the hot path: a relaxed-ish load that is false whenever the
         // processor is actively draining.
-        #[cfg(any(feature = "idle-pause", test))]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -2491,7 +2446,6 @@ impl Rex3 {
         if !self.gfifo.try_push(addr, val) {
             return false;
         }
-        #[cfg(any(feature = "idle-pause", test))]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -2523,7 +2477,6 @@ impl Rex3 {
         if !self.gfifo.try_push2(addr0, val0, addr1, val1) {
             return false;
         }
-        #[cfg(any(feature = "idle-pause", test))]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -2545,7 +2498,6 @@ impl Rex3 {
             });
         }
         self.gfifo.push_batch(token, vals.len() as u64, vals);
-        #[cfg(any(feature = "idle-pause", test))]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -2570,7 +2522,6 @@ impl Rex3 {
 
     fn register_processor(&self) {
         // Publish our thread handle so gfifo_push can unpark us when we park.
-        #[cfg(any(feature = "idle-pause", test))]
         let _ = self.processor_unparker.set(thread::current());
         let backoff = crossbeam_utils::Backoff::new();
         let mut is_busy = false;
@@ -2632,10 +2583,8 @@ impl Rex3 {
                 // (crossbeam's backoff completes), stop burning a host core on
                 // yield_now() and actually park. An idle IRIX desktop leaves this
                 // fifo empty indefinitely, so without parking this thread pins a
-                // CPU at ~100%. Test builds always park: every test leaks its
-                // Rex3, processor thread included, and a few hundred of them
-                // yield-spinning starve a CI runner.
-                #[cfg(any(feature = "idle-pause", test))]
+                // CPU at ~100%. Tests leak their Rex3 and its processor thread,
+                // so spinning ones also starve a CI runner.
                 if backoff.is_completed() {
                     // Set parked BEFORE the final emptiness re-check so a racing
                     // gfifo_push either (a) is seen by the peek below, or (b) sees
@@ -2650,8 +2599,6 @@ impl Rex3 {
                     self.processor_parked.store(false, Ordering::Release);
                     backoff.reset();
                 } else { backoff.snooze(); }
-                #[cfg(not(any(feature = "idle-pause", test)))]
-                backoff.snooze();
             }
         }
     }
@@ -2981,33 +2928,7 @@ impl Rex3 {
             self.trace_flush(false);
 
             // Poll and clear activity bits; preserve persistent LED bits.
-            let bar_stats = crate::disp::BarStats {
-                now:          start,
-                hb:           self.heartbeat.fetch_and(Self::HB_PERSISTENT, Ordering::Relaxed),
-                cycles:       self.cycles.get().get(),
-                fasttick:     self.fasttick_count.load(Ordering::Relaxed),
-                #[cfg(feature = "developer")]
-                decoded_delta: self.decoded_count.swap(0, Ordering::Relaxed),
-                #[cfg(not(feature = "developer"))]
-                decoded_delta: 0,
-                #[cfg(feature = "developer")]
-                l1i_hits:     self.l1i_hit_count.swap(0, Ordering::Relaxed),
-                #[cfg(not(feature = "developer"))]
-                l1i_hits:     0,
-                #[cfg(feature = "developer")]
-                l1i_fetches:  self.l1i_fetch_count.swap(0, Ordering::Relaxed),
-                #[cfg(not(feature = "developer"))]
-                l1i_fetches:  0,
-                #[cfg(feature = "developer")]
-                uncached:     self.uncached_fetch_count.swap(0, Ordering::Relaxed),
-                #[cfg(not(feature = "developer"))]
-                uncached:     0,
-                #[cfg(feature = "developer")]
-                count_hz:     self.count_hz_atomic.lock().load(Ordering::Relaxed),
-                #[cfg(not(feature = "developer"))]
-                count_hz:     0,
-                gfifo_pending: self.gfifo.len(),
-            };
+            let bar_stats = self.status.snapshot(start, self.gfifo.len());
 
             // Fence-based sync: wait until the GFIFO consumer has processed every
             // GFIFO_DISP_SYNC pushed since the last frame.  Each XMAP mode table
@@ -3253,9 +3174,7 @@ impl Rex3 {
             }
         }
 
-        if let Some(renderer) = self.renderer.lock().as_mut() {
-            renderer.stop();
-        }
+        self.display_stop.finish(&self.renderer);
     }
 
     /// Returns `true` if the register offset was recognized and updated state.
@@ -3635,6 +3554,7 @@ impl Device for Rex3 {
         if let Some(s) = self.stop_trace() {
             eprintln!("REX3: trace closed: {s}");
         }
+        self.display_stop.request();
         self.running.store(false, Ordering::SeqCst);
 
         // Send exit command to ensure processor thread wakes up and terminates.
@@ -4932,10 +4852,11 @@ impl BusDevice for Rex3 {
 
 impl crate::gfx_display::GfxDisplay for Rex3 {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { &self.display_stop }
     fn screen(&self) -> &Mutex<Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
     fn screenshot_pending(&self) -> bool { self.screenshot_pending.load(Ordering::Relaxed) }
-    fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.cycles.get() }
+    fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.status.cycles() }
     fn request_frame(&self) { self.frame_request.store(true, Ordering::Relaxed); }
     fn frame_pending(&self) -> bool { self.frame_request.load(Ordering::Relaxed) }
     fn set_capture(&self, on: bool) {

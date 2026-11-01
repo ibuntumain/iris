@@ -1,8 +1,8 @@
 //! Host-side networking: the NAT gateway the guest's Ethernet talks to, its
 //! in-core services, and the PCAP alternative to it.
 //!
-//! A NIC model (seeq8003, DaynaPort) hands guest frames to a [`NetBackend`]
-//! over an rtrb ring and takes frames back on another. The NAT backend is
+//! A NIC model (seeq8003, DaynaPort, MEC, IOC3) hands guest frames to a
+//! [`NetBackend`] over an rtrb ring and takes frames back on another. The NAT backend is
 //! [`NatEngine`]; see `clanker/plans/net-stack.md` for its design.
 //!
 //!   packet.rs    Ethernet/ARP/IPv4/ICMP/UDP/TCP views and builders
@@ -21,6 +21,7 @@
 //!   rsh.rs       read-only rsh (TCP 514): a few built-in commands over one directory
 //!   xdmcp.rs     XDMCP gateway into the guest's xdm
 //!   host_dns.rs  host DNS server discovery for DNS relaying
+//!   link.rs      an adapter's connection to the backend `[network]` selects
 //!   net_pcap.rs  PCAP bridged backend (`pcap` feature)
 //!   telnet.rs    telnet option negotiation for the monitor/serial consoles
 
@@ -28,6 +29,7 @@ mod engine;
 mod fwd;
 mod frag;
 mod host_dns;
+mod link;
 mod nat_icmp;
 mod nat_tcp;
 mod nat_udp;
@@ -57,6 +59,7 @@ use parking_lot::Mutex;
 use crate::config::{NatSubnet, NetMode, NfsConfig, PortForwardConfig};
 
 pub use engine::NatEngine;
+pub use link::{Link, Rings};
 pub use wake::Wake;
 #[cfg(feature = "pcap")]
 pub(crate) use nfs_pcap::NfsVirtualHost;
@@ -95,6 +98,10 @@ pub struct GatewayConfig {
     /// gateway): `rsh <gateway> cat|ls|echo|pwd`. Nothing is executed on the
     /// host. None disables it, and 514 is then relayed to the host like any port.
     pub rsh_dir: Option<std::path::PathBuf>,
+    /// Hold frames for the guest while its receive ring is about to end,
+    /// where the hardware would stop its channel (`[network] rx_hold`; the Indy's
+    /// SEEQ only).
+    pub rx_hold: bool,
 }
 
 impl Default for GatewayConfig {
@@ -113,6 +120,7 @@ impl Default for GatewayConfig {
             nfs_pcap_ip:  None,
             tftp_dir:     None,
             rsh_dir:      None,
+            rx_hold:      true,
         }
     }
 }
@@ -133,6 +141,7 @@ impl GatewayConfig {
             nfs_pcap_ip: net.nfs_pcap_ip,
             tftp_dir: net.tftp_dir.clone(),
             rsh_dir: net.rsh_dir.clone(),
+            rx_hold: net.rx_hold,
             ..Self::default()
         }
     }
@@ -149,7 +158,7 @@ impl GatewayConfig {
 //     host interface via libpcap.
 pub trait NetBackend: Send {
     /// Run the backend loop until the shared `running` flag goes false. Blocks
-    /// the calling thread (the `seeq-nat` thread).
+    /// the calling thread (the `seeq-net` thread).
     fn run(&mut self);
 }
 
@@ -198,7 +207,7 @@ pub struct NatControl {
     /// other link-layer chatter are excluded — they happen even with no/wrong
     /// IP). Monotonic for the life of the machine; the GUI samples it to light a
     /// grey/red/green "internal network" indicator.
-    pub guest_frames: AtomicU64,
+    pub guest_frames: Arc<AtomicU64>,
     /// Set once the guest sends an IP frame *to the gateway's MAC* — i.e. it is
     /// actually routing off-subnet through NAT. Gates plug-and-play adoption:
     /// adoption locks only once the guest is really using the gateway, so local
@@ -245,13 +254,19 @@ pub struct NatControl {
 
 impl NatControl {
     pub fn new() -> Arc<Self> {
+        Self::counting(Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Controls whose frame count is `frames`, shared with the backend-neutral
+    /// count a [`Link`] keeps.
+    pub fn counting(frames: Arc<AtomicU64>) -> Arc<Self> {
         Arc::new(Self {
             debug_tcp:  AtomicBool::new(false),
             debug_udp:  AtomicBool::new(false),
             debug_icmp: AtomicBool::new(false),
             snapshot:   Mutex::new(NatSnapshot::default()),
             reset_nat:  AtomicBool::new(false),
-            guest_frames: AtomicU64::new(0),
+            guest_frames: frames,
             routed: AtomicBool::new(false),
             observed_guest_ip: AtomicU32::new(0),
             observed_gateway: AtomicU32::new(0),
@@ -304,7 +319,6 @@ impl NatControl {
         }
     }
     /// Number of guest frames the NAT engine has seen so far.
-    pub fn guest_frames(&self) -> u64 { self.guest_frames.load(Ordering::Relaxed) }
 
     /// Ask the running NAT to move to a new subnet (applied on the NAT thread's
     /// next loop: config swapped + connection tables flushed). No reboot needed.

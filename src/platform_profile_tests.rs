@@ -17,7 +17,7 @@ mod tests {
     use crate::dev::ioc::{Ioc, IOC_BASE, IOC_SYS_ID, l1_regs, IOC_INT3_L1_STAT};
     use crate::dev::mgras::{Mgras, GIO_ID, MGRAS_SLOT_GFX_BASE};
     use crate::traits::{BusDevice, Saveable};
-    use crate::dev::gr2::{Gr2, Gr2Stats, Gr2Variant, GR2_BASE};
+    use crate::dev::gr2::{Gr2, Gr2Variant, GR2_BASE};
 
     fn minimal_cfg() -> MachineConfig {
         let mut cfg = MachineConfig::default();
@@ -130,10 +130,10 @@ mod tests {
     #[test]
     fn ioc_sys_id_matches_profile() {
         let sys = (IOC_BASE + IOC_SYS_ID) as u64;
-        let indy = Ioc::new_ci(true);
+        let indy = Ioc::new(true);
         assert_eq!(indy.read32(sys).data, 0x26, "Indy guinness sys_id");
 
-        let fullhouse = Ioc::new_ci(false);
+        let fullhouse = Ioc::new(false);
         assert_eq!(
             fullhouse.read32(sys).data,
             0x11,
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn fullhouse_vblank_routes_sg_retrace_to_l1() {
-        let ioc = Ioc::new_ci(false);
+        let ioc = Ioc::new(false);
         ioc.set_interrupt(crate::dev::ioc::IocInterrupt::VerticalRetrace, true);
         let l1 = ioc.read32((IOC_BASE + IOC_INT3_L1_STAT) as u64).data as u8;
         assert_ne!(l1 & l1_regs::VERTICAL_RETRACE, 0, "SG retrace should assert L1 vblank");
@@ -154,17 +154,14 @@ mod tests {
 
     #[test]
     fn ioc_fullhouse_gc_select_read_write() {
-        let ioc = Ioc::new_ci(false);
+        let ioc = Ioc::new(false);
         let gc = (IOC_BASE + crate::dev::ioc::IOC_GC_SELECT) as u64;
         assert_eq!(ioc.write32(gc, 0x0F), crate::traits::BUS_OK);
         assert_eq!(ioc.read32(gc).data, 0x0F, "fullhouse gc_select round-trip");
     }
 
     fn gr2(variant: Gr2Variant) -> Arc<Gr2> {
-        Gr2::new(variant, Gr2Stats {
-            heartbeat: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            fasttick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        })
+        Gr2::new(variant, crate::disp::StatusSource::detached())
     }
 
     /// What PROM Gr2Probe / Gr2InitInfo read (GR2.h probe section).
@@ -216,8 +213,7 @@ mod tests {
 
     #[test]
     fn mgras_answers_the_gio_id_probe() {
-        let hb = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let m = Mgras::new(GraphicsBoard::SolidImpact, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), hb.clone(), hb);
+        let m = Mgras::new(GraphicsBoard::SolidImpact, std::array::from_fn(|_| crate::irq::IrqLine::unconnected()), crate::disp::StatusSource::detached());
         assert_eq!(m.read32(MGRAS_SLOT_GFX_BASE as u64).data, GIO_ID);
     }
 

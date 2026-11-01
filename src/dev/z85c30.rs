@@ -15,7 +15,7 @@ use std::io::Write as IoWrite;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u8, u8_slice_to_toml, load_u8_slice, hex_u8};
 use crate::devlog::LogModule;
-use crate::dev::serial_log::SerialLog;
+use crate::dev::serial_host::{NullBackend, SerialBackend};
 
 pub mod scc_regs {
     pub const WR0: u8 = 0; // Command/Pointer
@@ -347,254 +347,6 @@ impl Channel {
     }
 }
 
-pub trait SerialBackend: Send + Sync {
-    fn send_byte(&self, byte: u8);
-    fn recv_byte(&self) -> io::Result<u8>;
-}
-
-/// Drops TX bytes and never yields RX. Used as a placeholder when a channel
-/// isn't wired to a host I/O source (e.g. CI mode unused channel).
-struct NullBackend;
-
-impl SerialBackend for NullBackend {
-    fn send_byte(&self, _byte: u8) {}
-    fn recv_byte(&self) -> io::Result<u8> {
-        Err(io::Error::new(io::ErrorKind::WouldBlock, "null"))
-    }
-}
-
-/// Tees guest-emitted bytes to a host file in addition to delegating to an
-/// inner backend.  Used by `--serial-log <file>` to capture the serial
-/// console transcript while the real TCP listener on port 8881 keeps
-/// working unchanged.
-pub struct TeeBackend {
-    inner: Arc<dyn SerialBackend>,
-    log: Arc<SerialLog>,
-}
-
-impl TeeBackend {
-    pub fn new(inner: Arc<dyn SerialBackend>, log: Arc<SerialLog>) -> Self {
-        Self { inner, log }
-    }
-}
-
-impl SerialBackend for TeeBackend {
-    fn send_byte(&self, byte: u8) {
-        self.log.write(&[byte]);
-        self.inner.send_byte(byte);
-    }
-    fn recv_byte(&self) -> io::Result<u8> {
-        self.inner.recv_byte()
-    }
-}
-
-#[cfg(unix)]
-struct UnixSocketBackend {
-    listener: UnixListener,
-    stream: Mutex<Option<UnixStream>>,
-}
-
-#[cfg(unix)]
-impl UnixSocketBackend {
-    fn new<P: AsRef<Path>>(path: P) -> Self {
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(path).expect("Failed to bind serial socket");
-        listener.set_nonblocking(true).expect("Failed to set nonblocking");
-        Self {
-            listener,
-            stream: Mutex::new(None),
-        }
-    }
-}
-
-#[cfg(unix)]
-impl SerialBackend for UnixSocketBackend {
-    fn send_byte(&self, byte: u8) {
-        let mut stream_guard = self.stream.lock();
-        if let Some(ref mut stream) = *stream_guard {
-            if let Err(e) = stream.write_all(&[byte]) {
-                if e.kind() != io::ErrorKind::WouldBlock {
-                    *stream_guard = None;
-                }
-            }
-        }
-    }
-
-    fn recv_byte(&self) -> io::Result<u8> {
-        let mut guard = self.stream.lock();
-        
-        if guard.is_none() {
-            match self.listener.accept() {
-                Ok((socket, _)) => {
-                    socket.set_nonblocking(true)?;
-                    *guard = Some(socket);
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        if let Some(ref mut stream) = *guard {
-            let mut buf = [0u8; 1];
-            match stream.read(&mut buf) {
-                Ok(1) => Ok(buf[0]),
-                Ok(_) => { // EOF
-                    *guard = None;
-                    Err(io::Error::new(io::ErrorKind::NotConnected, "EOF"))
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Err(io::Error::new(io::ErrorKind::WouldBlock, "WouldBlock")),
-                Err(e) => {
-                    *guard = None;
-                    Err(e)
-                }
-            }
-        } else {
-            Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"))
-        }
-    }
-}
-
-struct TcpConn {
-    stream: TcpStream,
-    telnet: crate::net::telnet::TelnetFilter,
-}
-
-struct TcpSocketBackend {
-    listener: TcpListener,
-    /// Every connected client: each sees all the output and may type, so a
-    /// person at the console and a script can share it.
-    conns: Mutex<Vec<TcpConn>>,
-}
-
-impl TcpSocketBackend {
-    /// Bind a TCP serial backend. Returns `None` (rather than panicking) if the
-    /// port can't be bound — most commonly because a stale emulator process from
-    /// an earlier crash is still holding it. Callers fall back to a NullBackend
-    /// so the machine still boots; that serial channel is simply unavailable
-    /// until the port frees.
-    fn new<A: std::net::ToSocketAddrs>(addr: A) -> Option<Self> {
-        let listener = match TcpListener::bind(addr) {
-            Ok(l) => l,
-            Err(e) => {
-                log::warn!("serial TCP backend disabled: failed to bind socket: {e}");
-                return None;
-            }
-        };
-        if let Err(e) = listener.set_nonblocking(true) {
-            log::warn!("serial TCP backend disabled: failed to set nonblocking: {e}");
-            return None;
-        }
-        Some(Self {
-            listener,
-            conns: Mutex::new(Vec::new()),
-        })
-    }
-
-    /// Take any clients waiting to connect, offering each telnet character
-    /// mode. One whose handshake cannot be written is dropped; it can
-    /// reconnect.
-    fn accept_waiting(&self, conns: &mut Vec<TcpConn>) {
-        while let Ok((socket, _)) = self.listener.accept() {
-            if socket.set_nonblocking(true).is_err() {
-                continue;
-            }
-            // The console is latency-sensitive: without TCP_NODELAY, Nagle
-            // holds a keystroke or a log line back until the previous
-            // segment is acked, which shows up as a stutter on every
-            // interaction. Set it on accept, before any byte is written.
-            let _ = socket.set_nodelay(true);
-            let mut c = TcpConn { stream: socket, telnet: crate::net::telnet::TelnetFilter::new() };
-            if c.stream.write_all(&crate::net::telnet::TelnetFilter::initial_handshake()).is_ok() {
-                conns.push(c);
-            }
-        }
-    }
-}
-
-impl SerialBackend for TcpSocketBackend {
-    fn send_byte(&self, byte: u8) {
-        let mut conns = self.conns.lock();
-        if conns.is_empty() {
-            return;
-        }
-        let mut buf = Vec::with_capacity(2);
-        crate::net::telnet::escape_byte(byte, &mut buf);
-        conns.retain_mut(|c| match c.stream.write_all(&buf) {
-            Ok(()) => true,
-            Err(e) => e.kind() == io::ErrorKind::WouldBlock,
-        });
-    }
-
-    fn recv_byte(&self) -> io::Result<u8> {
-        let mut conns = self.conns.lock();
-        self.accept_waiting(&mut conns);
-        if conns.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "No connection"));
-        }
-        // Each client in turn: pull bytes through its telnet filter until a
-        // real data byte falls out or it has nothing more to give. A client
-        // that has gone away is dropped.
-        let mut i = 0;
-        while i < conns.len() {
-            let mut gone = false;
-            loop {
-                let c = &mut conns[i];
-                let mut buf = [0u8; 1];
-                match c.stream.read(&mut buf) {
-                    Ok(1) => {
-                        let mut reply = Vec::new();
-                        let data = c.telnet.feed(buf[0], &mut reply);
-                        if !reply.is_empty() {
-                            if let Err(e) = c.stream.write_all(&reply) {
-                                if e.kind() != io::ErrorKind::WouldBlock {
-                                    gone = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(d) = data {
-                            return Ok(d);
-                        }
-                        // Telnet command consumed; keep reading.
-                    }
-                    Ok(_) => {
-                        gone = true;
-                        break;
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        gone = true;
-                        break;
-                    }
-                }
-            }
-            if gone {
-                conns.remove(i);
-            } else {
-                i += 1;
-            }
-        }
-        Err(io::Error::new(io::ErrorKind::WouldBlock, "WouldBlock"))
-    }
-}
-
-/// A TCP serial console on 127.0.0.1:`port` (0 takes any free port), in
-/// telnet character mode, for any device with a serial line: every client
-/// connected sees the output and may type. Returns the backend and the port
-/// it bound, or `None` when the port is taken.
-pub fn tcp_serial_backend(port: u16) -> Option<(Arc<dyn SerialBackend>, u16)> {
-    let b = TcpSocketBackend::new(("127.0.0.1", port))?;
-    let bound = b.listener.local_addr().ok()?.port();
-    Some((Arc::new(b), bound))
-}
-
-/// A serial line wired to nothing: output is dropped, nothing arrives.
-pub fn null_serial_backend() -> Arc<dyn SerialBackend> {
-    Arc::new(NullBackend)
-}
-
 #[derive(Clone)]
 pub struct Z85c30 {
     pub channel_a: Arc<(Mutex<Channel>, Condvar)>,
@@ -627,46 +379,18 @@ const CONSOLE_TAP_CAP: usize = 64 * 1024;
 pub const DEFAULT_PORTS: [u16; 2] = [8880, 8881];
 
 impl Z85c30 {
-    /// Default constructor: binds TCP serial backends on 127.0.0.1:8880
-    /// (channel A / tty2) and 127.0.0.1:8881 (channel B / tty1).
+    /// A controller whose channels are wired to nothing: the machine installs
+    /// each channel's host end with `set_backend_a` / `set_backend_b` before
+    /// the first `start()`.
     pub fn new(irq: Option<IrqLine>) -> Self {
-        Self::new_with_ports(irq, DEFAULT_PORTS)
+        Self::new_inner(irq)
     }
 
-    /// As `new`, with the TCP ports of channels A and B on 127.0.0.1.
-    pub fn new_with_ports(irq: Option<IrqLine>, ports: [u16; 2]) -> Self {
-        Self::new_inner(irq, Some(ports))
-    }
-
-    /// CI-mode constructor: uses null backends instead of binding TCP. The
-    /// caller is expected to install real backends via `set_backend_a` /
-    /// `set_backend_b` before the first `start()`. Avoids port conflicts
-    /// when multiple `--ci` instances run in parallel.
-    pub fn new_null(irq: Option<IrqLine>) -> Self {
-        Self::new_inner(irq, None)
-    }
-
-    fn new_inner(irq: Option<IrqLine>, ports: Option<[u16; 2]>) -> Self {
+    fn new_inner(irq: Option<IrqLine>) -> Self {
         let ip_a = Arc::new(AtomicU8::new(0));
         let ip_b = Arc::new(AtomicU8::new(0));
-
-        let (backend_a, backend_b): (Arc<dyn SerialBackend>, Arc<dyn SerialBackend>) = if let Some([a, b]) = ports {
-            let tcp_or_null = |port: u16, setting: &str| -> Arc<dyn SerialBackend> {
-                match TcpSocketBackend::new(("127.0.0.1", port)) {
-                    Some(b) => Arc::new(b),
-                    None => {
-                        eprintln!("iris: serial port {port} unavailable; is another iris using it? Set {setting} to run both.");
-                        Arc::new(NullBackend)
-                    }
-                }
-            };
-            (
-                tcp_or_null(a, "serial_port_a (--serial-port-a)"),
-                tcp_or_null(b, "serial_port_b (--serial-port-b)"),
-            )
-        } else {
-            (Arc::new(NullBackend), Arc::new(NullBackend))
-        };
+        let (backend_a, backend_b): (Arc<dyn SerialBackend>, Arc<dyn SerialBackend>) =
+            (Arc::new(NullBackend), Arc::new(NullBackend));
 
         Self {
             channel_a: Arc::new((Mutex::new(Channel::new("A", ip_a.clone(), ip_b.clone(), irq.clone())), Condvar::new())),
@@ -1141,124 +865,10 @@ impl Saveable for Z85c30 {
     }
 }
 
-// ============================================================================
-// CiSerialBackend — in-process serial backend used by --ci mode.
-// ============================================================================
-
-/// Serial backend that the CI control socket reads from and writes to. The
-/// guest sees this as channel A (the IRIX console). Host pushes bytes into
-/// `host_to_guest` via `push_host`; the existing RX thread drains them into
-/// `channel_a.rx_queue`. Guest output reaches `send_byte`, which pushes into
-/// `guest_to_host` and wakes anyone waiting in `wait_for`.
-pub struct CiSerialBackend {
-    host_to_guest: Mutex<VecDeque<u8>>,
-    guest_to_host: Mutex<Vec<u8>>,
-    cv: Condvar,
-    /// Optional file mirror: every byte that flows through ttyd1 in either
-    /// direction is appended here. Host-injected bytes are echoed by IRIX
-    /// anyway, so writing only guest output already captures the full
-    /// transcript without duplication.
-    log: Mutex<Option<Arc<SerialLog>>>,
-}
-
-impl CiSerialBackend {
-    pub fn new() -> Self {
-        Self {
-            host_to_guest: Mutex::new(VecDeque::new()),
-            guest_to_host: Mutex::new(Vec::new()),
-            cv: Condvar::new(),
-            log: Mutex::new(None),
-        }
-    }
-
-    /// Attach the shared serial-log sink. The caller opens the file (and
-    /// picks the timestamp mode), so the CI and TCP paths write the same bytes.
-    pub fn set_log(&self, log: Arc<SerialLog>) {
-        *self.log.lock() = Some(log);
-    }
-
-    /// Inject bytes from host to guest (the harness typing on the console).
-    pub fn push_host(&self, data: &[u8]) {
-        let mut q = self.host_to_guest.lock();
-        q.extend(data.iter().copied());
-    }
-
-    /// Drain everything the guest has produced since the last call. Empties
-    /// the buffer; the returned Vec is the guest output as raw bytes.
-    pub fn drain_guest(&self) -> Vec<u8> {
-        let mut q = self.guest_to_host.lock();
-        std::mem::take(&mut *q)
-    }
-
-    /// Block until `needle` is seen in guest output, or `timeout` expires.
-    /// On success returns the consumed bytes up to and including the match;
-    /// bytes that arrived after the match stay in the buffer for the next
-    /// `serial-read`. On timeout returns `None` without consuming anything.
-    pub fn wait_for(&self, needle: &[u8], timeout: Duration) -> Option<Vec<u8>> {
-        if needle.is_empty() {
-            return Some(Vec::new());
-        }
-        let deadline = Instant::now() + timeout;
-        let mut q = self.guest_to_host.lock();
-        loop {
-            if let Some(pos) = find_subseq(&q, needle) {
-                let end = pos + needle.len();
-                let consumed: Vec<u8> = q.drain(..end).collect();
-                return Some(consumed);
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            if self.cv.wait_until(&mut q, deadline).timed_out() {
-                // One more scan in case bytes arrived between the last check
-                // and the timeout.
-                if let Some(pos) = find_subseq(&q, needle) {
-                    let end = pos + needle.len();
-                    let consumed: Vec<u8> = q.drain(..end).collect();
-                    return Some(consumed);
-                }
-                return None;
-            }
-        }
-    }
-
-    /// Clear both queues. Called on `restore`/`rollback` so stale serial
-    /// output from the previous run doesn't leak into the next test.
-    pub fn reset(&self) {
-        self.host_to_guest.lock().clear();
-        self.guest_to_host.lock().clear();
-    }
-}
-
-fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-impl SerialBackend for CiSerialBackend {
-    fn send_byte(&self, byte: u8) {
-        self.guest_to_host.lock().push(byte);
-        if let Some(log) = self.log.lock().as_ref() {
-            log.write(&[byte]);
-        }
-        self.cv.notify_all();
-    }
-
-    fn recv_byte(&self) -> io::Result<u8> {
-        let mut q = self.host_to_guest.lock();
-        match q.pop_front() {
-            Some(b) => Ok(b),
-            None => Err(io::Error::new(io::ErrorKind::WouldBlock, "empty")),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dev::serial_host::{CiSerialBackend, TcpSocketBackend};
 
     /// Two clients on one TCP serial console: both see every byte the guest
     /// sends, and what either types arrives, with telnet's own commands
@@ -1316,7 +926,7 @@ mod tests {
     }
 
     /// Phase 1.7 round-trip: a fresh SCC loaded from a captured save_state must
-    /// re-serialize byte-identically. Use new_null so the test doesn't bind any
+    /// re-serialize byte-identically. Use new so the test doesn't bind any
     /// TCP ports.
     ///
     /// The `status` fixtures below are already normalized against empty FIFOs
@@ -1324,7 +934,7 @@ mod tests {
     /// deliberately not an identity on that field; do not "fix" them back.
     #[test]
     fn save_load_round_trip() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         {
             let mut ch = src.channel_a.0.lock();
             ch.regs[0]  = 0x44;
@@ -1344,7 +954,7 @@ mod tests {
         }
         let v1 = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&v1).expect("load_state");
         let v2 = dst.save_state();
 
@@ -1365,7 +975,7 @@ mod tests {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
-        let scc = Z85c30::new_null(None);
+        let scc = Z85c30::new(None);
         let backend = Arc::new(CiSerialBackend::new());
         scc.set_backend_a(backend.clone());
 
@@ -1408,11 +1018,11 @@ mod tests {
 
     #[test]
     fn restore_clears_rx_char_available() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         src.channel_a.0.lock().status |= rr0::RX_CHAR_AVAILABLE;
         let saved = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
         assert_eq!(dst.channel_a.0.lock().status & rr0::RX_CHAR_AVAILABLE, 0,
@@ -1422,11 +1032,11 @@ mod tests {
 
     #[test]
     fn restore_forces_tx_buffer_empty() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         src.channel_a.0.lock().status &= !rr0::TX_BUFFER_EMPTY;
         let saved = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
         assert_ne!(dst.channel_a.0.lock().status & rr0::TX_BUFFER_EMPTY, 0,
@@ -1436,7 +1046,7 @@ mod tests {
 
     #[test]
     fn restore_rearms_tx_int_pending() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         {
             let mut ch = src.channel_a.0.lock();
             ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
@@ -1444,7 +1054,7 @@ mod tests {
         }
         let saved = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
         assert!(dst.channel_a.0.lock().tx_int_pending,
@@ -1457,11 +1067,11 @@ mod tests {
     /// stays green even with the WR1 conjunct deleted from `channel_from_toml`.
     #[test]
     fn restore_leaves_latch_disarmed_when_tx_int_disabled() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         src.channel_a.0.lock().regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
         let saved = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
         assert!(!dst.channel_a.0.lock().tx_int_pending,
@@ -1472,11 +1082,11 @@ mod tests {
     /// through RR3 and has to assert the latch itself.
     #[test]
     fn restore_leaves_latch_disarmed_when_transmitter_disabled() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         src.channel_a.0.lock().regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
         let saved = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
         assert!(!dst.channel_a.0.lock().tx_int_pending,
@@ -1488,7 +1098,7 @@ mod tests {
     /// publishes. `machine.rs` puts the CI console on B.
     #[test]
     fn restore_channel_b_tx_int_reaches_rr3_via_a() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         {
             let mut ch = src.channel_b.0.lock();
             ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
@@ -1496,7 +1106,7 @@ mod tests {
         }
         let saved = src.save_state();
 
-        let dst = Z85c30::new_null(None);
+        let dst = Z85c30::new(None);
         dst.load_state(&saved).expect("load_state");
 
         dst.channel_a.0.lock().reg_ptr = scc_regs::RR3;
@@ -1506,7 +1116,7 @@ mod tests {
 
     #[test]
     fn restore_redrives_irq_line() {
-        let src = Z85c30::new_null(None);
+        let src = Z85c30::new(None);
         {
             let mut ch = src.channel_a.0.lock();
             ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
@@ -1515,7 +1125,7 @@ mod tests {
         let saved = src.save_state();
 
         let (probe, line) = crate::irq::LevelProbe::line();
-        let dst = Z85c30::new_null(Some(line));
+        let dst = Z85c30::new(Some(line));
         dst.load_state(&saved).expect("load_state");
 
         assert!(probe.level(),

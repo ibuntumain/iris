@@ -1,9 +1,12 @@
 # MP LL/SC: SC is a host compare-exchange on the data, not a line-ownership tracker
 
-Status: design decision, 2026-10-23. Nothing implemented yet; this records the
-reasoning so the multiprocessor (Octane) work does not re-derive it. Today
-`exec_sc`/`exec_scd` in `src/cpu/mips_exec.rs` test the LLbit and then call
-`write_data`, which is correct for one CPU and racy for two.
+Status: implemented 2026-10-30, for machines with `MipsCore::smp` set
+(`exec_sc`/`exec_scd`, `MipsCache::cas_ram32`/`cas_ram64`). One CPU still tests
+the LLbit and stores. An SC to a word other than the LL's stores the ordinary
+way. Memory outside the ppmem window takes the CAS through the bus
+(`BusDevice::cas32`/`cas64`); until 2026-10-31 it stored the ordinary way, which
+did no harm while an Octane stopped at 2 GB and lost counts as soon as it had
+8 GB. `write64_masked` became a CAS loop.
 
 ## The decision
 

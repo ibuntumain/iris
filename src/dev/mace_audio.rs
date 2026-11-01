@@ -163,6 +163,9 @@ struct State {
     status_in: u64,
     ch: [Chan; 3],
     codec: [u16; 32],
+    /// What the outputs played since the service thread last took it: per
+    /// catch-up, each output's pairs and rate.
+    played: Vec<([Vec<(i16, i16)>; 2], [u32; 2])>,
 }
 
 impl State {
@@ -177,7 +180,7 @@ impl State {
         for r in ad1843::CLOCK_RATE {
             codec[r] = 48000;
         }
-        Self { ctl: 1, codec_ctl: 1 << 16, mask: 0, status_in: 0, ch: [Chan::RESET; 3], codec }
+        Self { ctl: 1, codec_ctl: 1 << 16, mask: 0, status_in: 0, ch: [Chan::RESET; 3], codec, played: Vec::new() }
     }
 
     fn codec_read(&self, reg: usize) -> u16 {
@@ -389,8 +392,8 @@ impl MaceAudio {
                 let was_reset = st.ctl & 1 != 0;
                 st.ctl = (val & 1) | (st.ctl & val & (3 << 23));
                 if st.ctl & 1 != 0 && !was_reset {
-                    let keep = st.ch;
-                    *st = State { ch: keep, ..State::new() };
+                    let (ch, played) = (st.ch, std::mem::take(&mut st.played));
+                    *st = State { ch, played, ..State::new() };
                 }
             }
             0x08 => {
@@ -471,8 +474,31 @@ impl MaceAudio {
     /// Play what is due on each output channel since the last call, from
     /// its ring to the host. Called from the machine's service thread.
     pub fn poll(&self, io: &AudioIo) {
+        self.poll_at(io, Instant::now());
+    }
+
+    fn poll_at(&self, io: &AudioIo, now: Instant) {
+        self.catch_up_at(io, now);
+        let played = std::mem::take(&mut self.st.lock().played);
+        for (pcm, rates) in &played {
+            self.dump(pcm, rates);
+            self.play(pcm, rates);
+        }
+    }
+
+    /// Move each channel's ring up to now, keeping what the outputs played
+    /// for the next [`Self::poll`]. A read of the registers comes here
+    /// first, so software sees the pointers as they stand, not as of the
+    /// last service pass up to 2 ms ago: IRIX reads the read pointer about
+    /// once a millisecond and keeps its write pointer only about 2 ms
+    /// ahead of it, so a pass that found the ring that stale played it dry
+    /// and filled the tone with zeros.
+    pub fn catch_up(&self, io: &AudioIo) {
+        self.catch_up_at(io, Instant::now());
+    }
+
+    fn catch_up_at(&self, io: &AudioIo, now: Instant) {
         let mut st = self.st.lock();
-        let now = Instant::now();
         let mut pcm: [Vec<(i16, i16)>; 2] = [Vec::new(), Vec::new()];
         let mut rates = [0u32; 2];
         let ram = &*io.ram;
@@ -547,6 +573,9 @@ impl MaceAudio {
                 pcm[out].push(item);
             }
         }
+        if pcm.iter().any(|p| !p.is_empty()) {
+            st.played.push((pcm, rates));
+        }
         drop(st);
         // The pointers moved: a ring may have crossed its threshold.
         self.update_irq();
@@ -565,11 +594,6 @@ impl MaceAudio {
                 }
             }
         }
-        if pcm.iter().all(|p| p.is_empty()) {
-            return;
-        }
-        self.dump(&pcm, &rates);
-        self.play(&pcm, &rates);
     }
 
     /// Append one record per output that played: the output (u8), its rate
@@ -919,5 +943,54 @@ mod tests {
         assert_ne!(a.isa_bits() & 0x10, 0, "below half now");
         let mu = a.msc_ust(1);
         assert!((mu >> 32) as u32 > 0 && mu as u32 == 7, "MSC counts in the high word, UST stamped in the low");
+    }
+
+    /// IRIX feeds an output ring by reading the read pointer about once a
+    /// millisecond and setting the write pointer 17 frames past it at
+    /// 8 kHz, which the block pointer rounds down to 16 (2 ms). The service
+    /// thread passes about every 2.1 ms when the machine is quiet. Reading
+    /// a pointer last moved by such a pass, IRIX fell behind: a pass wanted
+    /// 16 or 17 frames, sometimes found fewer and played zeros in the middle
+    /// of the tone, so 8 and 11 kHz played sharp and long. A register read
+    /// brings the ring up to date first, and it never runs dry.
+    #[test]
+    fn a_register_read_catches_the_ring_up_so_irix_keeps_ahead() {
+        let us = std::time::Duration::from_micros;
+        let run = |catch_up: bool| {
+            let ram = O2Memory::single(8 << 20);
+            let a = MaceAudio::new();
+            a.write(MACE_AUDIO, 0);
+            write_codec(&a, 28, 0x0800);
+            write_codec(&a, 17, 8000);
+            write_codec(&a, 15, 1 << 8);
+            write_codec(&a, 27, 1 << 8);
+            let ring_base = 0x0010_0000u32;
+            for i in 0..1024u32 {
+                let o = ram.dma_offset(ring_base | 0x1000 | i * 4).unwrap();
+                ram.put_be(o, 4, 1000 << 8);
+            }
+            a.write(MACE_AUDIO + 0x40, CTRL_ENABLE);
+            let io = AudioIo { ram: &ram, ring_base, ust: 0 };
+            let t0 = Instant::now();
+            for step in 0..4000u64 {
+                let t = t0 + us(step * 50);
+                if step % 20 == 0 {
+                    if catch_up {
+                        a.catch_up_at(&io, t);
+                    }
+                    let rptr = a.read(MACE_AUDIO + 0x48);
+                    a.write(MACE_AUDIO + 0x50, rptr + 17 * 8);
+                }
+                if step % 42 == 0 {
+                    a.poll_at(&io, t);
+                }
+            }
+            (a.gaps[0].load(Ordering::Relaxed), a.msc_ust(1) >> 32)
+        };
+        let (gaps, _) = run(false);
+        assert!(gaps > 0, "a pointer only as fresh as the last pass let the ring run dry");
+        let (gaps, frames) = run(true);
+        assert_eq!(gaps, 0, "the ring never ran dry");
+        assert!((1590..=1600).contains(&frames), "200 ms at 8 kHz played, got {frames}");
     }
 }

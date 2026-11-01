@@ -4,6 +4,14 @@
 it. Kept because the two wrong diagnoses on the way are more instructive than
 the fix, which is four lines.
 
+**Superseded 2026-10-31.** The channel no longer looks at bit 14 at all: the
+HPC3 specification has no ownership check, so it fills every descriptor up to
+the one carrying EOX (read from memory as each frame completes) and stops
+there. Frames that reach a stopped channel are lost; the SEEQ's host side
+holds a frame off the wire only while it would end the ring early
+(`[network] rx_hold`). `rx_refused` is now
+`rx_lost`. NetBSD bulk receive has not been re-measured since.
+
 ## Symptom
 
 A bulk transfer into a NetBSD guest stopped after a few megabytes and the whole

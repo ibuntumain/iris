@@ -70,16 +70,29 @@ reach the machine through one shared `MachineSlot` per machine, which the
 machine's `Drop` nulls, so a holder that outlives the machine (the monitor,
 after iris-gui's Stop) gets "machine is not running" instead of freed memory.
 
-SCSI storage follows the same pattern one level down. `src/scsi.rs` is the
-target (disk, CD-ROM, DaynaPort) any controller can hold, and
-`src/scsi_monitor.rs` implements the monitor's `scsi` and `cow` subcommands and
-the run-time disc changes once, over a controller's target table lent through
-its `ScsiTargets` trait. The WD33C93A (Indy, Indigo2) and the Adaptec 7880 (O2)
-lend theirs and keep only chip-specific subcommands (`regs`; the WD's `wdt`,
-`defer`, `debug`), and `DiscChanger` is implemented once for every
-`ScsiTargets`. Configuration is shared the same way: both machines attach
-their devices from the `[scsi.N]` tables, where the key is a slot
-(controller × 16 + id, see `config::scsi_slot`).
+SCSI storage follows the same pattern one level down. `ScsiTarget` is what
+varies on a bus (a `ScsiDevice` disk or CD-ROM, a `DaynaPort`): `request`,
+the lifecycle, and optional behaviour with do-nothing defaults (a
+copy-on-write layer, CHD sync, a disc changer), so callers ask for behaviour
+and never for a type. `ScsiBus` (`src/scsi/bus.rs`) is the mechanism: the
+id-to-target table with attach, request and overlay export and import, and
+the controller's INQUIRY identities. A disk or CD-ROM sits on a `BlockNode`
+(`src/block_node.rs`), built by `open_image` for everything that mounts an
+image. A CD-ROM's node is a `ChangerNode`: the queue of discs and the open
+active one, with the `Removable` trait (present, changed, eject, load)
+separate from `BlockNode` so that removable media which is not a block device,
+a tape, can use it too. The WD33C93A (Indy, Indigo2), the Adaptec
+7880 (O2) and the ISP1040 (Octane) each make an empty bus of their own kind
+(`new_bus`); the machine fills it from config and gives it to the controller's
+constructor, so a controller exists with its targets and keeps only its
+registers and DMA. `src/scsi_monitor.rs` implements the monitor's `scsi` and `cow`
+subcommands and the run-time disc changes once, over the bus a controller hands
+out through `ScsiTargets::scsi_bus`; chip-specific subcommands (`regs`; the
+WD's `wdt`, `defer`, `debug`) stay with the chip, and `DiscChanger` is
+implemented once for every `ScsiTargets`. Configuration is shared the same
+way: `scsi::attach_from_config` walks the `[scsi.N]` tables for every machine,
+where the key is a slot (controller × 16 + id, see `config::scsi_slot`), and
+the machine supplies only a route from controller number to bus.
 
 ## 2. Data path and endianness
 
@@ -107,6 +120,7 @@ pub trait BusDevice: Send + Sync {
     // read16/write16, read32/write32, read64/write64 ...
     fn dma_read64 / dma_write64 (+ _bulk)              // accesses initiated by a DMA engine
     fn read_block / write_block / write64_masked       // bulk and byte-enable fast paths
+    fn cas32 / cas64                                   // SC on memory the ppmem window does not reach
     fn mem_ptr(&self, addr: u64) -> Option<*const u64>; // direct backing store, for RAM
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64;  // jitv2 page generation counter
 }
@@ -144,6 +158,15 @@ interfaces exist for specific links: `DmaClient` (a peripheral on an HPC3 DMA
 channel), `FifoDevice` (serial byte streams), `InterruptController`/`IrqLine`
 (below), `GfxDisplay` (a graphics board's screen, for the window and
 screenshots), `CpuDevice` (what `Machine` holds for the CPU).
+
+Serial lines have two halves. A UART model owns the registers: the Indy's
+`Z85c30`, and `Ns16550` (`src/dev/ns16550.rs`), the 16550A core that the O2's
+`MaceUart` (lane decode, interrupt line, monitor) and the Octane's IOC3 wrap.
+The host end is a `SerialBackend` from `src/dev/serial_host.rs`, which the
+machine constructors pick with `console_backends`: the CI backend, a TCP
+console, or a log tee. A UART's transmit is instant and its receive side
+pulls from the backend with back-pressure (`pump`), so nothing in the model
+needs a thread of its own beyond the service loop's call.
 
 ### The physical address map
 
@@ -205,6 +228,23 @@ aligned 32- and 64-bit host accesses are atomic (though unordered), and the
 hardware synchronisation points (descriptor ownership bits, interrupts) are
 kept where the real hardware has them.
 
+### The memory map
+
+The decode table says what answers at an address, but not whether that is
+memory. Each machine therefore also builds a `MemoryMap` (`src/memory_map.rs`)
+when it is constructed: a list of named ranges, each one RAM, an alias of RAM,
+or ROM. The Indy and Indigo2 take theirs from `ip22_bus::memory_map`, the O2
+from `ip32::memory_map`, and the Octane from `ip30::memory_map`, which sizes RAM
+from `banks`. The machine keeps it and passes it to the CPU in `MipsCpuConfig`.
+
+Code that needs to tell memory from everything else asks the map, not a
+machine's constants: the undo buffer records stores to RAM, the JIT sizes its
+page table to the map's end, and the `j2` monitor commands check addresses and
+lay out their report by range. A range says where the memory controller can
+answer, so an address in one may have nothing behind it until the firmware has
+programmed the controller. `lomem` and `himem` belong to the Indy and Indigo2
+devices and should not appear outside them.
+
 ### Interrupts
 
 A device holds an `IrqLine` (`src/irq.rs`): a reference to the controller it
@@ -242,11 +282,11 @@ Every device that has real work to do runs on its own thread:
 
 | Thread(s) | Work |
 |---|---|
-| `MIPS-CPU` | the interpreter or jitv2 dispatch loop |
+| `MIPS-CPU`, `MIPS-CPU1` | the interpreter or jitv2 dispatch loop, one thread per processor |
 | jitv2 compile pool | Cranelift compiles of requested pages (`[jitv2] threads`) |
 | `WD33C93A` | SCSI command execution and DMA |
 | `AIC-7880-0`, `AIC-7880-1` | O2 SCSI: command execution, host-memory DMA and disk I/O; the CPU's register writes only queue and kick |
-| `seeq-enet`, `seeq-nat` | ethernet DMA pump; the NAT engine and its built-in services |
+| `seeq-enet`, `seeq-net` | ethernet DMA pump; the network backend (the NAT engine and its built-in services, or a PCAP bridge) |
 | `MC-DMA` | VDMA (graphics DMA) |
 | `SCC-TX/RX-*` | serial ports |
 | `VINO-DMA` | video capture (only with a video source) |
@@ -258,13 +298,16 @@ Every device that has real work to do runs on its own thread:
 | `machine-events` | power-off and reset requests from devices |
 | `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
 | `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
-| `ip30-eth-rx`, `ip30-eth-nat` | Octane ethernet receive pump; the NAT engine |
+| `ip30-eth-rx`, `ip30-eth-net` | Octane ethernet receive pump; the network backend |
 
 Threads that have nothing to do park instead of spinning: the graphics
 consumers when their FIFO is empty, and the CPU thread in `idle-pause` builds
 when the guest is in its idle loop. A producer that adds work, or a device
 that raises an interrupt, unparks the thread it is waiting on. See
 `clanker/perf/` for what went wrong each time a parking rule was missed.
+
+`hptimer` sleeps to 50 µs short of its next deadline and spins only the rest,
+so a 1 kHz tick costs a few percent of a core, not all of it.
 
 The idle detector samples the guest PC every 32 sample calls (about 320
 instructions in the batch loop) and parks only when one long kernel cluster of
@@ -330,6 +373,28 @@ consumer thread never takes `rec`.
 - With `opcodefusion` (implied by `lightning`), the interpreter executes
   common pairs (branch + NOP, LUI + ORI/ADDIU, address + load/store) as one
   dispatch.
+
+### Several CPUs
+
+An Octane can have two ([docs/Octane/multiprocessor.md](docs/Octane/multiprocessor.md)).
+Each is its own `MipsCpu` with its own core, TLB, cache model and thread, over
+one `Physical`. `src/cpu/smp.rs` holds what they share:
+
+- **Which CPU this is.** `set_current_cpu` marks a CPU thread and `current_cpu()`
+  reads it. `BusDevice` carries no initiator; only HEART asks, for `PRID` and
+  `IMSR`. Any other thread reads as CPU 0.
+- **Holding a CPU still.** `ParkSlot::hold` sets `HOST_PARK_BIT` in the CPU's
+  interrupt word. Every preamble bails on any set bit, so the CPU leaves compiled
+  code at once and parks at its next batch boundary, with its executor unlocked
+  and its jitv2 page pointer cleared. HEART's disable bits use this.
+- **Getting the machine to yourself.** `World::stop_others` parks every other
+  CPU and runs a closure. Call it holding no lock another CPU could be waiting
+  on. Two callers take turns, and the one waiting counts as parked. Remapping
+  memory and flushing jitv2 go through it.
+
+The monitor reaches CPUs through `CpuMonitor` (`src/cpu/cpu_monitor.rs`), on
+every machine: it routes each command and the commands themselves live in
+`src/cpu/mips_exec/monitor.rs`.
 
 ### ExecStatus
 
@@ -419,6 +484,19 @@ without locks and composes it through the board's colour maps and DAC.
 Everything that touches the host GL context (including teardown) runs on the
 thread that owns it.
 
+The status bar under the frame is fed by `StatusSource` (`src/disp.rs`),
+which the machine builds once and hands to every graphics board: the
+heartbeat word (front-panel LEDs and SCSI/network activity bits), the CPU
+cycle counter, the Compare-match count and, in developer builds, the fetch
+counters. A display thread calls `status.snapshot(now, gfifo_pending)` once
+per presented frame and passes the result to `Renderer::present`; the call
+clears the activity bits and keeps the LEDs. Only the board's own queue depth
+is supplied by the board. A new board takes the `Arc<StatusSource>` in its
+constructor, answers `GfxDisplay::cycles` from it, and does not build a
+`BarStats` itself. The machine wires the cycle counter in with one
+`set_cpu_cycles` once the CPU exists, and each further CPU with
+`add_cpu_stats`.
+
 ### The composed frame and the hardware cursor
 
 `GfxDisplay` (`src/gfx_display.rs`) is what the window, the CI socket, the
@@ -471,6 +549,11 @@ code into host code with Cranelift. The concepts:
   an emitter end the compiled region or call the interpreter's handler. The
   equivalence tests, the cpu-tests matrix, `jitcheck` and the
   `jitv2_lockstep` feature compare the JIT against the interpreter.
+- **Several CPUs share one pool.** Compiled code reaches CPU state only through
+  its core pointer, so it runs on either CPU. Dispatch reads pages lock-free, the
+  pfn map publishes a slot after its claim, and inline stores bump generations
+  atomically. Compiled code is freed only by a full flush, and every flush parks
+  all CPUs first (`jitv2_flush_from_here`, `run_leader_flush`).
 - Compiled pages can optionally be cached on disk across runs
   (`[jitv2] cache`, [docs/jitv2-persistent-cache.md](docs/jitv2-persistent-cache.md)).
 

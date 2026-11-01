@@ -3,7 +3,7 @@
 //! and hands the access to the block it names, as HPC3 does for its
 //! children on the Indigo2. The blocks themselves are in their own files
 //! (`mace_pci`, `mec`, `mace_isa`, `mace_ps2`, `mace_ust`, `mace_audio`,
-//! `mace_sdma`, `ns16550`, `ds1687`, `onewire`); what has no model yet is a
+//! `mace_sdma`, `mace_uart`, `ds1687`, `mace_id`); what has no model yet is a
 //! storing register file (`regs`).
 
 use std::sync::{Arc, Mutex};
@@ -18,10 +18,10 @@ use crate::dev::mace_ps2::MacePs2;
 use crate::dev::mace_sdma::*;
 use crate::dev::mace_ust::MaceUst;
 use crate::dev::mec::Mec;
-use crate::dev::ns16550::Com16550;
-use crate::dev::onewire::{NicTrace, OneWireId};
+use crate::dev::mace_uart::MaceUart;
+use crate::dev::mace_id::{MaceId, DEFAULT_MAC};
 use crate::ip32::{
-    nic_bit, Stub, IP32_MEC_CRIME_INT, MACE_BASE, MACE_COM0, MACE_COM1, MACE_COM_SIZE, MACE_ISA_FLASH_NIC_REG,
+    Stub, IP32_MEC_CRIME_INT, MACE_BASE, MACE_COM0, MACE_COM1, MACE_COM_SIZE, MACE_ISA_FLASH_NIC_REG,
     MACE_MEC, MACE_MEC_SIZE, MACE_PS2, MACE_PS2_SIZE, MACE_RTC, MACE_RTC_SIZE, MACE_SIZE, MACE_UST_MSC,
     MACE_UST_MSC_SIZE, MACEPCI_BASE, MACEPCI_SIZE,
 };
@@ -38,17 +38,16 @@ pub struct Mace {
     /// The PCI host bridge: its registers here, its windows outside MACE.
     pub pci: MacePci,
     pub ust: Arc<MaceUst>,
-    pub nic_trace: NicTrace,
     pub rtc: MaceRtc,
     pub ps2: MacePs2,
-    pub onewire: OneWireId,
-    pub com0: Com16550,
-    pub com1: Com16550,
+    pub id: MaceId,
+    pub com0: MaceUart,
+    pub com1: MaceUart,
     /// The serial ports' DMA rings, which IRIX's console runs on.
     pub sdma: MaceSerialDma,
     /// The audio interface and its AD1843 (dev/mace_audio.rs).
     pub audio: MaceAudio,
-    /// The Ethernet. Its frames go nowhere until `start_nat` (`[o2] net`).
+    /// The Ethernet. Its frames go nowhere until `attach` (`[o2] net`).
     pub mec: Arc<Mec>,
 }
 
@@ -63,13 +62,12 @@ impl Mace {
             regs: Stub::new("mace"),
             pci: MacePci::new(crime.clone(), ram.clone()),
             ust,
-            nic_trace: NicTrace::new(),
             rtc: MaceRtc::new(),
             ps2: MacePs2::new(),
             // A locally-administered address; nothing depends on the value yet.
-            onewire: OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]),
-            com0: Com16550::named("com0"),
-            com1: Com16550::named("com1"),
+            id: MaceId::new(DEFAULT_MAC),
+            com0: MaceUart::named("com0"),
+            com1: MaceUart::named("com1"),
             sdma: MaceSerialDma::new(),
             audio: MaceAudio::new(),
             mec: Arc::new(Mec::new(ram.clone())),
@@ -103,11 +101,7 @@ impl Mace {
         self.mec.poll();
         self.com0.pump();
         self.com1.pump();
-        self.audio.poll(&AudioIo {
-            ram: &self.ram,
-            ring_base: (self.regs.cell(MACE_ISA_RING_BASE) & sdma::RING_BASE_MASK) as u32,
-            ust: self.ust.counter() as u32,
-        });
+        self.audio.poll(&self.audio_io());
         if self.sdma.any_owned() {
             self.sdma.poll(&self.sdma_io());
         }
@@ -117,9 +111,18 @@ impl Mace {
     /// commands through on the Indigo2.
     pub fn devices(&self) -> Vec<&dyn crate::traits::Device> {
         vec![
-            &self.pci, &*self.ust, &self.rtc, &self.ps2, &self.onewire, &self.com0, &self.com1, &self.sdma,
+            &self.pci, &*self.ust, &self.rtc, &self.ps2, &self.id, &self.com0, &self.com1, &self.sdma,
             &self.audio, &*self.mec, &*self.isa,
         ]
+    }
+
+    /// The audio engine's view of the machine.
+    fn audio_io(&self) -> AudioIo<'_> {
+        AudioIo {
+            ram: &self.ram,
+            ring_base: (self.regs.cell(MACE_ISA_RING_BASE) & sdma::RING_BASE_MASK) as u32,
+            ust: self.ust.counter() as u32,
+        }
     }
 
     /// The engines' view of the machine.
@@ -215,7 +218,7 @@ impl Mace {
         (0x20..0x38).contains(&off).then(|| ((off - 0x20) / 8) as usize)
     }
 
-    fn com_for(&self, addr: u32) -> Option<&Com16550> {
+    fn com_for(&self, addr: u32) -> Option<&MaceUart> {
         if (MACE_COM0..MACE_COM0 + MACE_COM_SIZE).contains(&addr) {
             Some(&self.com0)
         } else if (MACE_COM1..MACE_COM1 + MACE_COM_SIZE).contains(&addr) {
@@ -229,33 +232,18 @@ impl Mace {
         (addr & !3) == MACE_ISA_FLASH_NIC_REG
     }
 
-    /// Feed a write of the NIC register through to the 1-Wire device.
-    fn nic_write(&self, val: u8) {
-        self.nic_trace.record(self.ust.now(), self.ust.guest_us(), true, val);
-        // DEASSERT alone decides it: clear means the master is pulling the
-        // line down, set means it has let go. The firmware writes DATA=1 in
-        // both cases, so DATA is an input here, not a level to drive — which
-        // is exactly what the bus trace shows (only 0x08 and 0x0c are ever
-        // written).
-        let low = val & nic_bit::DEASSERT == 0;
+    /// The identity/flash/LED register: its own device holds the value.
+    fn id_write(&self, val: u8) {
         self.ust.onewire_busy();
-        self.onewire.master_drive(self.ust.guest_us(), low);
+        self.id.write(self.ust.guest_us(), val);
     }
 
-    /// The NIC register, with the 1-Wire line as it stands now. A read does
-    /// not hold the guest clock (only the master driving the line does):
-    /// IRIX reads this register about a hundred times a second for its
-    /// other bits, and each read holding the clock for 5 ms ran UST at half
-    /// speed.
-    fn nic_read(&self) -> u8 {
-        let mut v = self.regs.cell(MACE_ISA_FLASH_NIC_REG) as u8;
-        if self.onewire.line_level(self.ust.guest_us()) {
-            v |= nic_bit::DATA;
-        } else {
-            v &= !nic_bit::DATA;
-        }
-        self.nic_trace.record(self.ust.now(), self.ust.guest_us(), false, v);
-        v
+    /// A read does not hold the guest clock (only the master driving the
+    /// line does): IRIX reads this register about a hundred times a second
+    /// for its other bits, and each read holding the clock for 5 ms ran UST
+    /// at half speed.
+    fn id_read(&self) -> u8 {
+        self.id.read(self.ust.guest_us())
     }
 }
 
@@ -291,7 +279,7 @@ impl Mace {
             ("pci", &self.pci),
             ("rtc", &self.rtc),
             ("ps2", &self.ps2),
-            ("onewire", &self.onewire),
+            ("id", &self.id),
             ("com0", &self.com0),
             ("com1", &self.com1),
             ("sdma", &self.sdma),
@@ -314,7 +302,7 @@ impl BusDevice for Mace {
             return BusRead8::ok(self.pci.read32(addr & !3).data as u8);
         }
         if Self::is_nic_reg(a) {
-            return BusRead8::ok(self.nic_read());
+            return BusRead8::ok(self.id_read());
         }
         if let Some(c) = self.com_for(a) {
             return c.read8(addr);
@@ -329,6 +317,7 @@ impl BusDevice for Mace {
             return self.rtc.read8(addr);
         }
         if MaceAudio::contains(a) {
+            self.audio.catch_up(&self.audio_io());
             return BusDevice::read8(&self.audio, addr);
         }
         if Self::in_sdma(a) {
@@ -362,6 +351,7 @@ impl BusDevice for Mace {
             return self.rtc.read16(addr);
         }
         if MaceAudio::contains(a) {
+            self.audio.catch_up(&self.audio_io());
             return BusDevice::read16(&self.audio, addr);
         }
         if Self::in_sdma(a) {
@@ -390,7 +380,7 @@ impl BusDevice for Mace {
             return self.pci.read32(addr);
         }
         if Self::is_nic_reg(a) {
-            return BusRead32::ok(self.nic_read() as u32);
+            return BusRead32::ok(self.id_read() as u32);
         }
         if let Some(c) = self.com_for(a) {
             return c.read32(addr);
@@ -405,6 +395,7 @@ impl BusDevice for Mace {
             return self.rtc.read32(addr);
         }
         if MaceAudio::contains(a) {
+            self.audio.catch_up(&self.audio_io());
             return BusDevice::read32(&self.audio, addr);
         }
         if Self::in_sdma(a) {
@@ -434,7 +425,7 @@ impl BusDevice for Mace {
             return self.pci.read64(addr);
         }
         if Self::is_nic_reg(a) {
-            return BusRead64::ok(self.nic_read() as u64);
+            return BusRead64::ok(self.id_read() as u64);
         }
         if let Some(c) = self.com_for(a) {
             return c.read64(addr);
@@ -449,6 +440,7 @@ impl BusDevice for Mace {
             return self.rtc.read64(addr);
         }
         if MaceAudio::contains(a) {
+            self.audio.catch_up(&self.audio_io());
             return BusDevice::read64(&self.audio, addr);
         }
         if Self::in_sdma(a) {
@@ -470,10 +462,8 @@ impl BusDevice for Mace {
             return self.pci.write32(addr & !3, val as u32);
         }
         if Self::is_nic_reg(a) {
-            self.nic_write(val);
-            let r = self.regs.write8(addr, val);
-            self.regs_wrote(a);
-            return r;
+            self.id_write(val);
+            return BUS_OK;
         }
         if let Some(c) = self.com_for(a) {
             return c.write8(addr, val);
@@ -565,10 +555,8 @@ impl BusDevice for Mace {
             return self.pci.write32(addr, val);
         }
         if Self::is_nic_reg(a) {
-            self.nic_write(val as u8);
-            let r = self.regs.write32(addr, val);
-            self.regs_wrote(a);
-            return r;
+            self.id_write(val as u8);
+            return BUS_OK;
         }
         if let Some(c) = self.com_for(a) {
             return c.write32(addr, val);
@@ -618,10 +606,8 @@ impl BusDevice for Mace {
             return self.pci.write64(addr, val);
         }
         if Self::is_nic_reg(a) {
-            self.nic_write(val as u8);
-            let r = self.regs.write64(addr, val);
-            self.regs_wrote(a);
-            return r;
+            self.id_write(val as u8);
+            return BUS_OK;
         }
         if let Some(c) = self.com_for(a) {
             return c.write64(addr, val);

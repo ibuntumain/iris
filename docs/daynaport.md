@@ -46,7 +46,7 @@ DaynaPort), with MAC and subnet fields next to it.
 
 ## Networking topology
 
-Each DaynaPort runs **its own `NatEngine`** on its own thread (`daynaN-nat`),
+Each DaynaPort runs **its own `NatEngine`** on its own thread (`daynaN-net`),
 separate from the onboard SEEQ's. So `dp0` and `ec0` are on different subnets
 and traffic through the DaynaPort is unmistakable — useful for testing, and it
 keeps a broken DaynaPort from disturbing the onboard NIC.

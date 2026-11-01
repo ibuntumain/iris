@@ -52,9 +52,8 @@ fn rig() -> Rig {
     let irq = Arc::new(Mutex::new(Vec::new()));
     let log = irq.clone();
     eth.connect(mem.clone(), Box::new(move |l| log.lock().unwrap().push(l)));
-    let (to_net, sent) = rtrb::RingBuffer::new(64);
-    let (inject, from_net) = rtrb::RingBuffer::new(64);
-    eth.attach(to_net, from_net, None, None);
+    let (link, sent, inject) = crate::net::Link::loopback();
+    eth.attach(link);
     Rig { eth, mem, irq, sent, inject }
 }
 
@@ -720,10 +719,9 @@ fn a_reset_during_an_interrupt_delivery_leaves_the_line_low() {
 #[test]
 fn a_stopped_mac_takes_no_frames_until_it_starts() {
     let mut t = rig();
-    let wake = crate::net::Wake::new();
-    let (inject, from_net) = rtrb::RingBuffer::new(64);
-    let (to_net, _sent) = rtrb::RingBuffer::new(64);
-    t.eth.attach(to_net, from_net, None, Some(wake.clone()));
+    let (link, _sent, inject) = crate::net::Link::loopback();
+    let wake = link.rx_wake();
+    t.eth.attach(link);
     t.inject = inject;
     t.rx_setup(2);
     t.eth.start();
@@ -750,10 +748,8 @@ fn a_frame_waits_for_the_negotiation_deadline_without_a_wake() {
     let eth = Ioc3Eth::with_negotiation_delay(STATION, Duration::from_millis(60));
     let mem = Arc::new(Mem(Mutex::new(vec![0; MEM_SIZE])));
     eth.connect(mem.clone(), Box::new(|_| {}));
-    let wake = crate::net::Wake::new();
-    let (to_net, _sent) = rtrb::RingBuffer::new(64);
-    let (mut inject, from_net) = rtrb::RingBuffer::new(64);
-    eth.attach(to_net, from_net, None, Some(wake));
+    let (link, _sent, mut inject) = crate::net::Link::loopback();
+    eth.attach(link);
     let t = Rig { eth, mem, irq: Arc::new(Mutex::new(Vec::new())), sent: rtrb::RingBuffer::new(1).1, inject: rtrb::RingBuffer::new(1).0 };
     t.rx_setup(2);
     t.eth.start();
@@ -779,18 +775,126 @@ fn waits_for(cond: impl Fn() -> bool) -> bool {
 #[test]
 fn stopping_the_mac_joins_its_threads() {
     let eth = Ioc3Eth::with_negotiation_delay(STATION, Duration::ZERO);
-    let mut cfg = crate::net::GatewayConfig::default();
-    cfg.port_forwards.clear();
-    let _ctl = eth.start_nat(cfg);
+    let mut net = crate::config::NetworkConfig::default();
+    net.port_forward.clear();
+    eth.attach(crate::net::Link::open(&net).unwrap().expect("NAT is the default"));
     assert!(eth.threads.lock().is_empty(), "no thread before start");
     eth.start();
     assert_eq!(eth.threads.lock().len(), 2);
     eth.stop();
     assert!(eth.threads.lock().is_empty());
-    assert!(eth.nat.lock().is_some(), "the engine is back for the next run");
+    assert!(eth.backend.lock().is_some(), "the engine is back for the next run");
     eth.start();
     assert_eq!(eth.threads.lock().len(), 2);
     let probe = Arc::downgrade(&eth);
+    let running = eth.running.clone();
     drop(eth);
+    // The receive thread holds a strong reference for the length of each
+    // poll, so it can be the one that releases the last reference. The
+    // device is gone a moment after the caller's drop, not at it.
+    assert!(waits_for(|| probe.upgrade().is_none()), "the device is freed");
+    assert!(waits_for(|| !running.load(Ordering::SeqCst)), "dropping stops it");
+}
+
+/// Dropping the caller's reference to a running device while another thread
+/// still holds one (the receive thread does for each poll) leaves the device
+/// alive and running; whoever releases the last reference stops it.
+#[test]
+fn the_last_reference_released_on_another_thread_stops_the_mac() {
+    let eth = Ioc3Eth::with_negotiation_delay(STATION, Duration::ZERO);
+    eth.start();
+    let probe = Arc::downgrade(&eth);
+    let running = eth.running.clone();
+    let held = eth.clone();
+    drop(eth);
+    assert!(probe.upgrade().is_some(), "kept alive by the other reference");
+    assert!(running.load(Ordering::SeqCst), "still running");
+    std::thread::spawn(move || drop(held)).join().unwrap();
     assert!(probe.upgrade().is_none());
+    assert!(!running.load(Ordering::SeqCst), "the last release stops it");
+}
+
+/// A guest that does nothing but ACK: the whole host side of a lock-step
+/// TFTP read (transmit descriptor, NAT thread, built-in server, receive
+/// thread, receive ring), with the guest's own software left out. Every
+/// ACK is answered with the next block, in order, and the blocks add up to
+/// the file. Nothing here depends on how fast the host is; the engine test
+/// `tftp_blocks_are_not_paced_by_the_poll_tick` owns the one-pass reply.
+#[test]
+fn a_tftp_read_through_the_ioc3_and_gateway_returns_the_file() {
+    use crate::net::packet::{Ether, Ipv4Route};
+    const BLOCKS: u16 = 400;
+    const GUEST_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 0, 2, 2);
+
+    let root = std::env::temp_dir().join(format!("iris-ioc3-tftp-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let data: Vec<u8> = (0..BLOCKS as usize * 512 + 7).map(|i| (i % 251) as u8).collect();
+    std::fs::write(root.join("big"), &data).unwrap();
+
+    let gw = crate::net::GatewayConfig { tftp_dir: Some(root.clone()), ..crate::net::GatewayConfig::default() };
+    let (gw_mac, gw_ip) = (gw.gateway_mac, gw.gateway_ip);
+    let eth = Ioc3Eth::with_negotiation_delay(STATION, Duration::ZERO);
+    let mem = Arc::new(Mem(Mutex::new(vec![0; MEM_SIZE])));
+    eth.connect(mem.clone(), Box::new(|_| {}));
+    eth.attach(crate::net::Link::with_gateway(gw).unwrap().expect("NAT"));
+    let t = Rig { eth, mem, irq: Arc::new(Mutex::new(Vec::new())), sent: rtrb::RingBuffer::new(1).1, inject: rtrb::RingBuffer::new(1).0 };
+
+    // 512 receive entries over 32 buffers, reused as the guest consumes.
+    for i in 0..512u32 {
+        t.put(RX_RING + i * 8, &u64::from(RX_BUFS + (i % 32) * 0x800).to_be_bytes());
+    }
+    t.w(RX_RING_LO, RX_RING);
+    t.w(RX_CONSUME, 0);
+    t.w(RX_PRODUCE, (16 * 8) | RPIR_ARM);
+    t.w(MAC_CONTROL, MCR_RX_DMA_EN | MCR_RX_EN | (33 << MCR_RXOFF_SHIFT));
+    t.w(MAC_ADDR_LO, u32::from_le_bytes(STATION[..4].try_into().unwrap()));
+    t.w(MAC_ADDR_HI, u32::from(STATION[4]) | u32::from(STATION[5]) << 8);
+    t.tx_setup(0);
+    t.eth.start();
+
+    let route = Ipv4Route::new(gw_mac, STATION, GUEST_IP, gw_ip);
+    let mut tx_idx = 0u32;
+    let mut send = |t: &Rig, payload: &[u8]| {
+        let f = route.udp(tx_idx as u16 + 1, 4270, 69, payload);
+        assert!(f.len() <= 104, "fits the inline area");
+        t.desc(tx_idx % 128, f.len() as u32 | TXD_DATA_VALID, f.len() as u32, 0, 0, &f);
+        tx_idx += 1;
+        t.w(TX_PRODUCE, (tx_idx % 128) * 128);
+    };
+    // The next frame in the receive ring, as the guest driver would find it:
+    // spin on the buffer's valid bit (not on a register, which would contend
+    // with the receive thread for the device lock), read it, hand it back.
+    let mut rx_seen = 0u32;
+    let recv = |t: &Rig, rx_seen: &mut u32| -> Vec<u8> {
+        let end = Instant::now() + Duration::from_secs(5);
+        let buf = RX_BUFS + (*rx_seen % 32) * 0x800;
+        while t.get32(buf) & RXH_VALID == 0 {
+            assert!(Instant::now() < end, "no frame after {} received (tx {:?})", rx_seen, t.eth.counts());
+            std::hint::spin_loop();
+        }
+        let len = ((t.get32(buf) & RXH_BYTECNT_MASK) >> RXH_BYTECNT_SHIFT) as usize - 4;
+        let f = t.get(buf + 66, len);
+        t.put(buf, &[0; 4]);
+        *rx_seen = (*rx_seen + 1) % 512;
+        t.w(RX_PRODUCE, ((*rx_seen + 16) % 512) * 8 | RPIR_ARM);
+        f
+    };
+
+    let data_of = |f: &[u8], block: u16| -> Vec<u8> {
+        let udp = Ether::parse(f).and_then(|e| e.ipv4()).and_then(|i| i.udp()).expect("a UDP frame");
+        let p = udp.payload();
+        assert_eq!(&p[..4], &[0, 3, (block >> 8) as u8, block as u8], "DATA {}", block);
+        p[4..].to_vec()
+    };
+    send(&t, b"\x00\x01big\x00octet\x00");
+    let f = recv(&t, &mut rx_seen);
+    let mut got = data_of(&f, 1);
+    for block in 1..=BLOCKS {
+        send(&t, &[0, 4, (block >> 8) as u8, block as u8]);
+        let f = recv(&t, &mut rx_seen);
+        got.extend_from_slice(&data_of(&f, block + 1));
+    }
+    t.eth.stop();
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(got, data);
 }

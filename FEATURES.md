@@ -141,7 +141,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `prom` | `"prom.bin"` | PROM path; IP24, IP22, and IP28 each have an embedded fallback. Indigo2 also tries `070-1367-012.bin` (IP22) or `070-1477-002.bin` (IP28) in the working directory; the O2, which has no embedded PROM, tries `ip32prom.rev4.18.bin`. |
 | `nvram` | `"nvram.bin"` | DS1386 backing file on the Indy; the PROM's environment on the O2 (its flash) and the Octane. GUI defaults to an absolute user-config path. |
 | `nveeprom` | `"nveeprom.bin"` | Motherboard EEPROM file; GUI anchors it in its user-config directory. |
-| `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (every machine today has four; the rest must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is 64, 128, 256 or 512, filled from bank 0, 2048 in all. See profile constraints below. |
+| `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (every machine today has four; the rest must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. On the Octane each entry is a pair of DIMMs, 64, 128, 256, 512, 1024 or 2048, filled from bank 0, 8192 in all. See profile constraints below. |
 | `scale` | `1` | Standalone window scale: 1–4. GUI uses its separate vm_scale. |
 | `headless` | `false` | Disable the standalone window and graphics; the O2 then boots on its serial console. Audio is independent. |
 | `no_audio` | `false` | Disable audio emulation (HAL2, MACE or RAD). |
@@ -149,6 +149,8 @@ the first `[section]`, because TOML tables continue until the next header.
 | `monitor_port` | `8888 when unset` | Monitor listener on loopback. |
 | `serial_port_a` | `8880 when unset` | SCC channel A listener (tty2); the O2's first serial port, its console when headless. |
 | `serial_port_b` | `8881 when unset` | SCC channel B listener (tty1/console); the O2's second serial port. GUI halt uses this port. |
+| `serial_socket_a` | `unset` | Also serve serial channel A on this Unix socket (raw bytes, one client at a time). |
+| `serial_socket_b` | `unset` | Likewise for channel B. With `ci` the console stays readable through `serial-read` and `wait-serial` as well. |
 | `load_elf` | `unset` | Load a static big-endian MIPS ELF32 binary before starting the CPU. |
 | `test_device` | `false` | Map the bare-metal test device in GIO slot 0. |
 | `test_device_dump` | `iris-testdev-dump.json when unset` | Test-device machine-state JSON output. |
@@ -160,6 +162,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `mouse_scroll_pixels_per_line` | `40.0` | Host scrolling distance per guest PS/2 detent. |
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
 | `serial_log` | `unset` | Append guest channel-B output (the O2's first serial port); used by CI and GUI serial capture. |
+| `serial_log_a`, `serial_log_b` | `unset` | Log what the guest sends on channel A or B when that channel is not the console (A on the Indy and Indigo2, B on the Octane and O2; `serial_log` is the console's). Truncated at start on the Octane and O2, appended to on the Indy and Indigo2, like `serial_log`. |
 | `serial_log_timestamps` | `off` | `off` (raw transcript) or `wall`: prefix each completed serial-log line with a UTC ISO-8601 stamp. A partial line is held until its newline and written on stop. |
 | `scsi_deferred_int` | `true` | Defer SCSI status interrupts for BSD compatibility. |
 
@@ -168,7 +171,8 @@ the first `[section]`, because TOML tables continue until the next header.
 | Key | Default | Values and behavior |
 |---|---|---|
 | `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)). |
-| `machine.cpu` | `r4400` | r4400, r5000, r10000; CPU/ISA choice is independent of build features. |
+| `machine.cpu` | `r4400` | r4400, r5000, r10000; CPU/ISA choice is independent of build features. An O2 takes r5000 or r10000 (an r4400 is refused when the machine is built); the Octane is r10000 only. |
+| `machine.cpus` | `1` | Processors fitted. 2 only on the Octane; see [its guide](docs/Octane/multiprocessor.md). |
 
 ### [graphics]
 
@@ -193,7 +197,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `scsi.<ID>.size_mb` | `64 when unset` | Size of a newly created scratch image; existing files are unchanged. |
 | `scsi.<ID>.controller` | `0` | 0 or 1; controller 1 is accepted on indigo2_ip22 and o2_ip32 (on the O2 it is the external bus). A key of 16 + ID names controller 1 directly and does not need it. |
 
-IDs are 1–7. The key is a slot: `[scsi.N]` with N 1–7 is id N on controller 0
+IDs are 1–7, or 1–15 on the Octane's wide ISP1040 buses. The key is a slot: `[scsi.N]` with N 1–7 is id N on controller 0
 (or on `controller`, when set), and N = 16 + id is that id on controller 1,
 so both controllers can carry the same id; two tables naming one target are
 rejected. If `scsi` is entirely omitted, core defaults attach SCSI #1 as
@@ -205,12 +209,13 @@ An explicit non-disk kind takes precedence over the legacy cdrom flag.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `network.mode` | `nat` | nat, pcap or off (no Ethernet; O2 only for now). PCAP needs build support and host capture permissions, and is not available on the O2 yet. |
+| `network.mode` | `nat` | nat, pcap or off (no Ethernet; O2 and Octane only). PCAP needs build support and host capture permissions; it works on every machine with an Ethernet. |
 | `network.pcap_interface` | `auto-pick when unset` | Interface name or numeric list index; PCAP only. |
 | `network.nfs_pcap_ip` | `unset` | Virtual LAN IP for the built-in NFS responder in PCAP mode. |
 | `network.mac` | `08:00:69:12:34:56 when unset` | ec0 MAC; injected only into blank PROM battery-backed MAC slots. |
 | `network.tftp_dir` | `unset` | Read-only TFTP root at the NAT gateway for PROM network boot. |
 | `network.rsh_dir` | `unset` | Root for the built-in rsh server at the NAT gateway (TCP 514): `rsh <gateway> cat\|dd\|ls\|echo\|pwd`, read-only, nothing runs on the host. |
+| `network.rx_hold` | `true` | Indy: frames for the guest wait in iris, off the virtual wire, while the next one would fill the last descriptor of its receive ring before the driver has reaped the filled ones, and for at most 100 ms. A frame that reaches a stopped receive channel is lost either way, as on the wire. `false` never waits. |
 
 ### [nfs]
 
@@ -242,7 +247,7 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `vnc.listen` | `unset` (no server) | `host:port`, or a port on 127.0.0.1, to serve the screen, keyboard and mouse over VNC (RFB 3.8; Raw and ZRLE; no password). Every board, with a window or `ci`; not `headless`. Standalone `iris` only. See [HELP.md](HELP.md#vnc). |
+| `vnc.listen` | `unset` (no server) | `host:port`, or a port on 127.0.0.1, to serve the screen, keyboard and mouse over VNC (RFB 3.8; Raw and ZRLE; no password). Every board, with a window or `ci`; not `headless`. Standalone `iris` and iris-gui. See [HELP.md](HELP.md#vnc) and [iris-gui-README.md](iris-gui-README.md#vnc). |
 | `vnc.max_fps` | `30` | Most updates a second sent to a viewer (1–120). |
 
 ### [audio]
@@ -329,8 +334,8 @@ the file is loaded, with a note, and never written back.
 Used with `machine.profile = "octane_ip30"`, which needs `machine.cpu =
 "r10000"`. An Octane is configured by the shared keys: `prom` (the IP30 PROM,
 not embedded; `IP30prom.bin` is tried when it is left unset), `nvram` (the
-DS1685's NVRAM, behind IOC3), `banks` (the MB in each HEART bank: 64, 128, 256
-or 512, filled from bank 0 with no gap, 2048 in all), `serial_port_a` and
+DS1685's NVRAM, behind IOC3), `banks` (the MB in each HEART bank: 64, 128, 256,
+512, 1024 or 2048, filled from bank 0 with no gap, 8192 in all), `serial_port_a` and
 `serial_port_b`/`serial_log` (IOC3's two ports, the first the console),
 `headless`, `[clock] fixed_mhz` (CP0 Count; 97.5 for the 195 MHz R10000),
 `[network]`, `[[port_forward]]`, `nat_subnet`, `[scsi.N]` (`controller` 0
@@ -345,7 +350,7 @@ is the internal bus, 1 the external) and `[graphics] board`. See [the Octane gui
 On the Indy and Indigo2 bank values are 0, 8, 16, 32, 64, or 128 MB, and only
 IP28 accepts 256/512 MB. On the O2 a bank is a DIMM pair's kit, 32, 64, 128 or
 256 MB, fitted from pair A largest first; on the Octane it is a matched DIMM
-pair, 64, 128, 256 or 512 MB, filled from bank 0. `banks` has eight entries;
+pair, 64 MB to 2 GB, filled from bank 0. `banks` has eight entries;
 every machine today uses the first four and the rest must be 0.
 IP22/IP24 four-bank IRIX 6.5 behavior remains separate from IP28's verified
 two-bank 1 GB layout. Extreme requires IP22. All non-Newport boards require
@@ -409,6 +414,8 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--vnc [ADDR]` | Serve the screen, keyboard and mouse over VNC on ADDR (`host:port` or a port; default 127.0.0.1:5900). Sets `vnc.listen`. |
 | `--serial-port-a` | Serial channel A (tty2) port on 127.0.0.1 (default 8880). |
 | `--serial-port-b` | Serial channel B (tty1, the console) port on 127.0.0.1 (default 8881). |
+| `--serial-socket-a`, `--serial-socket-b` | Also serve channel A or B on a Unix socket. |
+| `--serial-log-a`, `--serial-log-b` | Log what the guest sends on channel A or B when it is not the console. |
 | `--test-device` | Map the bare-metal test device into GIO expansion slot 0: SIGNATURE, PUTC (guest console → stdout), DUMP (machine state → JSON) and EXIT (terminate with the guest's exit code). Off by default. |
 | `--test-device-dump` | Where the test device writes its machine-state dump. |
 | `--cheritest-dump-hook` | cheritest convention: a guest write to CP0 register 26 dumps machine state. Needs --test-device. Never enable for a normal boot — CP0 26 is ECC on a real R4400 and the PROM writes it during cache init. |
@@ -497,6 +504,9 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_JIT_DISPATCH` | off or 0 disables normal JIT v2 dispatch at startup. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_JIT_HASHSTATS` | 1 enables page/entry reuse diagnostics. | [src/cpu/jitv2/hashstats.rs](src/cpu/jitv2/hashstats.rs) |
 | `IRIS_JIT_HASHSTATS_LOG` | Append per-compile reuse diagnostic records to this file. | [src/cpu/jitv2/hashstats.rs](src/cpu/jitv2/hashstats.rs) |
+| `IRIS_JIT_VERIFY` | 1 or on runs Cranelift's IR verifier on every JIT v2 compile. Already on in unit tests and `--features developer` builds. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
+| `IRIS_JIT_ARENA_FLUSH_MB` | Flush compiled code when the arena holds this many MiB, for testing the compile workers' flush. | [src/cpu/jitv2/jitv2.rs](src/cpu/jitv2/jitv2.rs) |
+| `IRIS_JIT_ATOMIC_GEN` | Any presence makes inline stores bump the page generation atomically with one CPU too, as they always do with several. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_JIT_PIC` | Any presence disables core-address constants for JIT code. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_MEM_HELPERS` | Any presence enables the experimental JIT memory-helper path. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_MGRAS_REC` | Record IMPACT bus operations from power-on to this path. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |

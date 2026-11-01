@@ -3,11 +3,12 @@
 //! Used by the CPU run loop in `mips_exec.rs`. See
 //! `clanker/perf/idle-pause-work.md`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::cpu::mips_core::{CAUSE_IP_MASK, STATUS_IM_MASK};
 use crate::cpu::mips_core::MipsCore;
+use crate::cpu::smp::{HOST_PARK_BIT, MAX_CPUS};
 
 /// PCs kept for the idle-window test. The batch run loop calls [`sample`]
 /// after each ten-instruction group, so with [`SAMPLE_EVERY`] = 32 the ring
@@ -44,6 +45,17 @@ const SLICE_NS: u64 = 1_000_000;
 /// `ci_clock`. In every build this keeps cross-thread cycle readers
 /// (WD33C93A's deferred-interrupt spin, CP0 Random) moving during a park.
 const STALL_NS_PER_CYCLE: u64 = 10;
+/// Move `hot.cycles` on by a park's host time, and record that those cycles
+/// were not instructions. Guest-visible timing (Count under `ci_clock`,
+/// CP0 Random, the cycle-reading device spins) follows `hot.cycles` exactly
+/// as before; only the status bars' MIPS reads `CyclesPtr::retired`, which
+/// leaves them out.
+fn advance_parked(core: &mut MipsCore, elapsed_ns: u64) {
+    let cycles = elapsed_ns / STALL_NS_PER_CYCLE;
+    core.hot.cycles = core.hot.cycles.wrapping_add(cycles);
+    core.hot.parked_cycles = core.hot.parked_cycles.wrapping_add(cycles);
+}
+
 /// After a park wakes on a pending line the guest cannot take (`(ip & im) ==
 /// 0`), do not park again for this many `hot.cycles`. A genuine idle loop
 /// wakes for an unmasked interrupt; waking for a masked one means the
@@ -61,12 +73,12 @@ const PARK_WARMUP: Duration = Duration::from_secs(60);
 
 /// The CPU thread while it is parked in [`IdleParkState::park`], so an
 /// interrupt source can wake it at once instead of leaving it to notice on its
-/// next slice. There is one CPU thread, so one slot.
-static PARKER: parking_lot::Mutex<Option<std::thread::Thread>> = parking_lot::const_mutex(None);
-/// Set while the CPU thread is between its last look at the pending word and
-/// its sleep. Paired with the writers' order (set the bit, then read this) so
-/// a wakeup cannot be lost.
-static PARKED: AtomicBool = AtomicBool::new(false);
+/// next slice. One slot per CPU.
+static PARKER: parking_lot::Mutex<[Option<std::thread::Thread>; MAX_CPUS]> = parking_lot::const_mutex([const { None }; MAX_CPUS]);
+/// A bit per CPU, set while its thread is between its last look at the pending
+/// word and its sleep. Paired with the writers' order (set the bit, then read
+/// this) so a wakeup cannot be lost.
+static PARKED: AtomicU8 = AtomicU8::new(0);
 /// When this process first built an `IdleParkState`. One `Machine` per
 /// process, and the warm-up must not restart every time the monitor stops and
 /// starts the CPU thread (which builds a fresh state), so it is process-wide.
@@ -88,16 +100,25 @@ pub static WINDOW_FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static WINDOW_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WINDOW_DISTINCT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Wake the parked CPU thread, if it is parked. Call after setting a bit in
-/// `hot.interrupts` from any thread; one relaxed-cost atomic load when the CPU
-/// is running.
+/// Wake the parked CPU threads. Call after setting a bit in `hot.interrupts`
+/// from any thread; one relaxed-cost atomic load when no CPU is parked. Every
+/// parked CPU wakes and looks at its own word, so the caller need not say whose
+/// bit it set; one that finds nothing sleeps again.
 #[inline]
 pub fn wake() {
-    if PARKED.load(Ordering::SeqCst) {
-        if let Some(t) = PARKER.lock().as_ref() {
+    if PARKED.load(Ordering::SeqCst) != 0 {
+        for t in PARKER.lock().iter().flatten() {
             t.unpark();
         }
     }
+}
+
+fn announce_parked(core: &MipsCore) {
+    PARKED.fetch_or(1 << core.cpu_id, Ordering::SeqCst);
+}
+
+fn clear_parked(core: &MipsCore) {
+    PARKED.fetch_and(!(1 << core.cpu_id), Ordering::SeqCst);
 }
 
 /// Detects kernel idle loops from a per-instruction PC sample ring.
@@ -309,6 +330,18 @@ impl IdleParkState {
             return IdleDecision::None;
         }
 
+        // IE=0: no interrupt can be delivered at all, so a park could never
+        // end. Same busy-wait trap as `im == 0` above; keep executing. This
+        // must come before the pending-line pace below: with IE clear the
+        // guest is typically polling a device (the kernel's console printf
+        // spins on the SCC's transmit-ready bit), and sleeping it waits on a
+        // status change only its own next batch can observe.
+        if !core.interrupts_enabled() {
+            RESET_IE0.fetch_add(1, Ordering::Relaxed);
+            self.clear_window();
+            return IdleDecision::None;
+        }
+
         // A pending interrupt that is masked now is still about to be
         // taken: a loop that raises and drops the spl (IRIX's splhi leaves
         // only IP6 unmasked on IP22) is mostly seen in its masked stretch,
@@ -320,14 +353,6 @@ impl IdleParkState {
             RESET_IP.fetch_add(1, Ordering::Relaxed);
             self.clear_window();
             return IdleDecision::Pace;
-        }
-
-        // IE=0: no interrupt can be delivered at all, so a park could never
-        // end. Same busy-wait trap as `im == 0` above; keep executing.
-        if !core.interrupts_enabled() {
-            RESET_IE0.fetch_add(1, Ordering::Relaxed);
-            self.clear_window();
-            return IdleDecision::None;
         }
 
         // Only kernel code can be parked. A user process spinning in a loop
@@ -378,7 +403,7 @@ impl IdleParkState {
         }
 
         PARK_COUNT.fetch_add(1, Ordering::Relaxed);
-        *PARKER.lock() = Some(std::thread::current());
+        PARKER.lock()[core.cpu_id as usize] = Some(std::thread::current());
         loop {
             if !running.load(Ordering::Relaxed) {
                 PARK_WAKE_OTHER.fetch_add(1, Ordering::Relaxed);
@@ -387,8 +412,12 @@ impl IdleParkState {
             // Announce the park before the last look at the pending word: a
             // writer sets its bit and then reads PARKED, so either we see the
             // bit here or the writer sees PARKED and unparks us.
-            PARKED.store(true, Ordering::SeqCst);
-            let pending = core.hot.interrupts.load(Ordering::SeqCst) as u32;
+            announce_parked(core);
+            let word = core.hot.interrupts.load(Ordering::SeqCst);
+            if word & HOST_PARK_BIT != 0 {
+                break;
+            }
+            let pending = word as u32;
             let ip = (core.cp0_cause | pending) & CAUSE_IP_MASK;
             // Any line, masked or not: the mask is the guest's of the moment
             // `update` sampled - the middle of a raised spl, often - and a
@@ -412,7 +441,7 @@ impl IdleParkState {
             std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
             PARK_SLEEP_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
-            core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / STALL_NS_PER_CYCLE);
+            advance_parked(core, elapsed_ns);
         }
         // If the wake was for a line the guest cannot take (masked), this
         // was not an idle loop; back off so a device-poll or DELAY loop runs
@@ -425,22 +454,22 @@ impl IdleParkState {
         }
         // Every exit, including the ci_clock one, leaves the flag clear: a
         // stale `true` would put `wake` on the mutex for a running CPU.
-        PARKED.store(false, Ordering::SeqCst);
+        clear_parked(core);
     }
 
     /// Pace a repeated state whose interrupts are masked.
     ///
-    /// Unlike [`IdleParkState::park`], this never waits indefinitely: every
-    /// slice is bounded, so there is no deadlock risk when nothing can wake
-    /// the CPU. `hot.cycles` advances during the sleep at the host-pacing
+    /// Unlike [`IdleParkState::park`], this never waits indefinitely: it
+    /// sleeps at most one slice per call, so there is no deadlock risk when
+    /// nothing can wake the CPU. `hot.cycles` advances during the sleep at the host-pacing
     /// rate (`STALL_NS_PER_CYCLE`), so cross-thread cycle readers keep seeing
     /// progress and, under `ci_clock`, the Compare threshold still arrives.
-    /// The loop ends at once when `running` is cleared (monitor command /
+    /// The sleep ends at once when `running` is cleared (monitor command /
     /// soft reset), when an interrupt becomes deliverable, when the guest
     /// re-enables interrupts (the normal park path takes over next), or —
     /// under `ci_clock` — when the compare deadline is reached.
     pub fn pace(&self, core: &mut MipsCore, running: &AtomicBool) {
-        *PARKER.lock() = Some(std::thread::current());
+        PARKER.lock()[core.cpu_id as usize] = Some(std::thread::current());
         loop {
             if !running.load(Ordering::Relaxed) {
                 break;
@@ -449,9 +478,13 @@ impl IdleParkState {
             // (Dekker): a writer sets its bit then reads `PARKED`, so either
             // we see the bit here or the writer sees `PARKED` and unparks us
             // via [`wake`].
-            PARKED.store(true, Ordering::SeqCst);
+            announce_parked(core);
             let ie = core.interrupts_enabled();
-            let pending = core.hot.interrupts.load(Ordering::SeqCst) as u32;
+            let word = core.hot.interrupts.load(Ordering::SeqCst);
+            if word & HOST_PARK_BIT != 0 {
+                break;
+            }
+            let pending = word as u32;
             let ip = (core.cp0_cause | pending) & CAUSE_IP_MASK;
             let im = core.cp0_status & STATUS_IM_MASK;
             if (ip & im) != 0 {
@@ -471,11 +504,15 @@ impl IdleParkState {
             let t0 = Instant::now();
             std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
-            core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / STALL_NS_PER_CYCLE);
+            advance_parked(core, elapsed_ns);
+            // One slice, then back to the run loop. Status cannot change
+            // while this thread sleeps, so looping here would wait on a
+            // condition only executing the guest can bring about.
+            break;
         }
         // Every exit leaves the flag clear: a stale `true` would put `wake`
         // on the mutex for a running CPU.
-        PARKED.store(false, Ordering::SeqCst);
+        clear_parked(core);
     }
 }
 
@@ -494,12 +531,12 @@ impl IdleParkState {
 /// Count keep seeing progress exactly as the old `spin_loop` stall did.
 pub fn park_wait(core: &mut MipsCore) {
     const SOFT_RESET_BIT: u64 = 1u64 << 63;
-    *PARKER.lock() = Some(std::thread::current());
+    PARKER.lock()[core.cpu_id as usize] = Some(std::thread::current());
     loop {
         // Announce the park before the last look at the pending word (Dekker).
-        PARKED.store(true, Ordering::SeqCst);
+        announce_parked(core);
         let pending = core.hot.interrupts.load(Ordering::SeqCst);
-        if pending & SOFT_RESET_BIT != 0 {
+        if pending & (SOFT_RESET_BIT | HOST_PARK_BIT) != 0 {
             break;
         }
         let ip = (core.cp0_cause | (pending as u32)) & CAUSE_IP_MASK;
@@ -516,22 +553,21 @@ pub fn park_wait(core: &mut MipsCore) {
         let t0 = Instant::now();
         std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / STALL_NS_PER_CYCLE);
+        advance_parked(core, elapsed_ns);
     }
     // Every exit leaves the flag clear: a stale `true` would put `wake` on the
     // mutex for a running CPU.
-    PARKED.store(false, Ordering::SeqCst);
+    clear_parked(core);
 }
 
 /// Is the CPU thread parked now? (Tests wait for it, not a guessed sleep.)
 #[cfg(test)]
 pub(crate) fn parked() -> bool {
-    PARKED.load(Ordering::SeqCst)
+    PARKED.load(Ordering::SeqCst) != 0
 }
 
-/// Tests that park take this first: there is one parked-thread slot
-/// (`PARKER`, as there is one CPU thread), so two parking at once would wake
-/// each other's threads and miss their own.
+/// Tests that park take this first: their cores are all CPU 0, one
+/// parked-thread slot, so two parking at once would miss their own wakes.
 #[cfg(test)]
 pub(crate) static PARK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
@@ -787,6 +823,33 @@ mod tests {
         );
     }
 
+    /// A pending line the guest has masked, with IE clear, is the guest
+    /// polling a device with interrupts off (the kernel's console printf
+    /// spins on the SCC's transmit-ready bit). Sleeping it freezes the
+    /// guest: the bit it waits on only changes under the polling code.
+    #[test]
+    fn update_keeps_a_polling_guest_running_when_a_masked_line_is_pending() {
+        use crate::cpu::mips_core::CAUSE_IP2;
+        let mut core = idle_core(1 << (STATUS_IM_SHIFT + 6)); // IM6 only, IE clear
+        core.hot.interrupts.store(CAUSE_IP2 as u64, Ordering::SeqCst);
+        let mut st = IdleParkState::ready();
+        assert!(matches!(st.update(&core), IdleDecision::None));
+    }
+
+    /// `pace` returns after one slice even when nothing wakes it, so the run
+    /// loop gets to execute the guest again.
+    #[test]
+    fn pace_sleeps_one_slice_and_returns() {
+        let _one = PARK_TEST_LOCK.lock();
+        let mut core = MipsCore::default();
+        core.cp0_status = 0;
+        let running = AtomicBool::new(true);
+        let t0 = Instant::now();
+        IdleParkState::ready().pace(&mut core, &running);
+        assert!(t0.elapsed() < Duration::from_millis(100), "pace must not wait for a wake");
+        assert!(core.hot.cycles > 0);
+    }
+
     /// Pacing advances `hot.cycles` while it sleeps, so cross-thread cycle
     /// readers keep seeing progress.
     #[test]
@@ -1012,5 +1075,77 @@ mod wake_tests {
              a slice is {:?}",
             Duration::from_nanos(SLICE_NS)
         );
+    }
+}
+
+#[cfg(test)]
+mod retired_tests {
+    use super::*;
+    use crate::cpu::mips_core::{CyclesPtr, MipsCore};
+
+    fn ptr(core: &MipsCore) -> CyclesPtr {
+        CyclesPtr::with_parked(&core.hot.cycles, &core.hot.parked_cycles)
+    }
+
+    /// Parked time moves the guest-visible cycle counter but is not retired
+    /// instructions, so the MIPS figure must not see it.
+    #[test]
+    fn parked_time_is_not_retired() {
+        let mut core = MipsCore::default();
+        core.hot.cycles = 1_000;
+        let p = ptr(&core);
+        assert_eq!(p.retired(), 1_000);
+        advance_parked(&mut core, 1_000_000);
+        assert_eq!(core.hot.cycles, 1_000 + 1_000_000 / STALL_NS_PER_CYCLE);
+        assert_eq!(p.get(), core.hot.cycles, "timing readers still see the park");
+        assert_eq!(p.retired(), 1_000, "a park retires nothing");
+        core.hot.cycles += 50;
+        assert_eq!(p.retired(), 1_050);
+    }
+
+    /// The real pacing path, run until a stopper ends it.
+    #[test]
+    fn pace_leaves_retired_alone() {
+        let _one = PARK_TEST_LOCK.lock();
+        let mut core = MipsCore::default();
+        core.cp0_status = 0; // interrupts masked: the pace path
+        core.hot.cycles = 7;
+        let p = ptr(&core);
+        let running = std::sync::Arc::new(AtomicBool::new(true));
+        let stop = running.clone();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            stop.store(false, Ordering::SeqCst);
+            wake();
+        });
+        IdleParkState::ready().pace(&mut core, &running);
+        stopper.join().unwrap();
+        assert!(p.get() > 7, "the pace moved the cycle counter");
+        assert_eq!(p.retired(), 7);
+    }
+
+    /// A hard reset starts the cycle counter again from 0; the parked part
+    /// must go with it, or the bars read 0 MIPS after a reboot for as long
+    /// as the previous run spent parked.
+    #[test]
+    fn a_reset_starts_the_retired_count_again() {
+        let mut core = MipsCore::default();
+        core.hot.cycles = 1_000;
+        advance_parked(&mut core, 1_000_000);
+        let p = ptr(&core);
+        core.reset(false);
+        assert_eq!(p.get(), 0);
+        core.hot.cycles += 50;
+        assert_eq!(p.retired(), 50);
+    }
+
+    #[test]
+    fn plain_pointer_has_no_parked_time() {
+        let mut core = MipsCore::default();
+        core.hot.cycles = 9;
+        let p = CyclesPtr::new(&core.hot.cycles);
+        advance_parked(&mut core, 10_000);
+        assert_eq!(p.retired(), p.get());
+        assert_eq!(CyclesPtr::dangling().retired(), 0);
     }
 }

@@ -40,7 +40,15 @@ use toml::Value;
 /// v3 → v4: the L1D cache tag moved to the Figure 11-4 field positions. A v3
 /// reader would take a v4 tag as clean and drop the line without writing it
 /// back, so the bump is what makes it refuse the snapshot instead.
-pub const SCHEMA_VERSION: u32 = 4;
+///
+/// v4 → v5: each of the O2's MACE UARTs saves the 16550 core's registers,
+/// receive FIFO and typed backlog where it saved eight registers and a queue.
+/// A v4 reader would find none of it in a v5 snapshot and restore a console
+/// with every UART register at zero under a running kernel; a v5 reader does
+/// the same with a v4 O2 snapshot, so the O2 refuses those. Nothing else
+/// changed shape: the serial DMA, the Indy's SCC and the rest are as before,
+/// and the Octane has no snapshots.
+pub const SCHEMA_VERSION: u32 = 5;
 
 const MANIFEST_FILE: &str = "snapshot.toml";
 

@@ -57,7 +57,8 @@ use crate::dev::ioc3_port::Ioc3EthPort;
 use crate::dev::ps2::Ps2Controller;
 use crate::dev::w1;
 use crate::dev::w1::sgi::{self, BoardRecord};
-use crate::dev::z85c30::{null_serial_backend, SerialBackend};
+use crate::dev::ns16550::Ns16550;
+use crate::dev::serial_host::SerialBackend;
 use crate::irq::{InterruptController, IrqLine};
 use crate::pci::{Bar, PciBusDevice, PciConfig, PciDma, PciDmaStatus, PCI_INTA};
 use crate::hptimer::{TimerId, TimerManager, TimerReturn};
@@ -69,6 +70,10 @@ pub const REVISION: u8 = 0x01;
 /// PCI subsystem id of the Octane's system board.
 pub const SUBSYS_IP30_SYSBOARD: u16 = 0xc304;
 pub const BAR_SIZE: u32 = 1 << 20;
+/// The configuration dwords the chip decodes; the rest of the 16 repeat them.
+const CONFIG_DECODED_DWORDS: usize = 8;
+/// PCI status bit 7, fast back-to-back capable.
+const PCI_STATUS_FAST_BACK: u32 = 0x0080;
 
 /// Register offsets within the BAR.
 pub mod reg {
@@ -78,6 +83,8 @@ pub mod reg {
     pub const CHIP_CONTROL: u32 = 0x28;
     pub const INT_OUTPUT: u32 = 0x2c;
     pub const MICROLAN: u32 = 0x30;
+    /// The last dword of the PCI header that shows through the block.
+    pub const HEADER_LAST: u32 = 0x10;
     pub const PIN_CONTROL_SET: u32 = 0x34;
     pub const PIN_CONTROL_CLR: u32 = 0x38;
     pub const PIN_DATA: u32 = 0x3c;
@@ -134,6 +141,8 @@ pub mod int {
         | PARALLEL_SERVICE
         | serial(0, RX_HIGH_WATER)
         | serial(1, RX_HIGH_WATER)
+        | serial(0, RX_RING_FULL)
+        | serial(1, RX_RING_FULL)
         | serial(0, TX_RING_EMPTY)
         | serial(1, TX_RING_EMPTY);
 }
@@ -144,9 +153,7 @@ pub mod int {
 
 mod uart_reg {
     pub const RBR_THR: u32 = 0;
-    pub const IER: u32 = 1;
     pub const IIR_FCR: u32 = 2;
-    pub const LCR: u32 = 3;
     pub const MCR: u32 = 4;
     pub const LSR: u32 = 5;
     pub const MSR: u32 = 6;
@@ -157,7 +164,6 @@ const LSR_OE: u8 = 0x02;
 const LSR_PE: u8 = 0x04;
 const LSR_FE: u8 = 0x08;
 const LSR_BI: u8 = 0x10;
-const LSR_THRE_TEMT: u8 = 0x60;
 const MCR_DTR: u8 = 0x01;
 const MCR_RTS: u8 = 0x02;
 const MCR_OUT1: u8 = 0x04;
@@ -167,27 +173,22 @@ const MCR_AFE: u8 = 0x20;
 const MSR_DCTS: u8 = 0x01;
 const MSR_CTS: u8 = 0x10;
 const MSR_DCD: u8 = 0x80;
-const LCR_DLAB: u8 = 0x80;
-const UART_FIFO: usize = 16;
 const LSR_TEST_MASK: u8 = 0x7f;
 const MSR_TEST_MASK: u8 = 0x0f;
+/// The reference clock of the UART crystal: the pre-divider divides it, and
+/// the divisor latch divides the result by 16 again.
+const UART_CRYSTAL_HZ: u32 = 22_118_400;
 
-/// A 16550 as IOC3 fits it. Transmit is instantaneous (the byte goes to the
+/// A 16550 as IOC3 fits it: the shared core (`ns16550.rs`) with the chip's
+/// own additions around it. Transmit is instantaneous (the byte goes to the
 /// backend inside the write), so the transmitter always reads empty.
+///
+/// The additions: the auto-flow bit in modem control, which the core's modem
+/// control masks away; factory-test writes to line and modem status; and the
+/// scratch register doubling as the clock pre-divider while the divisor latch
+/// is open. Ported from hw/misc/sgi-ioc3.c in jamesbraid/qemu-sgi-origami.
 struct Uart {
-    backend: Arc<dyn SerialBackend>,
-    rx: VecDeque<u8>,
-    ier: u8,
-    fifo: bool,
-    lcr: u8,
-    mcr: u8,
-    scr: u8,
-    dll: u8,
-    dlm: u8,
-    lsr_err: u8,
-    msr_delta: u8,
-    msr_prev: u8,
-    thr_int: bool,
+    core: Ns16550,
     // IOC3 specifics, kept beside the 16550.
     predivider: u8,
     mcr_afe: u8,
@@ -197,42 +198,11 @@ struct Uart {
 
 impl Uart {
     fn new() -> Uart {
-        let mut u = Uart {
-            backend: null_serial_backend(),
-            rx: VecDeque::new(),
-            ier: 0,
-            fifo: false,
-            lcr: 0,
-            mcr: MCR_OUT2,
-            scr: 0,
-            dll: 0x0c,
-            dlm: 0,
-            lsr_err: 0,
-            msr_delta: 0,
-            msr_prev: 0xb0,
-            thr_int: false,
-            predivider: 0,
-            mcr_afe: 0,
-            lsr_test: 0,
-            msr_test: 0,
-        };
-        u.reset();
-        u
+        Uart { core: Ns16550::new(115200), predivider: 0, mcr_afe: 0, lsr_test: 0, msr_test: 0 }
     }
 
     fn reset(&mut self) {
-        self.rx.clear();
-        self.ier = 0;
-        self.fifo = false;
-        self.lcr = 0;
-        self.mcr = MCR_OUT2;
-        self.scr = 0;
-        self.dll = 0x0c;
-        self.dlm = 0;
-        self.lsr_err = 0;
-        self.msr_delta = 0;
-        self.msr_prev = self.msr_levels();
-        self.thr_int = false;
+        self.core.reset();
         self.mcr_afe = 0;
         self.lsr_test = 0;
         self.msr_test = 0;
@@ -240,116 +210,25 @@ impl Uart {
         // specified for it.
     }
 
-    fn dlab(&self) -> bool {
-        self.lcr & LCR_DLAB != 0
-    }
-
     fn loopback(&self) -> bool {
-        self.mcr & MCR_LOOP != 0
-    }
-
-    /// The modem status input levels (bits 4..7). The port comes up with
-    /// carrier and clear-to-send asserted; in loopback the outputs wire back.
-    fn msr_levels(&self) -> u8 {
-        if self.loopback() {
-            ((self.mcr & (MCR_OUT1 | MCR_OUT2)) << 4)
-                | ((self.mcr & MCR_RTS) << 3)
-                | ((self.mcr & MCR_DTR) << 5)
-        } else {
-            0xb0
-        }
-    }
-
-    fn lsr_now(&self) -> u8 {
-        let mut v = LSR_THRE_TEMT | self.lsr_err;
-        if !self.rx.is_empty() {
-            v |= LSR_DR;
-        }
-        v
-    }
-
-    fn iir(&self) -> u8 {
-        let id = if self.ier & 4 != 0 && self.lsr_err & (LSR_OE | LSR_PE | LSR_FE | LSR_BI) != 0 {
-            0x06
-        } else if self.ier & 1 != 0 && !self.rx.is_empty() {
-            0x04
-        } else if self.ier & 2 != 0 && self.thr_int {
-            0x02
-        } else if self.ier & 8 != 0 && self.msr_delta & 0x0f != 0 {
-            0x00
-        } else {
-            0x01
-        };
-        id | if self.fifo { 0xc0 } else { 0 }
+        self.core.loopback()
     }
 
     /// The interrupt line: low IIR bit clear.
     fn irq(&self) -> bool {
-        self.iir() & 1 == 0
+        self.core.irq()
     }
 
-    fn push_rx(&mut self, b: u8) {
-        let cap = if self.fifo { UART_FIFO } else { 1 };
-        if self.rx.len() >= cap {
-            self.lsr_err |= LSR_OE;
-        } else {
-            self.rx.push_back(b);
-        }
-    }
-
-    /// Move whatever the host end has typed into the receive FIFO.
-    /// Returns whether anything arrived.
+    /// Move whatever the host end has typed into the receive FIFO and let
+    /// the receive timeout run out. Returns whether anything changed.
     fn pump(&mut self) -> bool {
-        let cap = if self.fifo { UART_FIFO } else { 1 };
-        let mut moved = false;
-        while self.rx.len() < cap {
-            match self.backend.recv_byte() {
-                Ok(b) => {
-                    self.rx.push_back(b);
-                    moved = true;
-                }
-                Err(_) => break,
-            }
-        }
-        moved
+        let moved = self.core.pump();
+        self.core.check_timeout(Instant::now()) || moved
     }
 
     /// The 16550 proper: what the ring engine sees.
     fn read_core(&mut self, r: u32) -> u8 {
-        match r {
-            uart_reg::RBR_THR => {
-                if self.dlab() {
-                    self.dll
-                } else {
-                    self.pump();
-                    self.rx.pop_front().unwrap_or(0)
-                }
-            }
-            uart_reg::IER => if self.dlab() { self.dlm } else { self.ier },
-            uart_reg::IIR_FCR => {
-                let v = self.iir();
-                if v & 0x0f == 0x02 {
-                    self.thr_int = false;
-                }
-                v
-            }
-            uart_reg::LCR => self.lcr,
-            uart_reg::MCR => self.mcr,
-            uart_reg::LSR => {
-                self.pump();
-                // Reading clears the error latches.
-                let v = self.lsr_now();
-                self.lsr_err = 0;
-                v
-            }
-            uart_reg::MSR => {
-                let v = self.msr_levels() | self.msr_delta;
-                self.msr_delta = 0;
-                self.msr_prev = self.msr_levels();
-                v
-            }
-            _ => self.scr,
-        }
+        self.core.read(r)
     }
 
     /// A guest's byte-wide read, with the chip's additions: the auto-flow
@@ -374,67 +253,20 @@ impl Uart {
 
     fn write(&mut self, r: u32, v: u8) {
         match r {
-            uart_reg::RBR_THR => {
-                if self.dlab() {
-                    self.dll = v;
-                } else {
-                    self.transmit(v);
-                }
-            }
-            uart_reg::IER => {
-                if self.dlab() {
-                    self.dlm = v;
-                } else {
-                    let was = self.ier;
-                    self.ier = v & 0x0f;
-                    // Enabling the transmit interrupt with the holding
-                    // register empty raises it at once.
-                    if was & 2 == 0 && self.ier & 2 != 0 {
-                        self.thr_int = true;
-                    }
-                }
-            }
-            uart_reg::IIR_FCR => {
-                self.fifo = v & 1 != 0;
-                if v & 2 != 0 {
-                    self.rx.clear();
-                }
-            }
-            uart_reg::LCR => self.lcr = v,
-            uart_reg::MCR => {
-                self.mcr_afe = v & MCR_AFE;
-                self.mcr = v & 0x1f;
-                let now = self.msr_levels();
-                let changed = (now ^ self.msr_prev) >> 4;
-                // CTS, DSR change bits straight; RI only on its trailing
-                // edge; carrier changes.
-                let mut delta = changed & 0x0b;
-                if self.msr_prev & 0x40 != 0 && now & 0x40 == 0 {
-                    delta |= 0x04;
-                }
-                self.msr_delta |= delta;
-                self.msr_prev = now;
-            }
+            uart_reg::MCR => self.mcr_afe = v & MCR_AFE,
             uart_reg::LSR => self.lsr_test = v & LSR_TEST_MASK,
             uart_reg::MSR => self.msr_test = v & MSR_TEST_MASK,
-            _ => {
-                self.scr = v;
+            uart_reg::SCR => {
                 // Scratch writes with the divisor latch up program the clock
                 // pre-divider; twice the divide wanted. 0 and 1 mean nothing.
-                if self.dlab() && v / 2 != 0 {
+                if self.core.dlab() && v / 2 != 0 {
                     self.predivider = v;
+                    self.core.set_baudbase(UART_CRYSTAL_HZ / (v / 2) as u32 / 16);
                 }
             }
+            _ => {}
         }
-    }
-
-    fn transmit(&mut self, b: u8) {
-        if self.loopback() {
-            self.push_rx(b);
-        } else {
-            self.backend.send_byte(b);
-        }
-        self.thr_int = true;
+        self.core.write(r, v);
     }
 
     /// Modem status as the ring engine reads it with flow control looped back.
@@ -515,6 +347,9 @@ struct SdmaPort {
     tx_delay_deadline: Option<Instant>,
     tx_delay_frozen: Option<Duration>,
     tx_delay_irq: bool,
+    /// An entry waits that the receive ring had no room for; drives
+    /// receive-ring-full while ring DMA is on.
+    post_refused: bool,
 }
 
 #[derive(Default)]
@@ -640,9 +475,23 @@ const PAR_FIFO_DEPTH: usize = 16;
 /// IRQ7 and DMA3.
 const PAR_CONFIG_A: u8 = 0x1f;
 const PAR_CONFIG_B: u8 = 0x0b;
-/// No peripheral on the cable: nFault high, nothing else asserted. This
-/// value is the model's choice; the register is described as "line-driven".
-const PAR_STATUS_IDLE: u8 = 0x08;
+// The status lines as the external SuperIO part reads them: bit 7 is the
+// inverse of the Busy pin, bits 6 to 3 are nAck, PError, Select and nFault as
+// the pins stand (nAck and nFault are active low). Bit 2, the part's PRINT
+// indicator, is not modelled and reads clear.
+const PAR_STATUS_NFAULT: u8 = 1 << 3;
+const PAR_STATUS_SELECT: u8 = 1 << 4;
+const PAR_STATUS_NACK: u8 = 1 << 6;
+const PAR_STATUS_BUSY: u8 = 1 << 7;
+/// Nothing on the connector: each of the five inputs sits at the level a
+/// pull-up gives it, high, and Busy high reads as a clear bit 7. The pull
+/// direction on the real boards is inferred; nothing measures an unplugged
+/// port.
+const PAR_STATUS_EMPTY: u8 = PAR_STATUS_NFAULT | PAR_STATUS_SELECT | 1 << 5 | PAR_STATUS_NACK;
+/// A ready printer: Busy low (bit 7 set), nAck, Select and nFault high, no
+/// paper error. Every host backend is taken as one that always accepts what
+/// is sent, an approximation: a file or pty never holds Busy.
+const PAR_STATUS_READY: u8 = PAR_STATUS_BUSY | PAR_STATUS_NACK | PAR_STATUS_SELECT | PAR_STATUS_NFAULT;
 
 #[derive(Default)]
 struct Parallel {
@@ -1163,14 +1012,24 @@ impl St {
         self.sdma_level(p, int::TX_RING_EMPTY, empty);
     }
 
-    /// The receive high-water mark counts ring entries; a level.
+    /// The receive high-water mark counts ring entries; a level. So is
+    /// receive-ring-full: set while ring DMA is on and an entry waits that
+    /// the ring had no room for, so an acknowledgement does not bring it back
+    /// with every refused retry, and it falls once the consumer makes room,
+    /// posted yet or not. A ring filled exactly, with nothing waiting, does
+    /// not raise it. A model choice; what the part does is not known.
     fn sdma_update_high_water(&mut self, p: usize) {
         let mask = self.sdma_mask();
         let port = &self.sdma.port[p];
         let hw = self.sdma_ctl(p) & sdma_ctl::HIGH_WATER;
         let waiting = port.reg[3].wrapping_sub(port.reg[4]) & mask;
         let level = hw != 0 && waiting / ENTRY as u32 >= hw;
+        if (port.reg[3] + ENTRY as u32) & mask != port.reg[4] & mask {
+            self.sdma.port[p].post_refused = false;
+        }
+        let full = self.sdma_ctl(p) & sdma_ctl::ENABLE != 0 && self.sdma.port[p].post_refused;
         self.sdma_level(p, int::RX_HIGH_WATER, level);
+        self.sdma_level(p, int::RX_RING_FULL, full);
     }
 
     /// Post the packer as one entry. Fails, keeping the characters, when the
@@ -1184,7 +1043,7 @@ impl St {
         };
         let next = (produce + ENTRY as u32) & mask;
         if next == consume & mask {
-            self.sdma_raise(p, int::RX_RING_FULL);
+            self.sdma.port[p].post_refused = true;
             return false;
         }
         if !self.dma_write(ring.saturating_add((produce & mask) as u64), &packer) {
@@ -1193,6 +1052,7 @@ impl St {
         }
         let port = &mut self.sdma.port[p];
         port.reg[3] = next;
+        port.post_refused = false;
         port.packed = 0;
         port.packer = [0; ENTRY];
         true
@@ -1414,9 +1274,9 @@ impl St {
     /// A passive mirror of the 16550's lines; no read side effects.
     fn sdma_shadow(&self, p: usize) -> u32 {
         let u = &self.uart[p];
-        let lsr = u.lsr_now();
-        let mcr = u.mcr;
-        let mut msr = if u.loopback() { u.msr_levels() } else { 0xb0 | u.msr_delta };
+        let lsr = u.core.lsr();
+        let mcr = u.core.mcr();
+        let mut msr = u.core.msr();
         if u.flow_cts(self.sdma_ctl(p)) {
             msr |= MSR_CTS;
         }
@@ -1491,6 +1351,7 @@ impl St {
                     port.armed = false;
                     port.drain_pending = false;
                     port.packed = 0;
+                    port.post_refused = false;
                     port.packer = [0; ENTRY];
                     port.tx_slot = 0;
                     port.tx_fetched = false;
@@ -1543,6 +1404,7 @@ impl St {
             _ => {}
         }
         self.sdma_update_tx_empty(p);
+        self.sdma_update_high_water(p);
     }
 }
 
@@ -1681,7 +1543,8 @@ impl St {
                 self.int_out.reg | if self.int_out.state { IO_STATE } else { 0 }
             }
             reg::MICROLAN => self.microlan,
-            reg::PIN_CONTROL_SET => self.pin_control,
+            // Both write aliases read the control word.
+            reg::PIN_CONTROL_SET | reg::PIN_CONTROL_CLR => self.pin_control,
             reg::PIN_DATA => self.pin_data_now(),
             0x80..=0x98 => self.par_dma_read(a),
             0x9c | 0xa0 | 0xa4 => self.kbc_read(a, c.ps2),
@@ -1959,7 +1822,9 @@ impl St {
         let p = &mut self.par;
         match r {
             0 => p.data,
-            1 => PAR_STATUS_IDLE,
+            // The lines follow the cable: a peripheral, or pull-ups on nothing.
+            1 if p.backend.is_some() => PAR_STATUS_READY,
+            1 => PAR_STATUS_EMPTY,
             2 => p.control,
             8 => {
                 if p.mode() == PAR_MODE_CONFIG {
@@ -2590,7 +2455,7 @@ impl Ioc3 {
     /// Wire the host end of serial port `port` (0 is the console): a TCP
     /// listener, a log tee, or nothing.
     pub fn set_serial_backend(&self, port: usize, backend: Arc<dyn SerialBackend>) {
-        self.sh.st.lock().uart[port].backend = backend;
+        self.sh.st.lock().uart[port].core.set_backend(backend);
     }
 
     /// Where parallel-port output goes. Without one it is dropped. No machine
@@ -2796,9 +2661,32 @@ impl Drop for Ioc3 {
     }
 }
 
+impl Ioc3 {
+    /// The header as the chip answers it, for the configuration space and
+    /// the first dwords of the register block alike. The status register
+    /// reads fast back-to-back capable beside the medium decode timing.
+    fn header_dword(&self, index: usize) -> u32 {
+        let v = self.sh.pci.read(index);
+        if index == 1 { v | PCI_STATUS_FAST_BACK << 16 } else { v }
+    }
+}
+
 impl PciBusDevice for Ioc3 {
     fn config(&self) -> &PciConfig {
         &self.sh.pci
+    }
+
+    /// The chip decodes five configuration address bits, so dwords 0x20 to
+    /// 0x3f read as 0x00 to 0x1f: no subsystem dword at 0x2c (the latency
+    /// word shows there) and no interrupt pin at 0x3d. Only the guest's
+    /// view repeats; the bridge still routes INTA from the stored pin, and
+    /// the subsystem id stays the key that picks the board's population.
+    fn config_dword(&self, index: usize) -> u32 {
+        self.header_dword(if (CONFIG_DECODED_DWORDS..2 * CONFIG_DECODED_DWORDS).contains(&index) {
+            index - CONFIG_DECODED_DWORDS
+        } else {
+            index
+        })
     }
 
     /// `off` is where the bridge put the access on the bus; IOC3 undoes the
@@ -2809,6 +2697,9 @@ impl PciBusDevice for Ioc3 {
             return 0;
         }
         let a = off ^ (4 - width.min(4) as u32);
+        if width == 4 && a <= reg::HEADER_LAST && a & 3 == 0 {
+            return self.header_dword((a / 4) as usize);
+        }
         if (reg::ENET_FIRST..=reg::ENET_LAST).contains(&a) {
             // Only 32-bit accesses reach the Ethernet block.
             if width != 4 {

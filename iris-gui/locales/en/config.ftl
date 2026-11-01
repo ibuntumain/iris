@@ -8,6 +8,7 @@ config-tab-network = Network
 config-tab-memory = Memory
 config-tab-display = Display
 config-tab-video-in = Video in
+config-tab-performance = Performance
 config-tab-debug = Debug
 config-tab-ci = Automation
 config-tab-bench = Benchmark
@@ -360,11 +361,28 @@ config-debug-rebuild-cli-tip =
 config-debug-rebuild-gui = Rebuild Premiere GUI…
 config-debug-rebuild-gui-tip =
 
-config-perf = Host performance
+## Performance
+
+config-perf-subtitle = How much of the host the emulator costs. None of this changes what the guest sees.
+config-perf-threads = Threads
 config-perf-affinity = Pin threads to cores
+config-perf-affinity-tip = Keep each emulator thread on one host core, so they don't fight over the same one. Needs a machine with at least three cores to help.
 config-perf-cpu-core = CPU thread core
 config-perf-rex3-core = Graphics thread core
 config-perf-refresh-core = Display refresh core
+config-perf-affinity-subtitle = Pinning helps on a host with cores to spare; on a two-core machine it costs more than it saves, and the emulator runs better unpinned.
+config-perf-cpu-count = Processors
+config-perf-cpus-octane-only = Only the Octane takes more than one.
+config-perf-cpus-subtitle = A second processor splits the guest's work across two emulated CPUs. Useful for an IRIX that can use it, and twice the host cost.
+config-perf-jit = JIT compilation
+config-perf-jit-subtitle = More compile threads build pages faster while the guest runs; one is enough on a small host, where extra threads only compete with the emulated CPU.
+config-perf-vnc = VNC server
+config-vnc-listen = Serve on
+config-vnc-listen-hint = Off, or host:port
+config-vnc-listen-tip = A port number serves 127.0.0.1; host:port serves that address. Anyone who can reach it controls the guest, so keep it on the loopback: the server has no password.
+config-vnc-max-fps = Frame rate
+config-vnc-max-fps-tip = How often the server sends a frame while a viewer is connected. Lower costs less host CPU.
+config-perf-vnc-subtitle = The guest's screen over the network, with keyboard and mouse. Starts with the machine and stops with it.
 
 ## Perfetto
 
@@ -405,3 +423,16 @@ config-octane-flash-tip = Keeps the PROM's saved records between runs. Created f
 config-octane-graphics-none = None
 config-octane-graphics-subtitle = The Octane models IMPACT as SI (Solid), SI with texture option (High) and MXI (Maximum), or no graphics board and a serial console.
 config-ram-banks-octane-subtitle = Each bank is a pair of DIMMs of 64, 128, 256 or 512 MB. Fill the banks from bank 0 with no gaps.
+
+## O2
+
+config-o2-subtitle = An R5000 or R10000 at 180 MHz. Like the Octane it has no built-in PROM: it boots from an IP32 image.
+config-o2-prom-warning = An O2 needs its own PROM image (IP32). There is no built-in PROM to fall back on.
+config-o2-section = O2 options
+config-o2-section-subtitle =
+config-o2-mouse = PS/2 mouse
+config-o2-mouse-tip = A mouse on the O2's second PS/2 port, alongside the graphics console.
+config-o2-control-port = Control port
+config-o2-control-port-tip = A TCP port on 127.0.0.1 for driving the machine from a script: screenshots, keys, the mouse. Leave it 0 for none.
+config-o2-arcs-fpu = FPU in ARCS
+config-o2-arcs-fpu-tip = Report the FPU to the PROM firmware. Off for a machine IRIX 6.5 must run without one.

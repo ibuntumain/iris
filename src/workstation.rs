@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use crate::config::MachineConfig;
 use crate::gdb_stub::CpuDebug;
 use crate::dev::ps2::Ps2Controller;
-use crate::dev::z85c30::CiSerialBackend;
+use crate::dev::serial_host::CiSerialBackend;
 use crate::gfx_display::GfxDisplay;
 use crate::hptimer::TimerManager;
 use crate::machine::Machine;
@@ -164,6 +164,12 @@ pub trait Workstation: Send {
     /// The kernel's clock-tick counter: its rate over wall time is the guest's
     /// Hz in the status bars.
     fn fasttick_count(&self) -> Arc<AtomicU64>;
+    /// Every CPU's retired-cycle counter and clock-tick counter, CPU 0 first,
+    /// for the front-end's MIPS and Hz. A machine with one CPU needs no more
+    /// than the default.
+    fn cpu_counters(&self) -> Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)> {
+        self.get_display().map(|d| (d.cycles(), self.fasttick_count())).into_iter().collect()
+    }
 
     /// The in-process serial console backend installed in CI mode.
     fn get_ci_serial(&self) -> Option<Arc<CiSerialBackend>>;
@@ -216,6 +222,10 @@ pub trait Workstation: Send {
     fn pending_chd_sync_count(&self) -> usize {
         0
     }
+    /// Make every disk's accepted writes survive the process, including a
+    /// copy-on-write overlay's record of the sectors it holds. Run it before
+    /// the process exits without dropping the machine.
+    fn flush_disks(&self) -> std::io::Result<()>;
     /// Fold pending CHD diffs into their bases (see `Machine::sync_chd_disks`).
     fn sync_chd_disks(
         &self,
@@ -226,6 +236,11 @@ pub trait Workstation: Send {
         Ok(0)
     }
 
+    /// The count of guest frames every network backend feeds, for the GUI's
+    /// network indicator.
+    fn net_frames(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        None
+    }
     /// The NAT engine's controls, when the machine's Ethernet runs on it.
     fn nat_control(&self) -> Option<Arc<NatControl>> {
         None
@@ -258,9 +273,9 @@ impl dyn Workstation + '_ {
     // The NAT controls by name, for embedders. Each is a no-op (or reports
     // nothing) on a machine without a NAT.
 
-    /// Guest-originated Ethernet frames the NAT has processed so far.
+    /// Guest-originated Ethernet frames the network backend has processed so far.
     pub fn net_guest_frames(&self) -> u64 {
-        self.nat_control().map_or(0, |n| n.guest_frames())
+        self.net_frames().map_or(0, |f| f.load(std::sync::atomic::Ordering::Relaxed))
     }
     /// The guest's own source IP as last seen on the wire.
     pub fn net_observed_guest_ip(&self) -> Option<Ipv4Addr> {
@@ -357,8 +372,296 @@ unsafe impl Sync for MachineRef {}
 /// instead of freed memory.
 pub type MachineSlot = Arc<Mutex<MachineRef>>;
 
+/// Stop `machine` and flush its disks: what every path that ends the process
+/// without dropping the machine does first. A failed flush is reported, not
+/// fatal, since the process is going away either way.
+pub fn stop_and_flush(machine: &mut dyn Workstation, at: &str) -> Flushed {
+    stop_flushing(machine, |m| m.stop(), |m| m.flush_disks(), at);
+    Flushed(())
+}
+
+/// What [`exit_process`] asks its caller's work to return, so that handing it
+/// nothing does not compile. A nudge in the type, not a proof: `flushed` is
+/// public and will vouch for any result, so what the work really does is for
+/// the machine tests to check.
+#[must_use]
+pub struct Flushed(());
+
+/// Report a flush's failure and vouch for it, for code that flushes a bus
+/// itself (see [`exit_process`]).
+pub fn flushed(result: std::io::Result<()>, at: &str) -> Flushed {
+    if let Err(e) = result {
+        eprintln!("iris: disk flush at {at} failed: {e} (guest writes may be lost)");
+    }
+    Flushed(())
+}
+
+/// [`stop_and_flush`]'s order: flush, stop, flush. The first flush is for a
+/// stop that hangs in some device: the process is then killed, and the writes
+/// made before the stop are already safe. It costs nothing when there is
+/// nothing new.
+fn stop_flushing<M: ?Sized>(
+    machine: &mut M,
+    stop: impl FnOnce(&mut M),
+    flush: impl Fn(&M) -> std::io::Result<()>,
+    at: &str,
+) {
+    let report = |r: std::io::Result<()>| {
+        if let Err(e) = r {
+            eprintln!("iris: disk flush at {at} failed: {e} (guest writes may be lost)");
+        }
+    };
+    report(flush(machine));
+    stop(machine);
+    report(flush(machine));
+}
+
+#[cfg(test)]
+#[test]
+fn stop_and_flush_flushes_before_the_stop_and_after() {
+    let log = std::cell::RefCell::new(Vec::new());
+    stop_flushing(
+        &mut (),
+        |_| log.borrow_mut().push("stop"),
+        |_| {
+            log.borrow_mut().push("flush");
+            Ok(())
+        },
+        "test",
+    );
+    assert_eq!(*log.borrow(), ["flush", "stop", "flush"]);
+}
+
+/// Flush a machine's disks as it is dropped. The disks hold on to their
+/// overlays through handles the devices share with threads and tables that can
+/// outlive the machine, so the machine cannot count on its disks' own `Drop`
+/// to write the overlay's sector record.
+pub(crate) fn flush_on_drop(machine: &dyn Workstation) {
+    if let Err(e) = machine.flush_disks() {
+        eprintln!("iris: disk flush at drop failed: {e} (guest writes may be lost)");
+    }
+}
+
+/// [`stop_and_flush`] for the machine behind `slot`, if it is still there.
+pub fn stop_and_flush_slot(slot: &MachineSlot, at: &str) -> Flushed {
+    if let Err(e) = with_machine_slot(slot, |m| stop_and_flush(m, at)) {
+        eprintln!("iris: could not stop the machine to flush its disks at {at}: {e}");
+    }
+    Flushed(())
+}
+
+/// What the terminal console runs when the monitor hangs up (`quit`): stop and
+/// flush the machine behind `slot`, then end the process.
+pub fn console_quit(slot: MachineSlot) -> impl FnOnce() + Send + 'static {
+    move || exit_process("console quit", 0, || stop_and_flush_slot(&slot, "console quit"))
+}
+
+/// End the process on SIGINT (Ctrl-C at the terminal), SIGTERM or SIGHUP the
+/// way `quit` does: stop and flush the machine behind `slot`, then exit with
+/// 128 plus the signal number. Without this the signal's default action ends
+/// the process with nothing flushed: a CHD loses what it took since its last
+/// flush, and an overlay's sector record is left uncompacted.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn exit_on_signal(slot: MachineSlot) {
+    on_exit_signal(move |sig| {
+        // Not eprintln!: on a terminal that has hung up it panics, and a panic
+        // aborts the process before anything is flushed.
+        let _ = writeln!(std::io::stderr(), "iris: signal {sig}: stopping the machine and flushing its disks before exit");
+        exit_process("signal", 128 + sig, || stop_and_flush_slot(&slot, "signal"));
+    });
+}
+
+/// Run `on_signal` once, on a thread of its own, when SIGINT, SIGTERM or
+/// SIGHUP arrives, in place of the default action that ends the process at
+/// once. It is handed the signal number and is expected to end the process
+/// after stopping its machines, as [`exit_on_signal`] does.
+///
+/// A signal the process inherited as ignored stays ignored: `nohup` ignores
+/// SIGHUP, and a shell ignores SIGINT for a background job, so that the
+/// process outlives the terminal.
+///
+/// The handler only writes the signal number to a pipe; the thread reads it
+/// and does the work, since a handler can do almost nothing safely. The
+/// thread puts the default actions back first, so a second Ctrl-C ends a
+/// stop that hangs. A process has one of these: a second call is refused.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn on_exit_signal(on_signal: impl FnOnce(libc::c_int) + Send + 'static) {
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    static PIPE: AtomicI32 = AtomicI32::new(-1);
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        eprintln!("iris: the exit-signal handler is already installed; not installing another");
+        return;
+    }
+    let signals = exit_signals_to_catch();
+
+    extern "C" fn handler(sig: libc::c_int) {
+        let byte = sig as u8;
+        // SAFETY: write(2) is async-signal-safe; errno is put back for the
+        // code the signal interrupted.
+        unsafe {
+            let errno = *errno_location();
+            libc::write(PIPE.load(Ordering::Relaxed), &byte as *const u8 as *const libc::c_void, 1);
+            *errno_location() = errno;
+        }
+    }
+
+    let mut fds = [-1; 2];
+    // SAFETY: `fds` is two ints, as pipe(2) needs. Close-on-exec, so no
+    // program iris starts holds the pipe.
+    if unsafe {
+        libc::pipe(fds.as_mut_ptr()) != 0
+            || libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) != 0
+            || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) != 0
+    } {
+        eprintln!("iris: no pipe for the signal handler ({}); a signal will not flush the disks",
+                  std::io::Error::last_os_error());
+        return;
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    PIPE.store(write_fd, Ordering::Relaxed);
+    let thread_signals = signals.clone();
+    let thread = std::thread::Builder::new().name("iris-signals".into()).spawn(move || {
+        let signals = thread_signals;
+        let mut byte = 0u8;
+        loop {
+            // SAFETY: reads one byte into `byte`.
+            let n = unsafe { libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
+            if n == 1 {
+                break;
+            }
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        for &sig in &signals {
+            // SAFETY: restores a default action.
+            unsafe { libc::signal(sig, libc::SIG_DFL) };
+        }
+        // A hangup means the terminal is gone and its descriptors fail with
+        // EIO, which makes any print from any thread panic, and so abort the
+        // process, part way through the flush. Point them at /dev/null.
+        if libc::c_int::from(byte) == libc::SIGHUP {
+            silence_output(&[1, 2]);
+        }
+        on_signal(libc::c_int::from(byte));
+    });
+    if let Err(e) = thread {
+        eprintln!("iris: no thread for the signal handler ({e}); a signal will not flush the disks");
+        return;
+    }
+    for &sig in &signals {
+        // SAFETY: installs a handler that only calls write(2).
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handler as *const () as usize;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Point each of `fds` at /dev/null, so writing to it succeeds whatever became
+/// of what it was.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn silence_output(fds: &[libc::c_int]) {
+    // SAFETY: opens /dev/null, duplicates it over each descriptor and closes it.
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if null < 0 {
+            return;
+        }
+        for &fd in fds {
+            libc::dup2(null, fd);
+        }
+        libc::close(null);
+    }
+}
+
+/// SIGINT, SIGTERM and SIGHUP, less any this process inherited as ignored.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn exit_signals_to_catch() -> Vec<libc::c_int> {
+    [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+        .into_iter()
+        .filter(|&sig| {
+            // SAFETY: a null new action only reads the current one.
+            let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+            unsafe { libc::sigaction(sig, std::ptr::null(), &mut old) };
+            old.sa_sigaction != libc::SIG_IGN
+        })
+        .collect()
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn an_inherited_ignored_signal_stays_ignored() {
+    // SAFETY: sets and reads back dispositions; SIGHUP is put back as found.
+    let before = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    let caught = exit_signals_to_catch();
+    unsafe { libc::signal(libc::SIGHUP, before) };
+    assert!(!caught.contains(&libc::SIGHUP), "nohup's ignored SIGHUP would end the process");
+    assert!(caught.contains(&libc::SIGTERM));
+}
+
+/// The terminal hangs up: its slave side fails with EIO once the master is
+/// closed, as a stderr that eprintln! would panic on. After `silence_output`
+/// the same descriptor takes writes.
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn a_hung_up_terminals_output_is_silenced() {
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty fills two descriptors; the rest is plain fd handling.
+    unsafe {
+        assert_eq!(libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()), 0);
+        libc::close(master);
+        let put = |fd: libc::c_int| libc::write(fd, b"x".as_ptr().cast(), 1);
+        assert_eq!(put(slave), -1, "a pty with no master should fail the write");
+        silence_output(&[slave]);
+        assert_eq!(put(slave), 1, "the silenced descriptor should take the write");
+        libc::close(slave);
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+/// How many exits `IRIS_NO_EXIT_ON_POWEROFF` has turned into returns, for the
+/// tests that wait for one.
+#[cfg(test)]
+pub(crate) static EXIT_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// End the process. This is the only place machine and device code may call
+/// `std::process::exit`: it skips every Drop, which is where a copy-on-write
+/// overlay would otherwise write its sector record, so the caller has to hand
+/// in `stop_and_flush`, the work that makes the guest's writes durable
+/// (`stop_and_flush`, `stop_and_flush_slot`, or `flushed` around a bus's
+/// `flush_disks`), whose [`Flushed`] result the type requires. It runs first,
+/// then the process exits unless `IRIS_NO_EXIT_ON_POWEROFF` is set, the escape
+/// hatch for hosts that embed iris and for tests. That variable suppresses
+/// every exit through here, the terminal console's `quit` too. A guard test
+/// fails on any other `process::exit` in the library.
+pub fn exit_process(at: &str, code: i32, stop_and_flush: impl FnOnce() -> Flushed) {
+    let Flushed(()) = stop_and_flush();
+    if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
+        eprintln!("iris: exit at {at} suppressed (IRIS_NO_EXIT_ON_POWEROFF)");
+        #[cfg(test)]
+        EXIT_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    std::process::exit(code);
+}
+
 /// Run `f` against the machine behind `slot`, or fail if it has been dropped.
-pub(crate) fn with_machine_slot<R>(slot: &MachineSlot, f: impl FnOnce(&mut dyn Workstation) -> R) -> Result<R, String> {
+pub fn with_machine_slot<R>(slot: &MachineSlot, f: impl FnOnce(&mut dyn Workstation) -> R) -> Result<R, String> {
     let guard = slot.lock();
     let ptr = guard.0;
     if ptr.is_null() {
@@ -394,27 +697,30 @@ pub(crate) fn register_system_controller(
     if let Some(rx) = events {
         std::thread::Builder::new().name("machine-events".to_string()).spawn(move || {
             while let Ok(event) = rx.recv() {
-                let _ = ctrl.with_machine(|machine| {
-                    match event {
-                        MachineEvent::HardReset => {
+                match event {
+                    MachineEvent::HardReset => {
+                        let _ = ctrl.with_machine(|machine| {
                             println!("Machine: SIN hard reset");
                             machine.reset();
                             machine.cpu_start();
-                        }
-                        MachineEvent::PowerOff => {
-                            println!("Machine: soft power-off");
-                            machine.stop();
-                            // Hosts that embed iris as a library (e.g. iris-gui)
-                            // set IRIS_NO_EXIT_ON_POWEROFF=1 so a guest halt
-                            // does not kill the host process.
-                            #[cfg(not(feature = "developer"))]
-                            if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
-                                std::process::exit(0);
-                            }
-                        }
+                            Ok(())
+                        });
                     }
-                    Ok(())
-                });
+                    MachineEvent::PowerOff => {
+                        println!("Machine: soft power-off");
+                        // The process may exit below without dropping the
+                        // disks, and an overlay's sector record is only
+                        // written out on a flush.
+                        let flush = || stop_and_flush_slot(&ctrl.machine, "power-off");
+                        // Hosts that embed iris as a library (e.g. iris-gui)
+                        // set IRIS_NO_EXIT_ON_POWEROFF=1 so a guest halt
+                        // does not kill the host process.
+                        #[cfg(not(feature = "developer"))]
+                        exit_process("power-off", 0, flush);
+                        #[cfg(feature = "developer")]
+                        let _ = flush();
+                    }
+                }
             }
         }).unwrap();
     }

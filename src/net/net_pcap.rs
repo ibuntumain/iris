@@ -7,7 +7,7 @@
 // other machines, etc.
 //
 // Wiring is identical to NatEngine: it owns the same rtrb ring endpoints and
-// wake condvars, runs on the "seeq-nat" thread, and implements NetBackend.
+// wake condvars, runs on the "seeq-net" thread, and implements NetBackend.
 //
 // Library / licensing note:
 //   The `pcap` crate links the generic `wpcap` import library on Windows (NOT a
@@ -138,7 +138,7 @@ fn select_interface(configured: &Option<String>) -> Result<String, String> {
     // No interface configured: auto-pick. Interactive selection (the numbered
     // menu shown when no interface is set) is done once at CLI startup on the
     // main thread via `prompt_for_interface`, NOT here — this runs on the
-    // seeq-nat thread during machine boot, where it can't gate startup and
+    // seeq-net thread during machine boot, where it can't gate startup and
     // (on Windows especially) a background-thread stdin read returns EOF
     // immediately, so a prompt here would just flash the menu and auto-pick.
     auto_pick(&ifaces)

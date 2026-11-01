@@ -147,11 +147,17 @@ fn descriptor_bank_storage() {
         wr(&r, off, v);
         assert_eq!(rd(&r, off), v);
     }
-    // Words in the bank that belong to no supported ring are refused.
-    wr(&r, 0x420, 7);
-    assert_eq!(rd(&r, 0x420), 0);
+    // Every descriptor RAM entry (0x400 + 12 i, 16 of them) is stored; past
+    // them, words that belong to no supported ring are refused.
+    for i in 0..16u32 {
+        wr(&r, 0x408 + 12 * i, 0x100 + i);
+        assert_eq!(rd(&r, 0x408 + 12 * i), 0x100 + i, "entry {i}");
+    }
+    wr(&r, 0x4c4, 7);
+    assert_eq!(rd(&r, 0x4c4), 0);
     r.reset();
     assert_eq!(rd(&r, 0x500), 0);
+    assert_eq!(rd(&r, 0x420), 0);
 }
 
 #[test]
@@ -439,6 +445,113 @@ fn input_ring_records_silence() {
     assert_eq!(word(&ram, 0x11_0000 + 352), 0xaaaa_aaaa);
 }
 
+/// Program clock generator `cg` as both drivers do: hold it in reset, pick
+/// its master clock, write the remainder word, then the control word that
+/// names it, and release it.
+fn set_clock(r: &Rad1, cg: u32, mux: u32, rem: u32, ictl_low: u32) {
+    wr(r, 0x80, 0xffe2_0000 | (0x100 << cg));
+    wr(r, 0xa8 + 4 * (3 - cg), mux);
+    wr(r, 0xa4, rem);
+    wr(r, 0xa0, (0x1000_0000 << cg) | ictl_low);
+    wr(r, 0x80, 0xffe2_0000);
+}
+
+/// Output frames counted after `ns` of a fresh output channel.
+fn output_frames_after(r: &Rad1, ns: i64) -> u32 {
+    program(r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    wr(r, 0x58, 0x2000_0001);
+    at(r, ns);
+    rd(r, 0x2c) >> 18
+}
+
+// The words IRIX 6.5.30 writes to the output's generator (1) for each rate,
+// captured from the guest; all of them use the 192 kHz master (select 1).
+const IRIX_DTOA_WORDS: [(u32, u32, u32); 7] = [
+    (48000, 0x0000_ffff, 0x603),
+    (44100, 0x0034_ff6d, 0x603),
+    (32000, 0x0000_ffff, 0x605),
+    (22050, 0x0068_ff6d, 0x207),
+    (16000, 0x0000_ffff, 0x60b),
+    (11025, 0x003d_ff6d, 0x610),
+    (8000, 0x0000_ffff, 0x617),
+];
+
+#[test]
+fn the_output_runs_at_its_clock_generator_rate() {
+    for (hz, rem, ictl) in IRIX_DTOA_WORDS {
+        let (r, _ram) = dma_card();
+        start_ust(&r);
+        set_clock(&r, 1, 1, rem, ictl);
+        // 100 ms is a whole number of frames at every rate in the table.
+        assert_eq!(output_frames_after(&r, 100_000_000), hz / 10, "{hz} Hz");
+    }
+}
+
+#[test]
+fn the_44k_master_divides_from_176400() {
+    // The Linux driver's choice for 44.1 kHz rates: master 0, no remainder.
+    let (r, _ram) = dma_card();
+    set_clock(&r, 1, 0, 0x0000_ffff, 0x607);
+    assert_eq!(output_frames_after(&r, 100_000_000), 2205);
+}
+
+#[test]
+fn generator_0_clocks_the_input_and_not_the_output() {
+    let (r, _ram) = dma_card();
+    set_clock(&r, 0, 1, 0x0000_ffff, 0x617);
+    program(&r, &RING_INPUT, 0x11_0000, 0xffff_f000);
+    wr(&r, 0x4c, 1);
+    assert_eq!(output_frames_after(&r, 100_000_000), 4410, "output keeps 44.1 kHz");
+    assert_eq!(rd(&r, 0x14) >> 18, 800, "input at 8 kHz");
+}
+
+#[test]
+fn a_control_word_naming_no_generator_changes_no_rate() {
+    let (r, _ram) = dma_card();
+    set_clock(&r, 1, 1, 0x0000_ffff, 0x617);
+    // IRIX writes these between rate changes; no generator bit is set.
+    wr(&r, 0xa4, 0x0068_ff6d);
+    wr(&r, 0xa0, 0x0200_0004);
+    assert_eq!(rd(&r, 0xa0), 0x0200_0004, "still stored");
+    assert_eq!(output_frames_after(&r, 100_000_000), 800);
+}
+
+#[test]
+fn a_rate_change_while_running_takes_effect_from_then() {
+    let (r, _ram) = dma_card();
+    start_ust(&r);
+    assert_eq!(output_frames_after(&r, 100_000_000), 4410);
+    set_clock(&r, 1, 1, 0x0068_ff6d, 0x207);
+    at(&r, 200_000_000);
+    assert_eq!(rd(&r, 0x2c) >> 18, 4410 + 2205);
+    // A's UST stamp is the last frame's boundary at the new rate.
+    let boundary = 100_000_000 + (2205u64 * 1_000_000_000).div_ceil(22050) as i64;
+    assert_eq!(rd(&r, 0x2c) & 0x3ffff, (boundary / 960) as u32 & 0x3ffff);
+}
+
+#[test]
+fn reset_returns_the_generators_to_the_default_rate() {
+    let (r, _ram) = dma_card();
+    set_clock(&r, 1, 1, 0x0000_ffff, 0x617);
+    r.reset();
+    assert_eq!(output_frames_after(&r, 100_000_000), 4410);
+}
+
+#[test]
+fn the_wav_capture_stays_at_44100_whatever_the_card_rate() {
+    let dir = std::env::temp_dir().join(format!("rad1-wav-rate-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("o.wav");
+    let mut sink = Sink { host: None, host_failed_at: None, wav: Wav::create(path.as_os_str()), tap: None };
+    sink.play(&[0i16; 2 * 2205], 22050, false);
+    sink.play(&[0i16; 2 * 4410], 44100, false);
+    let b = std::fs::read(&path).unwrap();
+    assert_eq!(u32::from_le_bytes(b[24..28].try_into().unwrap()), 44100);
+    let frames = u32::from_le_bytes(b[40..44].try_into().unwrap()) / 4;
+    assert!((8818..=8822).contains(&frames), "{frames} frames for 200 ms");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn aes_subcode_runs_at_250_hz_without_a_position_latch() {
     let (r, ram) = dma_card();
@@ -492,7 +605,9 @@ fn status_schedule_restarts_when_far_behind() {
     wr(&r, 0x5c, 0x40003 | (3300 << 2));
     let gen = r.state.lock().status_gen;
     at(&r, 1_000_000_000);
-    assert_eq!(r.status_tick(gen), Some(1_000_100_000));
+    // A second late is a hold-up; 200 ms of it is held back and the rest
+    // credited, so the schedule restarts from there.
+    assert_eq!(r.status_tick(gen), Some(1_000_000_000 - 200_000_000 + 100_000));
 }
 
 #[test]
@@ -552,14 +667,22 @@ fn the_clock_stands_still_while_paused() {
     r.fake_ns.store(i64::MIN, Ordering::Relaxed);
     start_ust(&r);
     r.pause();
+    let before = std::time::Instant::now();
     let ust = rd(&r, 0x30);
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(rd(&r, 0x30), ust, "no UST ticks while paused");
     r.resume();
-    std::thread::sleep(Duration::from_millis(2));
-    let ticks = rd(&r, 0x30).wrapping_sub(ust);
-    // About 2 ms of 960 ns ticks, short of the 22 ms slept in all.
-    assert!(ticks > 0 && ticks < 20_000, "{ticks} ticks");
+    let mut ticks = 0;
+    assert!(eventually(|| {
+        ticks = rd(&r, 0x30).wrapping_sub(ust);
+        ticks > 0
+    }), "the clock runs again after the resume");
+    // The card's time since the first read cannot include the 20 ms slept
+    // stopped, however long the host took to get here: the host's own span
+    // less that sleep bounds it. (A bound on the wall clock alone fails
+    // whenever a loaded host oversleeps.)
+    let host_ns = before.elapsed().as_nanos() as u64 - 20_000_000;
+    assert!(u64::from(ticks) * 960 <= host_ns + 960, "{ticks} ticks in {host_ns} ns of running time");
 }
 
 /// A card on the real clock with the machine's timers, started, and a
@@ -577,15 +700,24 @@ fn timed_card() -> (Rad1, Arc<Ram>, Arc<TimerManager>) {
     (r, ram, tm)
 }
 
+/// Poll `done` until it holds, giving up after a minute. Timer callbacks run
+/// on another thread and the suite runs many cards at once, so a wait counted
+/// in sleeps or milliseconds gives up on a busy host before the callback has
+/// had a core; the deadline only has to catch a callback that never comes.
+fn eventually(mut done: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + Duration::from_secs(60);
+    while !done() {
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
 /// Poll the schedule's own counter, which no guest register read touches.
 fn wait_done(r: &Rad1, n: u64) -> bool {
-    for _ in 0..500 {
-        if r.state.lock().status_done >= n {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    false
+    eventually(|| r.state.lock().status_done >= n)
 }
 
 /// A started status schedule delivers completions from the timer with no
@@ -643,8 +775,7 @@ fn the_output_pump_runs_only_while_the_channel_does() {
     wr(&r, 0x58, 0x2000_0001);
     assert!(r.state.lock().audio_timer.is_some());
     // The pump moves frames the guest never asked about.
-    std::thread::sleep(Duration::from_millis(40));
-    assert!(r.state.lock().chan[CH_OUT].frames > 0);
+    assert!(eventually(|| r.state.lock().chan[CH_OUT].frames > 0), "the pump never ran");
     Device::stop(&r);
     assert!(r.state.lock().audio_timer.is_none(), "stop removes it");
     Device::start(&r);
@@ -744,7 +875,7 @@ fn host_frames_encode_into_ring_frames() {
 fn output_ring_reaches_the_sink() {
     let (r, ram) = dma_card();
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, wav: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, tap: Some(tap.clone()) });
     // A 512-frame ring (4 KiB), each frame left = n, right = -n.
     {
         let mut m = ram.0.lock().unwrap();
@@ -782,7 +913,7 @@ fn output_ring_reaches_the_sink() {
 fn input_ring_is_not_played() {
     let (r, _ram) = dma_card();
     let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    *r.sink.lock() = Some(Sink { host: None, wav: None, tap: Some(tap.clone()) });
+    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, tap: Some(tap.clone()) });
     program(&r, &RING_INPUT, 0x11_0000, 0xffff_f000);
     wr(&r, 0x4c, 1);
     at(&r, 1_000_000);
@@ -883,4 +1014,262 @@ fn a_recorded_adat_frame_plays_back_unchanged() {
     let mut back = [0i16; 4];
     frames_to_pcm(&ring, &mut back, ADAT_WORDS);
     assert_eq!(back, pcm);
+}
+
+#[test]
+fn a_failed_host_open_is_retried_after_a_wait() {
+    let now = Instant::now();
+    let mut sink = Sink { host: None, host_failed_at: None, wav: None, tap: None };
+    assert!(sink.host_retry_due(now), "never tried");
+    sink.host_failed_at = Some(now);
+    assert!(!sink.host_retry_due(now), "just failed");
+    assert!(sink.host_retry_due(now + HOST_RETRY), "due again later");
+}
+
+const SEC: i64 = 1_000_000_000;
+
+fn tapped(r: &Rad1) -> Arc<parking_lot::Mutex<Vec<i16>>> {
+    let tap = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    *r.sink.lock() = Some(Sink { host: None, host_failed_at: None, wav: None, tap: Some(tap.clone()) });
+    tap
+}
+
+#[test]
+fn the_output_follows_the_generator_0x58_names() {
+    // Generator 2 is 32 kHz from the 192 kHz master and 29.4 kHz from the
+    // default one. The Octane PROM loads it, then selects the master.
+    let (r, _ram) = dma_card();
+    let tap = tapped(&r);
+    wr(&r, 0xa4, 0xffff);
+    wr(&r, 0xa0, 0x4000_0405);
+    wr(&r, 0xac, 1);
+    program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    wr(&r, 0x58, 0x2000_0001);
+    at(&r, SEC / 100);
+    rd(&r, 0x18);
+    assert_eq!(tap.lock().len(), 441 * 2, "generator 1 stays at 44.1 kHz");
+    // Switching to generator 2 while running counts from then at 32 kHz.
+    wr(&r, 0x58, 0x4000_0001);
+    at(&r, 2 * SEC / 100);
+    rd(&r, 0x18);
+    assert_eq!(tap.lock().len(), (441 + 320) * 2);
+}
+
+#[test]
+fn analog_output_enable_takes_only_the_two_known_selects() {
+    let r = card();
+    for v in [0x4000_0000, 0x2000_0000] {
+        wr(&r, 0x58, v);
+        assert_eq!(rd(&r, 0x58), v);
+    }
+    wr(&r, 0x58, 0x4000_0000);
+    for v in [0x6000_0000, 0x0000_0000, 0x4000_0002] {
+        wr(&r, 0x58, v);
+        assert_eq!(rd(&r, 0x58), 0x4000_0000, "{v:#x} is unsupported");
+    }
+    wr(&r, 0x58, 0x4000_0001);
+    assert_eq!(rd(&r, 0x58), 0x4000_0000, "no ring programmed");
+}
+
+// The Octane PROM's boot tune: one end-of-descriptor buffer on generator 2.
+
+const TUNE_BUF: u64 = 0x10_0000;
+/// 4504 units of 128 bytes (72,064 frames), end of descriptor set.
+const TUNE_CTRL: u32 = 0xfff7_3404;
+const TUNE_FRAMES: usize = 72_064;
+
+/// A card with a tap on what it plays.
+fn tune_card() -> (Rad1, Arc<Ram>, Arc<parking_lot::Mutex<Vec<i16>>>) {
+    let (r, ram) = dma_card();
+    let tap = tapped(&r);
+    (r, ram, tap)
+}
+
+/// The PROM's writes that matter: load generator 2, select the master after
+/// the load, program the buffer and start.
+fn prom_tune(r: &Rad1, ctrl: u32) {
+    wr(r, 0xa4, 0x0000_ffff);
+    wr(r, 0x58, 0x4000_0000);
+    wr(r, 0xa0, 0x4000_0405);
+    wr(r, 0xac, 1);
+    wr(r, 0x4c, 0x0300_0000);
+    wr(r, 0x524, 0);
+    wr(r, 0x4f8, TUNE_BUF as u32);
+    wr(r, 0x4fc, ctrl);
+    wr(r, 0x58, 0x4000_0001);
+}
+
+#[test]
+fn the_prom_tune_plays_once_at_32khz_and_clears_the_enable_bit() {
+    let (r, _ram, tap) = tune_card();
+    prom_tune(&r, TUNE_CTRL);
+    at(&r, SEC);
+    assert_eq!(rd(&r, 0x58), 0x4000_0001, "still busy");
+    assert_eq!(tap.lock().len(), 32_000 * 2);
+    // One pass is 2.252 s.
+    at(&r, 2_240 * SEC / 1000);
+    assert_eq!(rd(&r, 0x58) & 1, 1);
+    at(&r, 2_260 * SEC / 1000);
+    assert_eq!(rd(&r, 0x58), 0x4000_0000, "the channel cleared the bit itself");
+    at(&r, 10 * SEC);
+    rd(&r, 0x58);
+    assert_eq!(tap.lock().len(), TUNE_FRAMES * 2, "exactly one pass");
+}
+
+#[test]
+fn a_link_to_an_unprogrammed_descriptor_plays_one_lap_and_stops() {
+    let (r, _ram, tap) = tune_card();
+    // Bit 2 clear, next index 0, and descriptor RAM entry 0 never written.
+    prom_tune(&r, 0xfff7_3400);
+    at(&r, 10 * SEC);
+    rd(&r, 0x58);
+    assert_eq!(tap.lock().len(), TUNE_FRAMES * 2, "the first lap only");
+    assert_eq!(rd(&r, 0x58) & 1, 1, "nothing is reported as finished");
+    assert!(r.state.lock().chan[CH_OUT].stalled);
+}
+
+#[test]
+fn a_link_loads_the_descriptor_ram_entry_it_names() {
+    for entry in [1u32, 3, 7] {
+        let (r, _ram, tap) = tune_card();
+        // The first 512 frames link to `entry`, which holds 256 frames
+        // elsewhere with end of descriptor.
+        for (i, v) in [0x20_0000, 0, 0xffff_f804].into_iter().enumerate() {
+            wr(&r, 0x400 + 12 * entry + 4 * i as u32, v);
+        }
+        prom_tune(&r, 0xffff_f000 | entry << 3);
+        at(&r, SEC);
+        assert_eq!(rd(&r, 0x58), 0x4000_0000, "entry {entry} ended the transfer");
+        assert_eq!(tap.lock().len(), (512 + 256) * 2, "entry {entry}");
+        assert!(!r.state.lock().chan[CH_OUT].stalled);
+    }
+}
+
+#[test]
+fn the_relay_and_dac_mute_words_silence_the_output_but_not_the_transfer() {
+    let path = std::env::temp_dir().join(format!("rad1-mute-{}.wav", std::process::id()));
+    // The relay (0x88) and the DAC (0x8c): the word that mutes, the word that releases.
+    for (reg, mute, release) in [(0x88, 2, 3), (0x8c, 3, 2)] {
+        let (r, ram, tap) = tune_card();
+        ram.0.lock().unwrap()[0x10_0000..0x10_1000].fill(0x55);
+        r.sink.lock().as_mut().unwrap().wav = Wav::create(path.as_os_str());
+        program(&r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+        wr(&r, 0x58, 0x2000_0001);
+        let wav_at = |ms: i64| {
+            at(&r, ms * SEC / 1000);
+            rd(&r, 0x58);
+            std::fs::read(&path).unwrap()
+        };
+        let a = wav_at(10);
+        assert!(a[44..].iter().any(|&b| b != 0), "not muted at power-on");
+        wr(&r, reg, mute);
+        let b = wav_at(20);
+        assert!(b.len() > a.len() && b[a.len()..].iter().all(|&x| x == 0), "{reg:#x} silences");
+        wr(&r, reg, release);
+        let c = wav_at(30);
+        assert!(c[b.len()..].iter().any(|&x| x != 0), "{reg:#x} releases");
+        assert!(r.state.lock().chan[CH_OUT].running && tap.lock().len() > 2 * 441 * 2);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+thread_local! {
+    /// The consumer end of the ring `slow_host` opened: the test plays it.
+    static HOST_RING: std::cell::RefCell<Option<rtrb::Consumer<i16>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A host stream that takes 300 ms to open, as a first launch on macOS can:
+/// the card's clock runs on meanwhile. 32 kHz, so the tune passes through
+/// unresampled, with the card's 200 ms ring.
+fn slow_host(card: &Inner, _: &crate::config::AudioConfig) -> Option<HostOut> {
+    card.fake_ns.fetch_add(300 * SEC / 1000, Ordering::Relaxed);
+    let (p, c) = rtrb::RingBuffer::new(32_000 * 2 / 5);
+    HOST_RING.with(|h| *h.borrow_mut() = Some(c));
+    Some(HostOut::detached(32_000, p))
+}
+
+/// A slow host open is over when the machine starts, before the guest
+/// plays: the PROM's boot tune reaches the host whole. Opened at the tune's
+/// start instead, the frames due by the first look overflow the 200 ms ring
+/// and the tune loses 200 ms near its start.
+#[test]
+fn a_host_slow_to_open_does_not_cost_the_boot_tune_its_start() {
+    let r = Rad1 { inner: Arc::new_cyclic(|me| Inner { open_host: slow_host, ..Inner::new(me.clone()) }) };
+    r.config().write(4, BAR as u32);
+    r.config().write(1, PCI_COMMAND_MEMORY_ON);
+    r.fake_ns.store(0, Ordering::Relaxed);
+    let ram = Arc::new(Ram(Mutex::new(vec![0; 0x40_0000])));
+    // A recognisable tune: every frame's samples count up from 1.
+    for (f, w) in ram.0.lock().unwrap()[TUNE_BUF as usize..][..TUNE_FRAMES * 8].chunks_exact_mut(4).enumerate() {
+        w.copy_from_slice(&sample_to_word((f / 2 % 30_000 + 1) as i16).to_le_bytes());
+    }
+    r.connect_dma(ram);
+    r.enable_output(crate::config::AudioConfig::default());
+    Device::start(&r);
+    prom_tune(&r, TUNE_CTRL);
+    let start = r.fake_ns.load(Ordering::Relaxed);
+    let mut played = Vec::new();
+    for step in 1..=25 {
+        at(&r, start + step * 100 * SEC / 1000);
+        rd(&r, 0x58);
+        HOST_RING.with(|h| played.extend(std::iter::from_fn(|| h.borrow_mut().as_mut().unwrap().pop().ok())));
+    }
+    assert_eq!(rd(&r, 0x58) & 1, 0, "the tune is over");
+    assert_eq!(played.len(), TUNE_FRAMES * 2, "every frame reached the host");
+    let want: Vec<i16> = (0..TUNE_FRAMES * 2).map(|i| (i / 2 % 30_000 + 1) as i16).collect();
+    assert!(played == want, "in order, none dropped");
+}
+
+/// Completion `k` of IRIX's continuous status schedule (interval 8251 at
+/// 33 MHz, 250 us) is due at this time.
+fn irix_due(k: i64) -> i64 {
+    k * 8251 * 1_000_000_000 / 33_000_000
+}
+
+/// The time held back from the card's clock for timer hold-ups.
+fn held(r: &Rad1) -> i64 {
+    r.stalled_ns.load(Ordering::SeqCst)
+}
+
+/// Output running on a 512-frame ring with that status schedule started at
+/// time 0; returns the schedule's generation.
+fn running_with_status(r: &Rad1) -> u64 {
+    start_ust(r);
+    program(r, &RING_OUTPUT, 0x10_0000, 0xffff_f008);
+    wr(r, 0x58, 0x2000_0001);
+    wr(r, 0x500, 0x30_0000);
+    wr(r, 0x504, 0xffff_c078);
+    wr(r, 0x4b4, 0x30_0000);
+    wr(r, 0x4bc, 0xffff_c078);
+    wr(r, 0x5c, 0x480ef);
+    r.state.lock().status_gen
+}
+
+/// IRIX writes only 36 to 90 frames ahead of the pointer, so a completion
+/// the host held up must not carry the output through the hold-up.
+#[test]
+fn a_late_status_completion_does_not_carry_the_output_through_the_hold_up() {
+    let (r, _ram) = dma_card();
+    let gen = running_with_status(&r);
+    at(&r, irix_due(1) + 5_000_000);
+    assert_eq!(r.status_tick(gen), Some(irix_due(2)), "the schedule carries on from the card's clock");
+    assert!(r.state.lock().chan[CH_OUT].frames <= 12, "moved over the hold-up");
+    assert_eq!(r.now(), irix_due(1), "the clock is back at the due time");
+    assert_eq!(held(&r), 5_000_000);
+    // An on-time completion wins back 1/32 of an interval.
+    at(&r, irix_due(2) + 5_000_000);
+    assert_eq!(r.status_tick(gen), Some(irix_due(3)));
+    assert_eq!(held(&r), 5_000_000 - irix_due(1) / 32);
+}
+
+#[test]
+fn a_hold_up_is_more_than_one_interval_late_and_at_most_200ms_is_held_back() {
+    let interval = irix_due(1);
+    for (late, held_back) in [(interval, 0), (interval + 1_000, interval + 1_000), (SEC, 200_000_000)] {
+        let (r, _ram) = dma_card();
+        let gen = running_with_status(&r);
+        at(&r, irix_due(1) + late);
+        r.status_tick(gen).unwrap();
+        assert_eq!(held(&r), held_back, "{late} ns late");
+    }
 }

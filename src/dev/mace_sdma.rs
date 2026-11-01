@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 use crate::dev::crime_mem::O2Memory;
+use crate::dev::mace_uart::MaceUart;
 use crate::snapshot::{get_field, hex_u32, hex_u64, toml_u32, toml_u64};
 use crate::ip32::*;
 
@@ -131,7 +132,7 @@ impl SdmaPort {
 /// where the rings are.
 pub struct SdmaIo<'a> {
     pub ram: &'a O2Memory,
-    pub com: [&'a Com16550; 2],
+    pub com: [&'a MaceUart; 2],
     /// The ring block's physical address, from the ring base register.
     pub ring_base: u32,
 }
@@ -305,10 +306,10 @@ impl MaceSerialDma {
                     let (c, d) = (pair[slot], pair[4 + slot]);
                     match c >> 6 {
                         sdma::TX_CMD_THR => {
-                            io.com[p].transmit(d);
+                            io.com[p].core().dma_write(d);
                             port.tx.bytes += 1;
                         }
-                        sdma::TX_CMD_MCR => io.com[p].write_mcr(d),
+                        sdma::TX_CMD_MCR => io.com[p].core().dma_modem_control(d),
                         // Skip, or a delay: there is no wire to be idle on.
                         _ => {}
                     }

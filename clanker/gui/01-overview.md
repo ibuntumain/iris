@@ -37,9 +37,16 @@ easy to break.
 The GUI installs `framebuffer.rs::CaptureRenderer` through
 `Machine::get_display()` / `GfxDisplay::install_renderer` immediately after
 construction, before the CPU starts. Newport, GR2, and IMPACT share this
-interface. Each `render` call copies frames into a `FrameSink`; the event-loop
-thread uploads the pixels to an `egui::TextureHandle`. `IRIS_GUI_GL=1`
-(`[debug] gui_gl_capture`) selects the board's available GL capture path.
+interface. The renderer publishes frames into a `FrameSink` — pooled buffers,
+only the damaged band of scanlines, and a wake so the event loop sleeps until
+a frame exists; the event-loop thread uploads that band to an
+`egui::TextureHandle` (`gui-frame-sink-carries-only-the-damaged-band.md`).
+`IRIS_GUI_GL=1` (`[debug] gui_gl_capture`) selects the board's available GL
+capture path.
+
+The sink is the GUI's frame path only. Screenshots (`Cmd::Screenshot`) and VNC
+read `screen.rgba` through `gfx_display::fresh_frame` / the renderers' mirror,
+never the sink.
 
 PS/2 input flows through `input.rs::pump`, only while captured:
 

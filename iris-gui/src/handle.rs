@@ -120,6 +120,76 @@ pub struct Status {
     pub pcap_status: iris::net::PcapStatus,
 }
 
+impl Status {
+    /// Take the fields the worker's status tick measures from `s`. The worker
+    /// only knows these; `running`, `power_off_seen` and `in_prom` are driven
+    /// by lifecycle events, so merge rather than replace to avoid clobbering
+    /// them.
+    fn take_worker_fields(&mut self, s: &Status) {
+        self.mips = s.mips;
+        self.kernel_hz = s.kernel_hz;
+        self.dirty_cow = s.dirty_cow;
+        self.cpu_halted = s.cpu_halted;
+        self.cpu_stopped = s.cpu_stopped;
+        self.chd_sync_pending = s.chd_sync_pending;
+        self.net_frames = s.net_frames;
+        self.net_guest_ip = s.net_guest_ip;
+        self.net_guest_gateway = s.net_guest_gateway;
+        self.net_nat_gateway = s.net_nat_gateway;
+        self.pcap_status = s.pcap_status;
+    }
+}
+
+/// The live MIPS and Hz figures, from the machine's CPU counters sampled
+/// once per status tick. Mirrors the CLI status bar's math (`src/disp.rs`),
+/// which the GUI never runs.
+struct RateMeter {
+    /// Each CPU's retired-cycle counter and clock-tick counter, CPU 0 first.
+    cpus: Vec<(iris::cpu::mips_core::CyclesPtr, Arc<std::sync::atomic::AtomicU64>)>,
+    prev: Vec<(u64, u64)>,
+    at: std::time::Instant,
+}
+
+impl RateMeter {
+    fn new(cpus: Vec<(iris::cpu::mips_core::CyclesPtr, Arc<std::sync::atomic::AtomicU64>)>, now: std::time::Instant) -> Self {
+        let prev = Self::read(&cpus);
+        Self { cpus, prev, at: now }
+    }
+
+    fn read(cpus: &[(iris::cpu::mips_core::CyclesPtr, Arc<std::sync::atomic::AtomicU64>)]) -> Vec<(u64, u64)> {
+        cpus.iter().map(|(c, t)| (c.retired(), t.load(Ordering::Relaxed))).collect()
+    }
+
+    /// MIPS and Hz over the window since the last sample, or None when it is
+    /// under 0.1 s (the window then keeps growing).
+    fn sample(&mut self, now: std::time::Instant) -> Option<(f32, f32)> {
+        let dt = now.duration_since(self.at).as_secs_f64();
+        if dt < 0.1 {
+            return None;
+        }
+        let cur = Self::read(&self.cpus);
+        let rates = window_rates(&self.prev, &cur, dt);
+        self.prev = cur;
+        self.at = now;
+        Some(rates)
+    }
+}
+
+/// MIPS and Hz over `dt` seconds between two counter samples, one
+/// `(retired cycles, clock ticks)` pair per CPU, CPU 0 first. MIPS is the
+/// total over all CPUs: it is how fast the machine runs. Hz is CPU 0's tick
+/// rate: every CPU takes its own clock interrupt at the kernel's rate, so
+/// adding them would show twice the Hz on two CPUs.
+fn window_rates(prev: &[(u64, u64)], cur: &[(u64, u64)], dt: f64) -> (f32, f32) {
+    let retired: u64 = prev.iter().zip(cur).map(|(p, c)| iris::disp::cycles_moved(p.0, c.0)).sum();
+    let mips = (retired as f64 / dt / 1_000_000.0 * 10.0).round() as f32 / 10.0;
+    let hz = match (prev.first(), cur.first()) {
+        (Some(p), Some(c)) => (c.1.wrapping_sub(p.1) as f64 / dt).round() as f32,
+        _ => 0.0,
+    };
+    (mips, hz)
+}
+
 /// State of the internal-network ("NET") indicator shown next to MIPS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetState {
@@ -215,25 +285,13 @@ impl EmulatorHandle {
         let mut out = Vec::new();
         while let Ok(evt) = self.evt_rx.try_recv() {
             if let Evt::Status(s) = &evt {
-                // The worker only knows the perf-derived fields; `running`,
-                // `power_off_seen` and `in_prom` are driven by lifecycle
-                // events, so merge rather than replace to avoid clobbering them.
-                self.status.mips = s.mips;
-                self.status.dirty_cow = s.dirty_cow;
-                self.status.cpu_halted = s.cpu_halted;
-                self.status.cpu_stopped = s.cpu_stopped;
-                self.status.chd_sync_pending = s.chd_sync_pending;
+                self.status.take_worker_fields(s);
                 // Latch the NET light: once NAT IP traffic has flowed this run
                 // the guest's networking is up, so keep it green through idle
                 // lulls (it resets to red on the next Start).
                 if s.net_frames > self.net_seen_frames {
                     self.net_seen_frames = s.net_frames;
                 }
-                self.status.net_frames = s.net_frames;
-                self.status.net_guest_ip = s.net_guest_ip;
-                self.status.net_guest_gateway = s.net_guest_gateway;
-                self.status.net_nat_gateway = s.net_nat_gateway;
-                self.status.pcap_status = s.pcap_status;
             }
             match &evt {
                 Evt::Started => {
@@ -309,6 +367,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worker_tick_carries_the_kernel_hz() {
+        let mut shown = Status::default();
+        let tick = Status { mips: 90.0, kernel_hz: 100.0, ..Status::default() };
+        shown.running = true;
+        shown.take_worker_fields(&tick);
+        assert_eq!(shown.kernel_hz, 100.0);
+        assert_eq!(shown.mips, 90.0);
+        assert!(shown.running, "lifecycle fields are not the worker's to set");
+    }
+
+    #[test]
+    fn mips_totals_every_cpu_and_hz_is_cpu_zeros() {
+        let prev = [(1_000, 10), (5_000, 3)];
+        let cur = [(51_000_000 + 1_000, 20), (50_000_000 + 5_000, 13)];
+        // Two CPUs at 51 and 50 million cycles a second.
+        assert_eq!(window_rates(&prev, &cur, 1.0), (101.0, 10.0));
+        // Over half a second the same deltas are twice the rate.
+        assert_eq!(window_rates(&prev, &cur, 0.5), (202.0, 20.0));
+    }
+
+    /// A CPU reset in the window set its counter back to 0: count what ran
+    /// since rather than a wrapped difference.
+    #[test]
+    fn a_reset_in_the_window_counts_from_zero() {
+        assert_eq!(window_rates(&[(900_000_000, 10)], &[(40_000_000, 110)], 1.0), (40.0, 100.0));
+    }
+
+    #[test]
+    fn one_cpu_and_no_cpu() {
+        assert_eq!(window_rates(&[(0, 0)], &[(95_000_000, 100)], 1.0), (95.0, 100.0));
+        assert_eq!(window_rates(&[], &[], 1.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn meter_skips_a_short_window() {
+        let t0 = std::time::Instant::now();
+        let mut m = RateMeter::new(Vec::new(), t0);
+        assert_eq!(m.sample(t0 + std::time::Duration::from_millis(50)), None);
+        assert_eq!(m.sample(t0 + std::time::Duration::from_millis(200)), Some((0.0, 0.0)));
+    }
+
+    #[test]
     fn net_indicator_states() {
         // Unpowered (not running) → grey, regardless of past traffic.
         assert_eq!(net_state_for(false, false, 42), NetState::Off);
@@ -335,17 +435,15 @@ fn worker_loop(
     abandoned_machine: Arc<AtomicBool>,
 ) {
     let mut machine: Option<Box<dyn Workstation>> = None;
+    // The built-in VNC server, when `[vnc] listen` is set. Lives exactly as
+    // long as the machine it serves: dropped on Stop, disk sync and Quit, so a
+    // restarted machine never leaves the old port bound.
+    let mut vnc_server: Option<iris::vnc::VncServer> = None;
     // Live MIPS estimate: read REX3's free-running cycle counter and divide
     // the delta by wall-clock between ticks. Mirrors the status-bar math in
     // src/disp.rs, but driven here since the GUI never runs REX3's own
     // refresh/status-bar loop. `None` until a machine is up.
-    let mut cycles: Option<iris::cpu::mips_core::CyclesPtr> = None;
-    let mut prev_cycles: u64 = 0;
-    // Kernel tick-rate Hz, sampled alongside MIPS from the same shared
-    // counter the CLI status bar reads (see `Machine::fasttick_count`).
-    let mut fasttick: Option<Arc<std::sync::atomic::AtomicU64>> = None;
-    let mut prev_fasttick: u64 = 0;
-    let mut prev_tick = std::time::Instant::now();
+    let mut meter: Option<RateMeter> = None;
     // Tick cadence for the status poll while idle on the command channel.
     const STATUS_TICK: std::time::Duration = std::time::Duration::from_millis(500);
     loop {
@@ -355,42 +453,25 @@ fn worker_loop(
         match command {
             // Periodic tick (no command pending): refresh the MIPS estimate.
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if let Some(c) = cycles {
-                    let now = std::time::Instant::now();
-                    let dt = now.duration_since(prev_tick).as_secs_f64();
-                    if dt >= 0.1 {
-                        let cur = c.get();
-                        let dc = cur.wrapping_sub(prev_cycles);
-                        let mips = (dc as f64 / dt / 1_000_000.0 * 10.0).round() as f32 / 10.0;
-                        prev_cycles = cur;
-                        let kernel_hz = if let Some(ft) = &fasttick {
-                            let cur_ft = ft.load(std::sync::atomic::Ordering::Relaxed);
-                            let df = cur_ft.wrapping_sub(prev_fasttick);
-                            prev_fasttick = cur_ft;
-                            (df as f64 / dt).round() as f32
-                        } else {
-                            0.0
-                        };
-                        prev_tick = now;
-                        // The guest has shut down when the CPU thread has stopped
-                        // (soft power-off calls Machine::stop) or has retired no
-                        // instructions this window (halted/idle at the PROM, 0 MIPS).
-                        let cpu_stopped = machine.as_ref().map_or(true, |m| !m.cpu_is_running());
-                        let cpu_halted = cpu_stopped || mips == 0.0;
-                        let chd_sync_pending = machine.as_ref().map_or(false, |m| m.pending_chd_sync_count() > 0);
-                        let net_frames = machine.as_ref().map_or(0, |m| m.net_guest_frames());
-                        let net_guest_ip = machine.as_ref().and_then(|m| m.net_observed_guest_ip());
-                        let net_guest_gateway = machine.as_ref().and_then(|m| m.net_observed_gateway());
-                        let net_nat_gateway = machine.as_ref().and_then(|m| m.nat_expected()).map(|(_, gw, _)| gw);
-                        let pcap_status = machine.as_ref()
-                            .map_or(iris::net::PcapStatus::Inactive, |m| m.net_pcap_status());
-                        let _ = evt_tx.send(Evt::Status(Status {
-                            mips, kernel_hz, cpu_halted, cpu_stopped, chd_sync_pending,
-                            net_frames, net_guest_ip, net_guest_gateway, net_nat_gateway,
-                            pcap_status,
-                            ..Status::default()
-                        }));
-                    }
+                if let Some((mips, kernel_hz)) = meter.as_mut().and_then(|m| m.sample(std::time::Instant::now())) {
+                    // The guest has shut down when the CPU thread has stopped
+                    // (soft power-off calls Machine::stop) or has retired no
+                    // instructions this window (halted/idle at the PROM, 0 MIPS).
+                    let cpu_stopped = machine.as_ref().map_or(true, |m| !m.cpu_is_running());
+                    let cpu_halted = cpu_stopped || mips == 0.0;
+                    let chd_sync_pending = machine.as_ref().map_or(false, |m| m.pending_chd_sync_count() > 0);
+                    let net_frames = machine.as_ref().map_or(0, |m| m.net_guest_frames());
+                    let net_guest_ip = machine.as_ref().and_then(|m| m.net_observed_guest_ip());
+                    let net_guest_gateway = machine.as_ref().and_then(|m| m.net_observed_gateway());
+                    let net_nat_gateway = machine.as_ref().and_then(|m| m.nat_expected()).map(|(_, gw, _)| gw);
+                    let pcap_status = machine.as_ref()
+                        .map_or(iris::net::PcapStatus::Inactive, |m| m.net_pcap_status());
+                    let _ = evt_tx.send(Evt::Status(Status {
+                        mips, kernel_hz, cpu_halted, cpu_stopped, chd_sync_pending,
+                        net_frames, net_guest_ip, net_guest_gateway, net_nat_gateway,
+                        pcap_status,
+                        ..Status::default()
+                    }));
                 }
                 continue;
             }
@@ -418,6 +499,9 @@ fn worker_loop(
                 let sink_for_machine = frame_sink.clone();
                 let sink_for_head1 = frame_sink_head1.clone();
                 let heads = cfg_owned.graphics.heads;
+                // Read before the closure moves the config into it.
+                let vnc_listen = cfg_owned.vnc.listen.clone();
+                let vnc_max_fps = cfg_owned.vnc.max_fps;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // A machine that cannot be built panics here, so the
                     // catch_unwind below reports why.
@@ -447,13 +531,29 @@ fn worker_loop(
                             crate::netplan::gather_host_ifaces()
                                 .into_iter().map(|h| (h.network, h.prefix)).collect());
                         *ps2_slot.lock() = Some(m.get_ps2());
-                        // Latch REX3's cycle counter for the live MIPS estimate.
-                        cycles = m.get_display().map(|d| d.cycles());
-                        prev_cycles = cycles.map(|c| c.get()).unwrap_or(0);
-                        let ft = m.fasttick_count();
-                        prev_fasttick = ft.load(std::sync::atomic::Ordering::Relaxed);
-                        fasttick = Some(ft);
-                        prev_tick = std::time::Instant::now();
+                        // Latch every CPU's counters for the live MIPS and Hz estimate.
+                        // A headless machine has none, and then sends no tick.
+                        let counters = m.cpu_counters();
+                        meter = (!counters.is_empty()).then(|| RateMeter::new(counters, std::time::Instant::now()));
+                        // The built-in VNC server, if `[vnc] listen` is set.
+                        // The GUI builds its own machine, so without this the
+                        // Performance tab's VNC settings would be config the
+                        // GUI silently ignores. A bind failure is a toast, not
+                        // an exit: the machine itself is fine without it.
+                        if let Some(listen) = vnc_listen {
+                            match iris::vnc::VncServer::start(
+                                iris::hostinput::HostInput::attach(&*m),
+                                &listen,
+                                vnc_max_fps,
+                                "IRIS",
+                            ) {
+                                Ok(s) => vnc_server = Some(s),
+                                Err(e) => {
+                                    let _ = evt_tx.send(Evt::Error(
+                                        t!("emu-vnc-failed", listen = &listen, error = e)));
+                                }
+                            }
+                        }
                         machine = Some(m);
                         let _ = evt_tx.send(Evt::Started);
                     }
@@ -487,8 +587,10 @@ fn worker_loop(
             Ok(Cmd::Stop) => {
                 if let Some(m) = machine.take() {
                     *ps2_slot.lock() = None;
-                    cycles = None;
-                    fasttick = None;
+                    meter = None;
+                    // Drop the VNC server with the machine it serves: it holds
+                    // the display and the port, and a restart rebinds both.
+                    drop(vnc_server.take());
                     // Always report the machine as stopped so the user regains
                     // control, even if the stop failed or had to be abandoned.
                     if let Err(msg) = stop_machine_timed(m) {
@@ -508,8 +610,9 @@ fn worker_loop(
                 let mut synced = 0usize;
                 if let Some(mut m) = machine.take() {
                     *ps2_slot.lock() = None;
-                    cycles = None;
-                    fasttick = None;
+                    meter = None;
+                    // Its grab loop reads the display, so it goes first.
+                    drop(vnc_server.take());
                     m.stop();
                     synced = match m.sync_chd_disks(
                         None,
@@ -640,15 +743,38 @@ fn worker_loop(
                 }
             }
             Ok(Cmd::Screenshot(path)) => {
-                // Pull the most recently rendered frame from the sink and
-                // encode as PNG. We do this in the worker (rather than the
-                // GUI thread) because PNG encoding is non-trivial CPU.
-                let frame = frame_sink.snapshot();
-                if frame.width == 0 || frame.height == 0 {
+                // Pull a whole composed frame from the board and encode it as
+                // PNG. We do this in the worker (rather than the GUI thread)
+                // because PNG encoding is non-trivial CPU.
+                //
+                // Not `frame_sink.snapshot()`: the sink carries only the
+                // damaged band of the newest frame (see `framebuffer`), so it
+                // cannot serve a whole picture. `screen.rgba` can, and the
+                // board keeps it current the moment something asks — a
+                // `request_frame` makes REX3's refresh loop compose and copy,
+                // which costs nothing until a screenshot is taken.
+                let Some(m) = machine.as_ref() else {
+                    let _ = evt_tx.send(Evt::Error(t!("emu-not-running")));
+                    continue;
+                };
+                let Some(display) = m.get_display() else {
                     let _ = evt_tx.send(Evt::Error(t!("emu-screenshot-no-frame")));
                     continue;
+                };
+                let mut px: Vec<u32> = Vec::new();
+                let Some((w, h, _)) = iris::gfx_display::fresh_frame(
+                    &*display, &mut px, std::time::Duration::from_secs(2),
+                ) else {
+                    let _ = evt_tx.send(Evt::Error(t!("emu-screenshot-no-frame")));
+                    continue;
+                };
+                // Tight RGBA bytes from the tightly-packed words `copy_frame`
+                // hands over (`w` a row, 0xAABBGGRR, R in the low byte).
+                let mut rgba = Vec::with_capacity(w * h * 4);
+                for &word in &px[..w * h] {
+                    rgba.extend_from_slice(&(word | 0xFF00_0000).to_le_bytes());
                 }
-                match write_png(&path, frame.width as u32, frame.height as u32, &frame.rgba) {
+                match write_png(&path, w as u32, h as u32, &rgba) {
                     Ok(()) => { let _ = evt_tx.send(Evt::Screenshot(path)); }
                     Err(e) => { let _ = evt_tx.send(Evt::Error(t!("emu-screenshot-failed", error = e))); }
                 }
@@ -704,6 +830,9 @@ fn worker_loop(
             }
             Ok(Cmd::Quit) | Err(_) => {
                 *ps2_slot.lock() = None;
+                // Drop the VNC server first: its grab loop reads the display,
+                // and it must not outlive the machine it serves.
+                drop(vnc_server.take());
                 if let Some(m) = machine.take() {
                     // Bounded so a wedged guest can't hang app exit (Drop joins
                     // this thread). If the stop is abandoned, the process is

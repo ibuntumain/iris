@@ -156,12 +156,6 @@ pub struct Gr2Regs {
     pub pll_programs: u32,
 }
 
-/// Status-bar counters shared with the rest of the machine (same set REX3 gets).
-pub struct Gr2Stats {
-    pub heartbeat: Arc<AtomicU64>,
-    pub fasttick: Arc<AtomicU64>,
-}
-
 pub struct Gr2 {
     variant: Gr2Variant,
     /// Perfetto edge trackers (zero-valid, so `new`'s zeroed allocation
@@ -234,11 +228,11 @@ pub struct Gr2 {
 
     pub screen: Mutex<Rex3Screen>,
     pub renderer: Mutex<Option<Box<dyn Renderer>>>,
+    display_stop: crate::gfx_display::DisplayStop,
     pub screenshot_pending: AtomicBool,
     screenshot_counter: AtomicU32,
     retrace_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
-    stats: Gr2Stats,
-    cycles: Cell<CyclesPtr>,
+    status: Arc<crate::disp::StatusSource>,
     /// Annotated FIFO capture (`gr2 trace`); `trace_mask` gates the hot path.
     trace: Mutex<debug::Gr2Trace>,
     trace_mask: AtomicU32,
@@ -256,7 +250,7 @@ impl Gr2 {
     /// Build a GR2 in place on the heap. The multi-megabyte register/VRAM
     /// state is zero-initialised without ever touching the stack; only the
     /// runtime fields that are not all-zero-valid are written explicitly.
-    pub fn new(variant: Gr2Variant, stats: Gr2Stats) -> Arc<Self> {
+    pub fn new(variant: Gr2Variant, status: Arc<crate::disp::StatusSource>) -> Arc<Self> {
         let mut a: Arc<MaybeUninit<Self>> = Arc::new_zeroed();
         let p = Arc::get_mut(&mut a).unwrap().as_mut_ptr();
         // SAFETY: `p` points at zeroed, exclusively owned memory. Every field
@@ -273,11 +267,11 @@ impl Gr2 {
             addr_of_mut!((*p).re3_thread).write(Mutex::new(None));
             addr_of_mut!((*p).screen).write(Mutex::new(Rex3Screen::new()));
             addr_of_mut!((*p).renderer).write(Mutex::new(None));
+            addr_of_mut!((*p).display_stop).write(Default::default());
             addr_of_mut!((*p).screenshot_pending).write(AtomicBool::new(false));
             addr_of_mut!((*p).screenshot_counter).write(AtomicU32::new(0));
             addr_of_mut!((*p).retrace_cb).write(Mutex::new(None));
-            addr_of_mut!((*p).stats).write(stats);
-            addr_of_mut!((*p).cycles).write(Cell::new(CyclesPtr::dangling()));
+            addr_of_mut!((*p).status).write(status);
             addr_of_mut!((*p).trace).write(Mutex::new(debug::Gr2Trace::new()));
             addr_of_mut!((*p).trace_mask).write(AtomicU32::new(0));
             #[cfg(feature = "gr2-jit")]
@@ -292,10 +286,6 @@ impl Gr2 {
 
     pub fn set_retrace_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
         *self.retrace_cb.lock() = Some(cb);
-    }
-
-    pub fn set_cpu_cycles(&self, ptr: CyclesPtr) {
-        self.cycles.set(ptr);
     }
 
     #[allow(clippy::mut_from_ref)]
@@ -989,9 +979,10 @@ impl Gr2 {
 
 impl crate::gfx_display::GfxDisplay for Gr2 {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop { &self.display_stop }
     fn screen(&self) -> &Mutex<Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
-    fn cycles(&self) -> CyclesPtr { self.cycles.get() }
+    fn cycles(&self) -> CyclesPtr { self.status.cycles() }
     fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
         // A racy read of the registers, as the display thread's compose does.
         let vc1 = &self.regs().vc1;
@@ -1122,6 +1113,7 @@ impl Device for Gr2 {
     }
 
     fn stop(&self) {
+        self.display_stop.request();
         if !self.running.swap(false, Ordering::SeqCst) {
             return;
         }

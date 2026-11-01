@@ -1,6 +1,12 @@
 use std::io;
 
-use crate::block_node::{BlockNode, ChdCdNode, ChdNode, CowNode, RawNode};
+mod attach;
+mod bus;
+
+pub use attach::{attach_failed, attach_from_config, Attached, DaynaportRef, TableRef};
+pub use bus::{ScsiBus, ScsiIdentities, ScsiTarget, Targets};
+
+use crate::block_node::{ChangerNode, Removable, BlockNode};
 
 /// Get the standard CDB length based on the opcode's group code
 pub fn get_cdb_length(opcode: u8) -> usize {
@@ -78,17 +84,12 @@ pub fn request_sense_alloc_len(cdb: &[u8]) -> usize {
     if cdb[4] == 0 { 4 } else { cdb[4] as usize }
 }
 
-/// What kind of target sits at this SCSI id.
-///
-/// `Disk` and `Cdrom` share the storage command set below and differ only in
-/// behaviour (block size, TOC, write protection). `DaynaPort` shares nothing
-/// with them: it is a type-3 Processor device whose vendor command set reuses
-/// the READ(6)/WRITE(6) opcodes for packet RX/TX, so it is dispatched *before*
-/// the storage opcodes in `request()` and must never reach them.
+/// What kind of storage target sits at this SCSI id: the two share the
+/// command set below and differ only in behaviour (block size, TOC, write
+/// protection).
 pub enum DeviceKind {
     Disk,
     Cdrom,
-    DaynaPort(Box<crate::dev::daynaport::DaynaPort>),
 }
 
 /// What a target reports of itself in INQUIRY: vendor, product and
@@ -103,29 +104,62 @@ pub struct ScsiIdentity {
     pub revision: [u8; 4],
 }
 
+/// What every machine's emulated disk reports in INQUIRY.
+pub const DISK_IDENTITY: ScsiIdentity = ScsiIdentity::new(b"SGI     ", b"IRIS EMUL DISK  ", b"1.0 ");
+
+/// What an emulated CD-ROM reports, where the machine does not name a real
+/// drive (the Indy and Indigo2 do: a Sony CDU-76S).
+pub const CDROM_IDENTITY: ScsiIdentity = ScsiIdentity::new(b"SGI     ", b"IRIS EMUL CDROM ", b"1.0 ");
+
 impl ScsiIdentity {
     pub const fn new(vendor: &[u8; 8], product: &[u8; 16], revision: &[u8; 4]) -> Self {
         Self { vendor: *vendor, product: *product, revision: *revision }
     }
 }
 
+/// What a device reads and writes: a disk's image, or a CD-ROM drive's tray.
+enum Media {
+    /// A disk, and the path of its image.
+    Fixed(Box<dyn BlockNode>, String),
+    /// A CD-ROM drive.
+    Changer(ChangerNode),
+}
+
+impl Media {
+    fn node(&self) -> &dyn BlockNode {
+        match self {
+            Media::Fixed(n, _) => &**n,
+            Media::Changer(c) => c,
+        }
+    }
+
+    fn node_mut(&mut self) -> &mut dyn BlockNode {
+        match self {
+            Media::Fixed(n, _) => &mut **n,
+            Media::Changer(c) => c,
+        }
+    }
+
+    fn present(&self) -> bool {
+        match self {
+            Media::Fixed(..) => true,
+            Media::Changer(c) => c.present(),
+        }
+    }
+
+    fn take_changed(&mut self) -> bool {
+        match self {
+            Media::Fixed(..) => false,
+            Media::Changer(c) => c.take_changed(),
+        }
+    }
+}
+
 pub struct ScsiDevice {
-    /// None = no media loaded (CD-ROM drive present but tray is empty), or a
-    /// device with no storage behind it at all (DaynaPort).
-    /// HDDs are never None in practice.
-    backend: Option<Box<dyn BlockNode>>,
-    /// Capacity in bytes of the loaded media. 0 when `backend` is None.
-    size: u64,
+    media: Media,
     kind: DeviceKind,
-    /// Path of the currently mounted image. Empty string when no media.
-    filename: String,
-    /// Full disc list for CD-ROM changers. Index 0 is always the active disc.
-    /// For HDDs this is empty (unused).
-    discs: Vec<String>,
     buffer: Vec<u8>,  // Internal buffer for WRITE_BUFFER/READ_BUFFER commands
     pending_sense: [u8; 18],  // Stored sense data, served on REQUEST_SENSE
-    /// Unit Attention pending — set after disc change, cleared on next command.
-    unit_attention: bool,
     /// Physical sector size: always 2048 for CD-ROM (Yellow Book), 512 for HDD.
     /// Used for TOC lead-out LBA (CD spec requires TOC in physical sectors).
     phys_block_size: u64,
@@ -136,27 +170,26 @@ pub struct ScsiDevice {
     identity: ScsiIdentity,
 }
 
+/// A CD-ROM's physical sector (Yellow Book).
+pub const CDROM_SECTOR: u64 = 2048;
+
 const SCSI_BUFFER_SIZE: usize = 0x4000; // 16KB (16384 bytes)
 
 impl ScsiDevice {
-    pub fn new(
-        backend: Box<dyn BlockNode>,
-        size: u64,
-        is_cdrom: bool,
-        filename: String,
-        discs: Vec<String>,
-        identity: ScsiIdentity,
-    ) -> Self {
+    /// A disk, or a CD-ROM drive holding the image `node` opened from `path`
+    /// with `discs` queued.
+    pub fn new(node: Box<dyn BlockNode>, is_cdrom: bool, path: String, discs: Vec<String>, identity: ScsiIdentity) -> Self {
+        let media = if is_cdrom {
+            Media::Changer(ChangerNode::loaded(node, &path, discs))
+        } else {
+            Media::Fixed(node, path)
+        };
         Self {
-            backend: Some(backend),
-            size,
+            media,
             kind: if is_cdrom { DeviceKind::Cdrom } else { DeviceKind::Disk },
-            filename,
-            discs,
             buffer: vec![0u8; SCSI_BUFFER_SIZE],
             pending_sense: [0u8; 18],
-            unit_attention: false,
-            phys_block_size: if is_cdrom { 2048 } else { 512 },
+            phys_block_size: if is_cdrom { CDROM_SECTOR } else { 512 },
             // CD-ROM drives default to 2048-byte logical blocks (Sony CDU-76S behaviour).
             // HDD defaults to 512. dksc switches CD-ROM to 512 for EFS, back to 2048 for ISO.
             logical_block_size: if is_cdrom { 2048 } else { 512 },
@@ -164,192 +197,33 @@ impl ScsiDevice {
         }
     }
 
-    /// Open a disk or CD-ROM image as a target: a CHD (hard disk or CD),
-    /// a copy-on-write overlay over `path` when `overlay` (hard disks), or
-    /// the file itself; an empty `path` is a CD-ROM drive with no disc. A
-    /// CD-ROM changer's discs are `discs`. Any controller attaches its
-    /// targets this way, with its own `identity`.
-    ///
-    /// Each image becomes a [`BlockNode`]: the node owns the backend-specific
-    /// arithmetic, so the storage commands above never see a backend kind.
-    pub fn open(
-        path: &str,
-        is_cdrom: bool,
-        discs: Vec<String>,
-        overlay: bool,
-        overlay_path_override: Option<&str>,
-        identity: ScsiIdentity,
-    ) -> std::io::Result<Self> {
-        // Empty CD-ROM (drive present, tray empty). Stored backend=None so
-        // TEST UNIT READY / READ CAPACITY / READ return MEDIUM NOT PRESENT,
-        // while INQUIRY still advertises the drive. Use insert_disc() to
-        // mount media later.
-        if is_cdrom && path.is_empty() {
-            return Ok(Self::new_empty_cdrom(identity));
-        }
-        let is_chd_path = crate::chd_disk::is_chd(path);
-
-        let (backend, size): (Box<dyn BlockNode>, u64) = if is_chd_path {
-            if is_cdrom {
-                let cd = ChdCdNode::open(path)?;
-                let sz = cd.size();
-                (Box::new(cd), sz)
-            } else {
-                // HD CHD. The `overlay` flag is the per-disk copy-on-write
-                // toggle: COW on → always overlay (even an uncompressed base
-                // gets a diff) and never auto-fold on exit (commit/roll back
-                // manually); COW off → write in place (uncompressed) or a diff
-                // that auto-folds on a clean exit (compressed).
-                let hd = ChdNode::open(path, overlay)?;
-                let sz = hd.size();
-                (Box::new(hd), sz)
-            }
-        } else if overlay && !is_cdrom {
-            let overlay_path = overlay_path_override
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("{}.overlay", path));
-            let backing = RawNode::open_readonly(std::path::Path::new(path))?;
-            let sz = backing.size();
-            let cow = CowNode::new(Some(Box::new(backing)), &overlay_path, sz)?
-                .with_base_path(path);
-            (Box::new(cow), sz)
-        } else {
-            let node = if is_cdrom {
-                RawNode::open_readonly(std::path::Path::new(path))?
-            } else {
-                RawNode::open(std::path::Path::new(path))?
-            };
-            let sz = node.size();
-            (Box::new(node), sz)
-        };
-
-        let disc_list = if is_cdrom { discs } else { vec![] };
-        Ok(Self::new(backend, size, is_cdrom, path.to_string(), disc_list, identity))
-    }
-
     /// Construct an empty CD-ROM drive — drive present, no media inserted.
     /// IRIX will see the drive in `hinv` but `TEST UNIT READY` reports
     /// MEDIUM NOT PRESENT.
     pub fn new_empty_cdrom(identity: ScsiIdentity) -> Self {
         Self {
-            backend: None,
-            size: 0,
+            media: Media::Changer(ChangerNode::empty()),
             kind: DeviceKind::Cdrom,
-            filename: String::new(),
-            discs: vec![],
             buffer: vec![0u8; SCSI_BUFFER_SIZE],
             pending_sense: [0u8; 18],
-            unit_attention: false,
-            phys_block_size: 2048,
+            phys_block_size: CDROM_SECTOR,
             logical_block_size: 2048,
             identity,
         }
     }
 
-    /// Construct a DaynaPort SCSI/Link target — a type-3 Processor device with
-    /// no storage backing at all (no image, no CHD, no overlay).
-    pub fn new_daynaport(dp: crate::dev::daynaport::DaynaPort) -> Self {
-        Self {
-            backend: None,
-            size: 0,
-            kind: DeviceKind::DaynaPort(Box::new(dp)),
-            filename: String::new(),
-            discs: vec![],
-            buffer: Vec::new(),
-            pending_sense: [0u8; 18],
-            unit_attention: false,
-            phys_block_size: 512,
-            logical_block_size: 512,
-            // Never reported: a DaynaPort answers INQUIRY itself.
-            identity: ScsiIdentity::new(b"        ", b"                ", b"    "),
-        }
-    }
-
-    /// The DaynaPort behind this target, if it is one.
-    pub fn daynaport_mut(&mut self) -> Option<&mut crate::dev::daynaport::DaynaPort> {
-        match &mut self.kind {
-            DeviceKind::DaynaPort(dp) => Some(dp),
-            _ => None,
-        }
-    }
-
-    /// The DaynaPort behind this target, if it is one.
-    pub fn daynaport(&self) -> Option<&crate::dev::daynaport::DaynaPort> {
-        match &self.kind {
-            DeviceKind::DaynaPort(dp) => Some(dp),
-            _ => None,
-        }
-    }
-
-    /// True for a DaynaPort SCSI/Link target. Callers on the storage path use
-    /// this to skip block-oriented handling (the controller, for instance, must
-    /// not read a WRITE(6) byte count as `blocks × 512`).
-    pub fn is_daynaport(&self) -> bool {
-        matches!(self.kind, DeviceKind::DaynaPort(_))
-    }
-
     /// Whether physical media is loaded. For HDDs always true; for CD-ROMs
     /// false when the tray is empty.
-    pub fn has_media(&self) -> bool { self.backend.is_some() }
+    pub fn has_media(&self) -> bool { self.media.present() }
 
-    /// Mount media on a previously-empty CD-ROM, or swap the disc on a
-    /// loaded one. Sets `unit_attention` so the guest re-reads capacity.
-    pub fn insert_media(&mut self, path: &str) -> io::Result<()> {
-        let node = RawNode::open_readonly(std::path::Path::new(path))?;
-        let size = node.size();
-        self.backend = Some(Box::new(node));
-        self.size = size;
-        self.filename = path.to_string();
-        self.unit_attention = true;
-        Ok(())
-    }
-
-    /// Unload media from a CD-ROM (tray empty).
-    pub fn unload_media(&mut self) {
-        self.backend = None;
-        self.size = 0;
-        self.filename = String::new();
-        self.unit_attention = true;
-    }
-
-    /// Commit the divergence layer into the base image ("apply the changes").
-    /// Raw: copies the dirty sectors in place; CHD: rebuilds the base from the
-    /// diff (recompressing) and reopens a fresh overlay. No-op if not overlaid.
-    /// Returns a coarse count of what was committed. The concrete behaviour is
-    /// [`BlockNode::commit`] — including the CHD handle close/reopen.
-    pub fn cow_commit(&mut self) -> io::Result<usize> {
-        match self.backend.as_mut() {
-            Some(node) => node.commit(),
-            None => Ok(0),
-        }
-    }
-
-    /// Reset the divergence layer — discard all uncommitted writes ("roll
-    /// back"). Raw: truncates the overlay; CHD: deletes the `.diff.chd` and
-    /// reopens a fresh overlay over the untouched base. No-op if not overlaid.
-    /// The concrete behaviour is [`BlockNode::rollback`].
-    pub fn cow_reset(&mut self) -> io::Result<()> {
-        match self.backend.as_mut() {
-            Some(node) => node.rollback(),
-            None => Ok(()),
-        }
-    }
-
-    /// Copy the COW overlay into `dest` and return its dirty sector set.
-    /// Direct-mode / no-media devices return an empty list and create no file.
-    pub fn cow_export(&mut self, dest: &std::path::Path) -> io::Result<Vec<u64>> {
-        match self.backend.as_mut() {
-            Some(node) => node.export_overlay(dest),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// Replace the COW overlay with the contents of `source` and adopt
-    /// `dirty` as the dirty sector set. No-op on non-COW / no-media devices.
-    pub fn cow_import(&mut self, source: &std::path::Path, dirty: Vec<u64>) -> io::Result<()> {
-        match self.backend.as_mut() {
-            Some(node) => node.import_overlay(source, dirty),
-            None => Ok(()),
+    /// What the guest's eject does: [`Removable::eject`], whose queue rules
+    /// are the changer's. A disc that will not open is logged and the drive
+    /// left as it was.
+    fn eject(&mut self) {
+        if let Media::Changer(c) = &mut self.media {
+            if let Err(e) = c.eject() {
+                eprintln!("SCSI eject: {e}");
+            }
         }
     }
 
@@ -357,192 +231,21 @@ impl ScsiDevice {
     /// exact dirty sectors for a raw overlay, a coarse 1/0 for a CHD diff. 0 if
     /// direct / no media.
     pub fn cow_dirty_count(&self) -> usize {
-        self.backend.as_ref().map_or(0, |node| node.dirty_count())
+        self.media.node().dirty_count()
     }
 
     /// Whether this device has a divergence layer (a raw `.overlay` or a CHD
     /// `.diff.chd`) that `cow commit` / `cow reset` can act on.
     pub fn is_cow(&self) -> bool {
-        self.backend.as_ref().is_some_and(|node| node.is_cow())
-    }
-
-    /// `(base, diff)` paths if this device is a CHD writing to a `.diff.chd`
-    /// sidecar that holds changes worth folding back into the base on a clean
-    /// shutdown. `None` for in-place / non-CHD / no-media devices.
-    pub fn pending_chd_sync(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        self.backend.as_ref().and_then(|node| node.pending_sync())
-    }
-
-    /// Take the pending-sync paths AND release the disk backend, closing the CHD
-    /// so the base can be atomically rebuilt by `chd_disk::flatten_diff`. Returns
-    /// `None` and leaves the backend in place when there's nothing to sync.
-    pub fn take_pending_chd_sync(&mut self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        let pending = self.pending_chd_sync();
-        if pending.is_some() {
-            self.backend = None;
-        }
-        pending
-    }
-
-    /// Eject the current disc. Behaviour depends on how many discs are queued:
-    ///   - 0 or 1 disc: the tray empties (drive present, no media).
-    ///   - 2+ discs: cycle to the next disc in the changer list (wraps around).
-    /// Returns the newly-active disc path, or None when the tray is emptied or
-    /// this is not a CD-ROM.
-    pub fn eject_next(&mut self) -> Option<String> {
-        if !self.is_cdrom() {
-            return None;
-        }
-        // 0 or 1 disc: eject empties the tray entirely.
-        if self.discs.len() <= 1 {
-            let prev_disc = self.filename.clone();
-            self.unload_media();
-            self.discs.clear(); // no phantom entries remain
-            if !prev_disc.is_empty() {
-                eprintln!("CD-ROM: ejected '{}', tray empty", prev_disc);
-            }
-            return None;
-        }
-        // Rotate: move front to back, new front becomes active.
-        let current = self.discs.remove(0);
-        self.discs.push(current);
-        let next_path = self.discs[0].clone();
-
-        match RawNode::open_readonly(std::path::Path::new(&next_path)) {
-            Ok(node) => {
-                let size = node.size();
-                self.backend = Some(Box::new(node));
-                self.size = size;
-                // phys_block_size never changes — CD-ROM physical sectors are always 2048.
-                // Do NOT reset logical_block_size — MODE SELECT is a controller setting
-                // that persists across disc changes, just like on real hardware.
-                self.filename = next_path.clone();
-                self.unit_attention = true; // signal medium change on next command
-                eprintln!("CD-ROM changer: switched to '{}'", next_path);
-                Some(next_path)
-            }
-            Err(e) => {
-                eprintln!("SCSI eject: could not open {}: {}", next_path, e);
-                None
-            }
-        }
+        self.media.node().is_cow()
     }
 
     pub fn is_cdrom(&self) -> bool { matches!(self.kind, DeviceKind::Cdrom) }
 
-    /// Current active disc path (for display / status).
-    pub fn current_disc(&self) -> &str {
-        &self.filename
-    }
-
-    /// All discs in the changer list.
-    pub fn disc_list(&self) -> &[String] {
-        &self.discs
-    }
-
-    /// Load an explicit image path and make it the active disc immediately,
-    /// as if a hand swapped the disc in the drive. The path is inserted at the
-    /// front of the changer list (becomes index 0) and a medium-change is
-    /// signalled (unit attention) so the guest re-reads the TOC on its next
-    /// command. The image is opened as a raw ISO (`Direct` backend), matching
-    /// the changer's eject path. Err if this is not a CD-ROM or the file can't
-    /// be opened.
-    ///
-    /// Queue management by disc count:
-    ///   - 0 discs (empty tray): the new disc becomes the sole entry.
-    ///   - 1 disc: the existing disc is kept in the queue (pushed to index 1)
-    ///     and the new disc becomes active at index 0, growing the queue to 2
-    ///     so that eject cycles rather than emptying the tray.
-    ///   - 2+ discs: the new disc is placed at index 0 (active); if it was
-    ///     already queued it is moved to the front rather than duplicated.
-    pub fn load_disc(&mut self, path: String) -> Result<String, String> {
-        if !self.is_cdrom() {
-            return Err("Not a CD-ROM device".to_string());
-        }
-        let node = RawNode::open_readonly(std::path::Path::new(&path))
-            .map_err(|e| format!("could not open {}: {}", path, e))?;
-        let size = node.size();
-        self.backend = Some(Box::new(node));
-        self.size = size;
-        self.filename = path.clone();
-        self.unit_attention = true;
-
-        match self.discs.len() {
-            // Empty tray: new disc is the only entry.
-            0 => self.discs.push(path.clone()),
-            // One disc already loaded: keep it queued at index 1 so eject
-            // cycles between the two instead of emptying the tray.
-            1 => {
-                if self.discs[0] != path {
-                    // Push the current disc to the back, new disc goes to front.
-                    self.discs.insert(0, path.clone());
-                }
-                // If same path, nothing to change — already loaded.
-            }
-            // 2+ discs: make new disc active at front, dedup if already queued.
-            _ => {
-                if let Some(pos) = self.discs.iter().position(|d| d == &path) {
-                    self.discs.remove(pos);
-                }
-                self.discs.insert(0, path.clone());
-            }
-        }
-        Ok(path)
-    }
-
-    /// Insert a new disc path at position 1 (next after current).
-    /// Returns Err if this is not a CD-ROM or the path doesn't exist.
-    pub fn add_disc(&mut self, path: String) -> Result<(), String> {
-        if !self.is_cdrom() {
-            return Err("Not a CD-ROM device".to_string());
-        }
-        if !std::path::Path::new(&path).exists() {
-            return Err(format!("File not found: {}", path));
-        }
-        // Insert at index 1 so it becomes the next disc after eject.
-        let insert_pos = if self.discs.is_empty() { 0 } else { 1 };
-        self.discs.insert(insert_pos, path);
-        Ok(())
-    }
-
-    /// Remove disc at the given ordinal index.
-    /// Removing index 0 (current) does not eject — it only removes the path.
-    /// Returns Err if index is out of range.
-    pub fn remove_disc(&mut self, ordinal: usize) -> Result<String, String> {
-        if !self.is_cdrom() {
-            return Err("Not a CD-ROM device".to_string());
-        }
-        if ordinal >= self.discs.len() {
-            return Err(format!("Ordinal {} out of range (0..{})", ordinal, self.discs.len()));
-        }
-        Ok(self.discs.remove(ordinal))
-    }
-
-    /// Move disc at `ordinal` to index 1 (next after current).
-    /// If ordinal is 0 (active), returns Err.
-    pub fn move_disc_next(&mut self, ordinal: usize) -> Result<(), String> {
-        if !self.is_cdrom() {
-            return Err("Not a CD-ROM device".to_string());
-        }
-        if ordinal == 0 {
-            return Err("Ordinal 0 is the active disc; use 'scsi eject' to advance".to_string());
-        }
-        if ordinal >= self.discs.len() {
-            return Err(format!("Ordinal {} out of range (0..{})", ordinal, self.discs.len()));
-        }
-        if self.discs.len() < 2 {
-            return Ok(()); // already only entry
-        }
-        let path = self.discs.remove(ordinal);
-        // Insert at position 1 (right after the active disc at 0).
-        self.discs.insert(1, path);
-        Ok(())
-    }
-
     /// (physical_block_size, logical_block_size)
     /// Capacity of the loaded medium, in bytes (0 with none).
     pub fn size(&self) -> u64 {
-        self.size
+        self.media.node().size()
     }
 
     /// Set the logical block size, as a controller does for its own
@@ -576,93 +279,12 @@ impl ScsiDevice {
         ScsiResponse { status: 0x02, data: vec![] }
     }
 
-    pub fn request(&mut self, req: &ScsiRequest) -> Result<ScsiResponse, std::io::Error> {
-        if req.cdb.is_empty() {
-            return Ok(self.check_condition(0x05, 0x20, 0x00)); // Illegal Request: Invalid command
-        }
-
-        let lun = (req.cdb[1] >> 5) & 0x7;
-
-        // For most commands, only LUN 0 is valid
-        if lun != 0 && req.cdb[0] != scsi_cmd::INQUIRY && req.cdb[0] != scsi_cmd::REQUEST_SENSE {
-            return Ok(self.check_condition(0x05, 0x25, 0x00)); // Illegal Request: LUN Not Supported
-        }
-
-        // Unit attention fires before any other command (except REQUEST_SENSE/INQUIRY).
-        if self.unit_attention
-            && req.cdb[0] != scsi_cmd::REQUEST_SENSE
-            && req.cdb[0] != scsi_cmd::INQUIRY
-        {
-            self.unit_attention = false;
-            return Ok(self.check_condition(0x06, 0x28, 0x00));
-        }
-
-        // A DaynaPort answers its own vendor command set, which reuses the
-        // READ(6) (0x08) and WRITE(6) (0x0a) opcodes for packet RX/TX. Dispatch
-        // it here, ahead of the storage match below, or those two would be
-        // read as disk block transfers. It answers no storage command at all —
-        // not READ CAPACITY, not MODE SENSE, not READ TOC.
-        if let DeviceKind::DaynaPort(dp) = &mut self.kind {
-            let mut response = dp.request(req)?;
-            if let ScsiDataLength::Fixed(max_len) = req.data_len {
-                response.data.truncate(max_len.min(response.data.len()));
-            }
-            return Ok(response);
-        }
-
-        let mut response = match req.cdb[0] {
-            scsi_cmd::TEST_UNIT_READY => self.exec_test_unit_ready(&req.cdb)?,
-            scsi_cmd::REQUEST_SENSE => self.exec_request_sense(&req.cdb)?,
-            scsi_cmd::INQUIRY => self.exec_inquiry(&req.cdb)?,
-            scsi_cmd::READ_CAPACITY_10 => self.exec_read_capacity_10(&req.cdb)?,
-            scsi_cmd::READ_6 => self.exec_read_6(&req.cdb)?,
-            scsi_cmd::READ_10 => self.exec_read_10(&req.cdb)?,
-            scsi_cmd::WRITE_6 => self.exec_write_6(&req.cdb, req.data_in.as_ref())?,
-            scsi_cmd::WRITE_10 => self.exec_write_10(&req.cdb, req.data_in.as_ref())?,
-            scsi_cmd::START_STOP_UNIT => self.exec_start_stop_unit(&req.cdb)?,
-            scsi_cmd::MODE_SENSE_6 => self.exec_mode_sense_6(&req.cdb)?,
-            scsi_cmd::MODE_SENSE_10 => self.exec_mode_sense_10(&req.cdb)?,
-            scsi_cmd::WRITE_BUFFER => self.exec_write_buffer(&req.cdb, req.data_in.as_ref())?,
-            scsi_cmd::READ_BUFFER => self.exec_read_buffer(&req.cdb)?,
-            scsi_cmd::SEND_DIAGNOSTIC => self.exec_send_diagnostic(&req.cdb)?,
-            scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL => ScsiResponse { status: 0x00, data: vec![] },
-            // No write-back cache to flush — our backend writes are already synchronous.
-            scsi_cmd::SYNCHRONIZE_CACHE_10 => ScsiResponse { status: 0x00, data: vec![] },
-            scsi_cmd::MODE_SELECT_6 => self.exec_mode_select_6(&req.cdb, req.data_in.as_ref())?,
-            scsi_cmd::MODE_SELECT_10 => self.exec_mode_select_10(&req.cdb, req.data_in.as_ref())?,
-            // Nothing to do: one initiator, no medium to check, no speed to
-            // set. PROMs send RESERVE, RELEASE and VERIFY while probing, and
-            // a CD driver SET CD SPEED on open.
-            scsi_cmd::RESERVE_6 | scsi_cmd::RELEASE_6 | scsi_cmd::VERIFY_10 | scsi_cmd::SET_CD_SPEED => {
-                ScsiResponse { status: 0x00, data: vec![] }
-            }
-            scsi_cmd::READ_TOC_PMA_ATIP => self.exec_read_toc_pma_atip(&req.cdb)?,
-            scsi_cmd::GET_CONFIGURATION => self.exec_get_configuration(&req.cdb)?,
-            scsi_cmd::SGI_EJECT => self.exec_sgi_eject(&req.cdb)?,
-            scsi_cmd::SGI_HD2CDROM => self.exec_sgi_hd2cdrom(&req.cdb)?,
-            _ => {
-                eprintln!("SCSI: Unimplemented command {:02x} cdb={:02x?}", req.cdb[0], &req.cdb);
-                self.check_condition(0x05, 0x20, 0x00) // Illegal Request: Invalid Command Operation Code
-            }
-        };
-
-        // Handle data_len parameter
-        if let ScsiDataLength::Fixed(max_len) = req.data_len {
-            if response.data.len() > max_len {
-                response.data.truncate(max_len);
-            }
-        }
-
-        Ok(response)
-    }
-
     fn exec_test_unit_ready(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
-        if self.unit_attention {
-            self.unit_attention = false;
+        if self.media.take_changed() {
             // Sense key 0x06 UNIT_ATTENTION, ASC 0x28 "Not Ready to Ready Transition / Medium Changed"
             return Ok(self.check_condition(0x06, 0x28, 0x00));
         }
-        if self.backend.is_none() {
+        if !self.media.present() {
             // Sense key 0x02 NOT_READY, ASC 0x3A "Medium not present"
             return Ok(self.check_condition(0x02, 0x3A, 0x00));
         }
@@ -721,11 +343,11 @@ impl ScsiDevice {
     }
 
     fn exec_read_capacity_10(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
-        if self.backend.is_none() {
+        if !self.media.present() {
             return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
         }
         let block_size = self.logical_block_size as u32;
-        let last_lba = (self.size / self.logical_block_size).saturating_sub(1) as u32;
+        let last_lba = (self.size() / self.logical_block_size).saturating_sub(1) as u32;
         //eprintln!("SCSI READ CAPACITY: block_size={} last_lba={} data={:02x?}", block_size, last_lba, &[last_lba.to_be_bytes(), block_size.to_be_bytes()].concat());
 
         let mut data = vec![0u8; 8];
@@ -751,16 +373,16 @@ impl ScsiDevice {
     }
 
     fn perform_read(&mut self, lba: u64, count: usize) -> Result<ScsiResponse, std::io::Error> {
-        let Some(backend) = self.backend.as_mut() else {
+        if !self.media.present() {
             return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
-        };
+        }
         // Check LBA bounds before attempting I/O
-        let last_lba = self.size / self.logical_block_size;
+        let last_lba = self.size() / self.logical_block_size;
         if count > 0 && (lba >= last_lba || lba + count as u64 > last_lba) {
             return Ok(self.check_condition(0x05, 0x21, 0x00)); // Illegal Request: LBA Out of Range
         }
         let mut data = vec![0u8; count * self.logical_block_size as usize];
-        backend.read(lba * self.logical_block_size, &mut data)?;
+        self.media.node_mut().read(lba * self.logical_block_size, &mut data)?;
         let expected = count as u64 * self.logical_block_size;
         if data.len() as u64 != expected {
             eprintln!(
@@ -793,7 +415,7 @@ impl ScsiDevice {
             return Ok(self.check_condition(0x07, 0x27, 0x00)); // DATA PROTECT: write protected
         }
         // Past the end is an error, not a bigger disk.
-        if (lba + count as u64) * self.logical_block_size > self.size {
+        if (lba + count as u64) * self.logical_block_size > self.size() {
             return Ok(self.check_condition(0x05, 0x21, 0x00)); // ILLEGAL REQUEST: LBA out of range
         }
 
@@ -813,10 +435,10 @@ impl ScsiDevice {
         }
 
         // Writes always go through as 512-byte sectors (HDD path only, phys=logical=512)
-        let Some(backend) = self.backend.as_mut() else {
+        if !self.media.present() {
             return Ok(self.check_condition(0x02, 0x3A, 0x00));
-        };
-        if backend.write(lba * 512, data).is_err() {
+        }
+        if self.media.node_mut().write(lba * 512, data).is_err() {
             return Ok(self.check_condition(0x03, 0x0c, 0x00)); // MEDIUM ERROR: write error
         }
 
@@ -831,9 +453,7 @@ impl ScsiDevice {
         let loej  = (cdb[4] & 0x02) != 0;
         let start = (cdb[4] & 0x01) != 0;
         if loej && !start && self.is_cdrom() {
-            // Eject requested. eject_next() handles the count-driven cases:
-            // 0/1 disc empties the tray; 2+ discs cycle to the next.
-            self.eject_next();
+            self.eject();
         }
         Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
@@ -857,7 +477,7 @@ impl ScsiDevice {
         let block_desc: Vec<u8> = if dbd {
             vec![]
         } else {
-            let total_blocks = (self.size / self.logical_block_size) as u32;
+            let total_blocks = (self.size() / self.logical_block_size) as u32;
             vec![
                 0x00,                               // density code
                 (total_blocks >> 16) as u8,
@@ -873,7 +493,7 @@ impl ScsiDevice {
         // Synthesize geometry from disk size (HDD pages only)
         let heads: u32 = 16;
         let spt: u32 = 63;
-        let total_blocks_u64 = self.size / self.logical_block_size;
+        let total_blocks_u64 = self.size() / self.logical_block_size;
         let cylinders = ((total_blocks_u64 + (heads * spt - 1) as u64) / (heads * spt) as u64) as u32;
 
         let mut pages: Vec<u8> = Vec::new();
@@ -1227,7 +847,7 @@ impl ScsiDevice {
     }
 
     fn exec_read_toc_pma_atip(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
-        if self.backend.is_none() {
+        if !self.media.present() {
             return Ok(self.check_condition(0x02, 0x3A, 0x00)); // NOT READY / MEDIUM NOT PRESENT
         }
         let msf    = (cdb[1] & 0x02) != 0;
@@ -1235,7 +855,7 @@ impl ScsiDevice {
         let alloc_len = alloc_len_10(cdb);
 
         // TOC LBAs are always in physical CD sectors (2048 bytes each).
-        let total_lba = (self.size / self.phys_block_size) as u32;
+        let total_lba = (self.size() / self.phys_block_size) as u32;
         //eprintln!("SCSI READ TOC: format={} msf={} total_lba={} (current block_size={})",
         //    format, msf, total_lba, self.logical_block_size);
 
@@ -1306,7 +926,7 @@ impl ScsiDevice {
         if !self.is_cdrom() {
             return Ok(self.check_condition(0x05, 0x20, 0x00)); // Invalid command for HDD
         }
-        self.eject_next();
+        self.eject();
         Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
 
@@ -1343,6 +963,179 @@ impl ScsiDevice {
     }
 }
 
+impl ScsiTarget for ScsiDevice {
+    fn request(&mut self, req: &ScsiRequest) -> Result<ScsiResponse, std::io::Error> {
+        if req.cdb.is_empty() {
+            return Ok(self.check_condition(0x05, 0x20, 0x00)); // Illegal Request: Invalid command
+        }
+
+        let lun = (req.cdb[1] >> 5) & 0x7;
+
+        // For most commands, only LUN 0 is valid
+        if lun != 0 && req.cdb[0] != scsi_cmd::INQUIRY && req.cdb[0] != scsi_cmd::REQUEST_SENSE {
+            return Ok(self.check_condition(0x05, 0x25, 0x00)); // Illegal Request: LUN Not Supported
+        }
+
+        // Unit attention fires before any other command (except REQUEST_SENSE/INQUIRY).
+        if req.cdb[0] != scsi_cmd::REQUEST_SENSE
+            && req.cdb[0] != scsi_cmd::INQUIRY
+            && self.media.take_changed()
+        {
+            return Ok(self.check_condition(0x06, 0x28, 0x00));
+        }
+
+        let mut response = match req.cdb[0] {
+            scsi_cmd::TEST_UNIT_READY => self.exec_test_unit_ready(&req.cdb)?,
+            scsi_cmd::REQUEST_SENSE => self.exec_request_sense(&req.cdb)?,
+            scsi_cmd::INQUIRY => self.exec_inquiry(&req.cdb)?,
+            scsi_cmd::READ_CAPACITY_10 => self.exec_read_capacity_10(&req.cdb)?,
+            scsi_cmd::READ_6 => self.exec_read_6(&req.cdb)?,
+            scsi_cmd::READ_10 => self.exec_read_10(&req.cdb)?,
+            scsi_cmd::WRITE_6 => self.exec_write_6(&req.cdb, req.data_in.as_ref())?,
+            scsi_cmd::WRITE_10 => self.exec_write_10(&req.cdb, req.data_in.as_ref())?,
+            scsi_cmd::START_STOP_UNIT => self.exec_start_stop_unit(&req.cdb)?,
+            scsi_cmd::MODE_SENSE_6 => self.exec_mode_sense_6(&req.cdb)?,
+            scsi_cmd::MODE_SENSE_10 => self.exec_mode_sense_10(&req.cdb)?,
+            scsi_cmd::WRITE_BUFFER => self.exec_write_buffer(&req.cdb, req.data_in.as_ref())?,
+            scsi_cmd::READ_BUFFER => self.exec_read_buffer(&req.cdb)?,
+            scsi_cmd::SEND_DIAGNOSTIC => self.exec_send_diagnostic(&req.cdb)?,
+            scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL => ScsiResponse { status: 0x00, data: vec![] },
+            // Backend writes reach the host synchronously, but a copy-on-write
+            // overlay's record of its sectors is only written out on a flush.
+            scsi_cmd::SYNCHRONIZE_CACHE_10 => {
+                self.flush()?;
+                ScsiResponse { status: 0x00, data: vec![] }
+            }
+            scsi_cmd::MODE_SELECT_6 => self.exec_mode_select_6(&req.cdb, req.data_in.as_ref())?,
+            scsi_cmd::MODE_SELECT_10 => self.exec_mode_select_10(&req.cdb, req.data_in.as_ref())?,
+            // Nothing to do: one initiator, no medium to check, no speed to
+            // set. PROMs send RESERVE, RELEASE and VERIFY while probing, and
+            // a CD driver SET CD SPEED on open.
+            scsi_cmd::RESERVE_6 | scsi_cmd::RELEASE_6 | scsi_cmd::VERIFY_10 | scsi_cmd::SET_CD_SPEED => {
+                ScsiResponse { status: 0x00, data: vec![] }
+            }
+            scsi_cmd::READ_TOC_PMA_ATIP => self.exec_read_toc_pma_atip(&req.cdb)?,
+            scsi_cmd::GET_CONFIGURATION => self.exec_get_configuration(&req.cdb)?,
+            scsi_cmd::SGI_EJECT => self.exec_sgi_eject(&req.cdb)?,
+            scsi_cmd::SGI_HD2CDROM => self.exec_sgi_hd2cdrom(&req.cdb)?,
+            _ => {
+                eprintln!("SCSI: Unimplemented command {:02x} cdb={:02x?}", req.cdb[0], &req.cdb);
+                self.check_condition(0x05, 0x20, 0x00) // Illegal Request: Invalid Command Operation Code
+            }
+        };
+
+        // Handle data_len parameter
+        if let ScsiDataLength::Fixed(max_len) = req.data_len {
+            if response.data.len() > max_len {
+                response.data.truncate(max_len);
+            }
+        }
+
+        Ok(response)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.is_cdrom() {
+            return Ok(());
+        }
+        self.media.node_mut().flush()
+    }
+
+    /// Commit the divergence layer into the base image ("apply the changes").
+    /// Raw: copies the dirty sectors in place; CHD: rebuilds the base from the
+    /// diff (recompressing) and reopens a fresh overlay. No-op if not overlaid.
+    /// Returns a coarse count of what was committed. The concrete behaviour is
+    /// [`BlockNode::commit`] — including the CHD handle close/reopen.
+    fn cow_commit(&mut self) -> io::Result<usize> {
+        self.media.node_mut().commit()
+    }
+
+    /// Reset the divergence layer — discard all uncommitted writes ("roll
+    /// back"). Raw: truncates the overlay; CHD: deletes the `.diff.chd` and
+    /// reopens a fresh overlay over the untouched base. No-op if not overlaid.
+    /// The concrete behaviour is [`BlockNode::rollback`].
+    fn cow_reset(&mut self) -> io::Result<()> {
+        self.media.node_mut().rollback()
+    }
+
+    /// Copy the COW overlay into `dest` and return its dirty sector set.
+    /// Direct-mode / no-media devices create no file.
+    fn cow_export(&mut self, dest: &std::path::Path) -> io::Result<Option<Vec<u64>>> {
+        let node = self.media.node_mut();
+        if node.is_cow() { node.export_overlay(dest).map(Some) } else { Ok(None) }
+    }
+
+    /// Replace the COW overlay with the contents of `source` and adopt
+    /// `dirty` as the dirty sector set. No-op on non-COW / no-media devices.
+    fn cow_import(&mut self, source: &std::path::Path, dirty: Vec<u64>) -> io::Result<()> {
+        self.media.node_mut().import_overlay(source, dirty)
+    }
+
+    /// `(base, diff)` paths if this device is a CHD writing to a `.diff.chd`
+    /// sidecar that holds changes worth folding back into the base on a clean
+    /// shutdown. `None` for in-place / non-CHD / no-media devices.
+    fn pending_chd_sync(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        self.media.node().pending_sync()
+    }
+
+    /// Take the pending-sync paths AND release the disk backend, closing the CHD
+    /// so the base can be atomically rebuilt by `chd_disk::flatten_diff`. Returns
+    /// `None` and leaves the backend in place when there's nothing to sync.
+    fn take_pending_chd_sync(&mut self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let pending = self.pending_chd_sync();
+        if pending.is_some() {
+            // Nothing talks to the disk once the guest has stopped; it answers
+            // as a drive with its tray empty.
+            self.media = Media::Changer(ChangerNode::empty());
+        }
+        pending
+    }
+
+    /// The drive's tray and queue, `None` for a disk.
+    fn changer(&mut self) -> Option<&mut ChangerNode> {
+        if !self.is_cdrom() {
+            return None;
+        }
+        match &mut self.media {
+            Media::Changer(c) => Some(c),
+            Media::Fixed(..) => None,
+        }
+    }
+
+    fn status(&self, id: usize) -> Vec<String> {
+        let (phys, logical) = self.block_sizes();
+        if self.is_cdrom() {
+            let Media::Changer(changer) = &self.media else { return Vec::new() };
+            let list = changer.discs();
+            let active = changer.current().unwrap_or("(tray empty)");
+            let mut lines = vec![format!("SCSI ID {}: CD-ROM {} ({} disc(s))  phys_block={} logical_block={}",
+                id, active, list.len(), phys, logical)];
+            for (i, d) in list.iter().enumerate() {
+                let tag = if i == 0 { " <active>" } else if i == 1 { " <next>" } else { "" };
+                lines.push(format!("  [{}] {}{}", i, d, tag));
+            }
+            lines
+        } else {
+            let cow = if self.is_cow() { ", copy-on-write" } else { "" };
+            let path = match &self.media { Media::Fixed(_, p) => p.as_str(), Media::Changer(_) => "" };
+            vec![format!("SCSI ID {}: disk {} ({} blocks of {}{})",
+                id, path, self.size() / logical.max(1), logical, cow)]
+        }
+    }
+
+    fn block_size(&self) -> Option<u64> { Some(self.logical_block_size) }
+
+    fn reset_block_size(&mut self, cdrom_512: bool) {
+        if cdrom_512 && self.is_cdrom() {
+            self.logical_block_size = 512;
+        } else {
+            self.power_on_block_size();
+        }
+    }
+
+    fn cow_dirty(&self) -> Option<usize> { self.is_cow().then(|| self.cow_dirty_count()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1375,7 +1168,6 @@ mod tests {
         let node = crate::block_node::RawNode::open(&path).unwrap();
         let mut dev = ScsiDevice::new(
             Box::new(node),
-            4 * 512,
             false,
             path.display().to_string(),
             vec![],
@@ -1416,7 +1208,6 @@ mod tests {
             .with_base_path(&base);
         let mut dev = ScsiDevice::new(
             Box::new(node),
-            2 * 512,
             false,
             base.display().to_string(),
             vec![],
@@ -1434,7 +1225,7 @@ mod tests {
         assert_eq!(dev.cow_dirty_count(), 1);
 
         // Export the overlay, roll back, then re-import it.
-        let dirty = dev.cow_export(&export).unwrap();
+        let dirty = dev.cow_export(&export).unwrap().expect("a COW disk exports");
         assert_eq!(dirty, vec![0u64]);
         dev.cow_reset().unwrap();
         assert_eq!(dev.cow_dirty_count(), 0);
@@ -1458,9 +1249,9 @@ mod tests {
     fn cdrom() -> ScsiDevice {
         let path = std::env::temp_dir().join(format!("iris-scsi-alloc-{}.iso", std::process::id()));
         std::fs::write(&path, vec![0u8; 100 * 2048]).expect("test image");
-        let node = RawNode::open(&path).expect("open");
+        let node = crate::block_node::RawNode::open(&path).expect("open");
         let identity = ScsiIdentity::new(b"TEST    ", b"CD-ROM          ", b"1.0 ");
-        let mut dev = ScsiDevice::new(Box::new(node), 100 * 2048, true, path.display().to_string(), Vec::new(), identity);
+        let mut dev = ScsiDevice::new(Box::new(node), true, path.display().to_string(), Vec::new(), identity);
         let _ = run(&mut dev, &[0x00, 0, 0, 0, 0, 0]);
         let _ = run(&mut dev, &[0x03, 0, 0, 0, 18, 0]);
         dev
@@ -1499,5 +1290,31 @@ mod tests {
         let mut dev = cdrom();
         assert_eq!(run(&mut dev, &[0x03, 0, 0, 0, 8, 0]).data.len(), 8);
         assert_eq!(run(&mut dev, &[0x03, 0, 0, 0, 0, 0]).data.len(), 4, "SCSI-2: 0 means 4 bytes");
+    }
+
+    /// A disc swapped in through the changer is opened as the drive opens any
+    /// disc, so a CHD CD loads, not only a raw ISO.
+    #[test]
+    fn a_disc_change_loads_a_chd_cd() {
+        use libchdman_rs::cd::{create_from_iso, CdCreateOptions};
+        let dir = std::env::temp_dir().join(format!("iris-discswap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let iso = dir.join("disc.iso");
+        std::fs::write(&iso, vec![0x42u8; 16 * 2048]).unwrap();
+        let chd = dir.join("disc.chd");
+        create_from_iso(&iso, &chd, CdCreateOptions::default(), &mut |_| {}, &|| false).unwrap();
+
+        let mut cd = ScsiDevice::new_empty_cdrom(CDROM_IDENTITY);
+        assert!(!cd.has_media());
+        cd.changer().unwrap().load(&chd.display().to_string()).unwrap();
+        assert!(cd.has_media());
+        assert_eq!(cd.size(), 16 * 2048, "the CHD's size, not the file's");
+        // The medium change is reported once, then the disc reads.
+        let tur = cd.request(&request(&[0, 0, 0, 0, 0, 0], None)).unwrap();
+        assert_eq!(tur.status, 0x02, "unit attention after the change");
+        let read = cd.request(&request(&[0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0], None)).unwrap();
+        assert_eq!(read.status, 0x00);
+        assert_eq!(read.data, vec![0x42u8; 2048]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

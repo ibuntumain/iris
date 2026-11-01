@@ -18,7 +18,7 @@
 //! frame bytes are in wire order; the Bridge applies any programmed swap.
 //!
 //! Frames go through iris's network engine like the O2's MEC does: see
-//! [`Ioc3Eth::start_nat`] and [`Ioc3Eth::attach`].
+//! [`Ioc3Eth::attach`].
 //!
 //! Approximations (the QEMU model this was ported from has the same ones,
 //! plus one it dropped):
@@ -1014,13 +1014,6 @@ impl State {
     }
 }
 
-/// The backend side: frames out, frames in.
-struct Link {
-    to_net: rtrb::Producer<Vec<u8>>,
-    from_net: rtrb::Consumer<Vec<u8>>,
-    tx_wake: Option<Arc<crate::net::Wake>>,
-}
-
 /// How the MAC drives its interrupt line: called with each new level.
 type IrqFn = Box<dyn Fn(bool) + Send + Sync>;
 
@@ -1036,12 +1029,17 @@ pub struct Ioc3Eth {
     irq: Mutex<Option<IrqFn>>,
     /// Serialises delivery of level changes to the interrupt callback.
     irq_order: Mutex<()>,
-    link: Mutex<Option<Link>>,
+    link: Mutex<Option<crate::net::Rings>>,
     rx_wake: Mutex<Option<Arc<crate::net::Wake>>>,
     /// Between `start` and `stop`; the NAT engine watches it too.
     running: Arc<AtomicBool>,
-    /// The NAT engine, between runs. It keeps its flows across a stop.
-    nat: Arc<Mutex<Option<crate::net::NatEngine>>>,
+    /// The flag the network backend watches, set and cleared with `running`.
+    /// It belongs to the link, which arrives after `running` exists and
+    /// whose backend this device runs on its own thread.
+    net_running: Mutex<Option<Arc<AtomicBool>>>,
+    /// The network backend, between runs. A NAT engine keeps its flows across
+    /// a stop.
+    backend: Arc<Mutex<Option<Box<dyn crate::net::NetBackend>>>>,
     /// The NAT and receive threads, joined in `stop`.
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     me: Weak<Self>,
@@ -1072,7 +1070,8 @@ impl Ioc3Eth {
             link: Mutex::new(None),
             rx_wake: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
-            nat: Arc::new(Mutex::new(None)),
+            net_running: Mutex::new(None),
+            backend: Arc::new(Mutex::new(None)),
             threads: Mutex::new(Vec::new()),
             me: me.clone(),
             heartbeat: OnceLock::new(),
@@ -1142,9 +1141,7 @@ impl Ioc3Eth {
             for f in frames {
                 let _ = link.to_net.push(f);
             }
-            if let Some(w) = &link.tx_wake {
-                w.notify();
-            }
+            link.tx_wake.notify();
         }
     }
 
@@ -1154,46 +1151,31 @@ impl Ioc3Eth {
         }
     }
 
-    /// Connect to a backend: frames sent go on `to_net` (and `tx_wake` is
-    /// notified), frames on `from_net` are received. `rx_wake` is notified
-    /// when the guest does something that can unblock a waiting frame.
-    pub fn attach(
-        &self,
-        to_net: rtrb::Producer<Vec<u8>>,
-        from_net: rtrb::Consumer<Vec<u8>>,
-        tx_wake: Option<Arc<crate::net::Wake>>,
-        rx_wake: Option<Arc<crate::net::Wake>>,
-    ) {
-        *self.link.lock() = Some(Link { to_net, from_net, tx_wake });
-        *self.rx_wake.lock() = rx_wake;
-    }
-
-    /// Put iris's NAT gateway behind this Ethernet (DHCP, ARP, ICMP, TCP, DNS
-    /// and the port forwards in `config`). Returns the NAT's controls. The
-    /// NAT and receive threads run between `start` and `stop`; the NAT
-    /// engine, which only trades frames with the host and never reaches the
-    /// guest, keeps its flows across a stop.
-    pub fn start_nat(self: &Arc<Self>, config: crate::net::GatewayConfig) -> Arc<crate::net::NatControl> {
-        let (to_net, tx_cons) = rtrb::RingBuffer::new(256);
-        let (rx_prod, from_net) = rtrb::RingBuffer::new(256);
-        let rx_wake = crate::net::Wake::new();
-        let tx_wake = crate::net::Wake::new();
-        let ctl = crate::net::NatControl::new();
-        let controls = ctl.clone();
-        let engine = crate::net::NatEngine::new(config, tx_cons, rx_prod, rx_wake.clone(), tx_wake.clone(), self.running.clone(), ctl);
-        self.attach(to_net, from_net, Some(tx_wake), Some(rx_wake));
-        *self.nat.lock() = Some(engine);
+    /// Connect to the backend `[network]` selected: frames sent go on
+    /// `link.to_net`, frames on `link.from_net` are received, and
+    /// `link.rx_wake` is notified when the guest does something that can
+    /// unblock a waiting frame. The backend and receive threads run between
+    /// `start` and `stop`; a NAT engine, which only trades frames with the
+    /// host and never reaches the guest, keeps its flows across a stop.
+    pub fn attach(&self, mut link: crate::net::Link) {
+        let backend = link.backend();
+        let running = link.running();
+        let rings = link.into_rings();
+        *self.rx_wake.lock() = Some(rings.rx_wake.clone());
+        *self.link.lock() = Some(rings);
+        *self.net_running.lock() = Some(running.clone());
+        *self.backend.lock() = backend;
         if self.running.load(Ordering::SeqCst) {
+            running.store(true, Ordering::SeqCst);
             self.spawn_nat();
         }
-        controls
     }
 
     fn spawn_nat(&self) {
-        let slot = self.nat.clone();
+        let slot = self.backend.clone();
         let Some(mut engine) = slot.lock().take() else { return };
         let t = std::thread::Builder::new()
-            .name("ip30-eth-nat".into())
+            .name("ip30-eth-net".into())
             .spawn(move || {
                 engine.run();
                 *slot.lock() = Some(engine);
@@ -1303,6 +1285,9 @@ impl Device for Ioc3Eth {
             .spawn(move || Self::rx_loop(me, running, wake))
             .expect("ioc3 eth rx thread");
         self.threads.lock().push(rx);
+        if let Some(r) = self.net_running.lock().as_ref() {
+            r.store(true, Ordering::SeqCst);
+        }
         self.spawn_nat();
         // Frames queued while stopped.
         self.wake_rx();
@@ -1314,9 +1299,12 @@ impl Device for Ioc3Eth {
         if !self.running.swap(false, Ordering::SeqCst) {
             return;
         }
+        if let Some(r) = self.net_running.lock().as_ref() {
+            r.store(false, Ordering::SeqCst);
+        }
         self.wake_rx();
-        if let Some(w) = self.link.lock().as_ref().and_then(|l| l.tx_wake.as_ref()) {
-            w.notify();
+        if let Some(l) = self.link.lock().as_ref() {
+            l.tx_wake.notify();
         }
         // The receive thread can hold the last reference for a moment, and
         // then this runs on it; it cannot join itself.

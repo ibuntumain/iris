@@ -50,8 +50,10 @@ source. IRIX on Indigo2 and IP28 keeps time with the 8254: timer 0 is the
 100 Hz system clock and timer 1 the 1000 Hz fast clock (parked when nothing
 needs it), so the figure reads 1000 while the fast clock runs. IRIX on the
 Octane runs both clocks on CP0 Compare, which fires for whichever is due
-next, so there the figure reads about 1100: every Compare match is one
-interrupt, and the two clocks cannot be told apart from outside the guest.
+next, so there the figure counts every Compare match as one interrupt and the
+two clocks cannot be told apart from outside the guest. At an idle desktop it
+reads about 107 (the 100 Hz tick plus a few extra Compare writes); during boot
+it reads about 1000 while IRIX calibrates the clock.
 
 For a repeatable speed number, use the benchmark: `iris-bench run`, or the
 Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).
@@ -67,7 +69,10 @@ the IP22/IP24 extended layouts.
 
 `banks` has room for eight entries; every machine today uses four, and the
 rest must be 0. On the O2 each entry is the kit in a DIMM pair (32, 64, 128 or
-256 MB), largest first: `[256, 256, 256, 256]` is 1 GB.
+256 MB), largest first: `[256, 256, 256, 256]` is 1 GB. On the Octane each
+entry is a bank of two matched DIMMs (64, 128, 256, 512, 1024 or 2048 MB), so
+its eight DIMM slots are four entries: `[2048, 2048, 2048, 2048]` is the
+largest machine, 8 GB of 1 GB DIMMs.
 
 `banks` in `iris.toml` / iris-gui is applied only when you **Start** the VM.
 Changing RAM while IRIX is running updates the config but not the live guest —
@@ -443,6 +448,21 @@ The ports are the defaults: `serial_port_a` and `serial_port_b` in the config
 (or `--serial-port-a` / `--serial-port-b`) move them, as `monitor_port` moves the
 monitor, so that two iris processes can run at once.
 
+Each serial line can also be served on a Unix socket:
+`serial_socket_a` / `serial_socket_b` (or `--serial-socket-a` /
+`--serial-socket-b`). The socket carries raw bytes with no telnet negotiation,
+takes one client at a time, and is removed when iris exits; a stale socket file
+from a crashed run is replaced, a file that is not a socket is refused. A
+client that reads too slowly loses output, as on the TCP port. `serial_log`
+writes the console's transcript and `serial_log_a` / `serial_log_b` the other
+line's (the Indy and Indigo2 console is channel B, the Octane's and O2's
+channel A). With `ci`, a console that has a socket still feeds the control
+socket's `serial-read` and `wait-serial`, and either side may type.
+
+```bash
+socat - UNIX-CONNECT:/tmp/octane-console.sock
+```
+
 ### Connect to a serial port
 
 ```bash
@@ -518,8 +538,12 @@ max_fps = 30                 # most updates a second per viewer
 It works on every machine and graphics board (Newport, XZ/Extreme, IMPACT,
 the O2), with the normal window open or under `--ci` with no window. Not with
 `--headless`, which has no screen to serve. The window, the monitor and any
-number of viewers can type and click at the same time. iris-gui has no VNC
-server.
+number of viewers can type and click at the same time.
+
+**iris-gui** serves the screen too: set **Serve on** in the Performance tab
+(a port for `127.0.0.1`, or `host:port`), which is the same `vnc.listen` key
+the machine's TOML carries. The server starts with the machine and stops with
+it, and a port already in use is reported rather than failing the start.
 
 What you see is the guest's screen, without the window's status bar. Only
 the parts of the screen that change are sent, so an idle desktop costs next
@@ -594,6 +618,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 [machine]
 profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md)
 cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
+# cpus  = 2                 # Octane only: a second processor (docs/Octane/multiprocessor.md)
 
 [graphics]
 board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact) or "none"
@@ -610,7 +635,7 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
 # ── SCSI ─────────────────────────────────────────────────────────────────────
 
-# Valid IDs: 1–7. For a hard disk, set cdrom = false. On a machine with two
+# Valid IDs: 1–7 (1–15 on the Octane). For a hard disk, set cdrom = false. On a machine with two
 # controllers (Indigo2, O2) [scsi.N] is id N on controller 0 and [scsi.16+N]
 # is id N on controller 1, so one id can be used on both; `controller = 1`
 # in a [scsi.N] table does the same for that one device.
@@ -768,6 +793,10 @@ Automation and debugging
   --vnc [ADDR]                VNC server on ADDR (host:port or port; default 127.0.0.1:5900)
   --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
   --serial-port-b <PORT>      Serial channel B TCP port (default 8881)
+  --serial-socket-a <PATH>    Also serve channel A on a Unix socket
+  --serial-socket-b <PATH>    Likewise channel B
+  --serial-log-a <FILE>       Log channel A when it is not the console
+  --serial-log-b <FILE>       Likewise channel B
   --gdb-port <PORT>           Start the GDB stub
   --jitv2-threads <N>         jitv2 compile-pool thread count
   --load-elf <FILE>           Load a static big-endian ELF32 and start at its entry

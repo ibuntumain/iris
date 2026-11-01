@@ -23,10 +23,10 @@
 //!   by the time the driver looks, so the busy bit never reads set.
 //!
 //! Frames go to and come from a network backend over two rings, the way the
-//! Indy's SEEQ 8003 meets IRIS's NAT gateway: `start_nat` runs one.
+//! Indy's SEEQ 8003 meets IRIS's network backends: `attach` runs one.
 
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::snapshot::{get_field, hex_u32, hex_u64, load_u16_slice, toml_u32, toml_u64, u16_slice_to_toml};
@@ -227,25 +227,30 @@ impl State {
     }
 }
 
-/// Where frames go: a backend's two rings.
-struct Link {
-    to_net: rtrb::Producer<Vec<u8>>,
-    from_net: rtrb::Consumer<Vec<u8>>,
-    /// Told when a frame has been put on `to_net`.
-    tx_wake: Option<Arc<crate::net::Wake>>,
-}
-
 pub struct Mec {
     ram: Arc<crate::dev::crime_mem::O2Memory>,
     st: Mutex<State>,
-    link: Mutex<Option<Link>>,
+    link: Mutex<Option<crate::net::Rings>>,
     /// CRIME's Ethernet input.
     irq: std::sync::OnceLock<crate::irq::IrqLine>,
+    /// The status bar's activity bits, shared with the display thread.
+    heartbeat: std::sync::OnceLock<Arc<AtomicU64>>,
 }
 
 impl Mec {
     pub fn new(ram: Arc<crate::dev::crime_mem::O2Memory>) -> Self {
-        Self { ram, st: Mutex::new(State::new()), link: Mutex::new(None), irq: std::sync::OnceLock::new() }
+        Self { ram, st: Mutex::new(State::new()), link: Mutex::new(None), irq: std::sync::OnceLock::new(), heartbeat: std::sync::OnceLock::new() }
+    }
+
+    /// Light the status bar's Ethernet activity bits in `heartbeat`.
+    pub fn set_heartbeat(&self, heartbeat: Arc<AtomicU64>) {
+        let _ = self.heartbeat.set(heartbeat);
+    }
+
+    fn blink(&self, bit: u64) {
+        if let Some(hb) = self.heartbeat.get() {
+            hb.fetch_or(bit, Ordering::Relaxed);
+        }
     }
 
     /// Wire the chip's interrupt to `line`.
@@ -262,33 +267,12 @@ impl Mec {
         }
     }
 
-    /// Connect to a backend: frames sent go on `to_net`, frames on `from_net`
-    /// are received.
-    pub fn attach(&self, to_net: rtrb::Producer<Vec<u8>>, from_net: rtrb::Consumer<Vec<u8>>, tx_wake: Option<Arc<crate::net::Wake>>) {
-        *self.link.lock().unwrap() = Some(Link { to_net, from_net, tx_wake });
-    }
-
-    /// Run IRIS's NAT gateway behind this interface, on a thread of its own:
-    /// DHCP, DNS and the port forwards in `config`, as the Indy's SEEQ 8003
-    /// has them.
-    /// Returns the NAT's controls.
-    pub fn start_nat(&self, config: crate::net::GatewayConfig) -> Arc<crate::net::NatControl> {
-        let (to_net, tx_cons) = rtrb::RingBuffer::new(256);
-        let (rx_prod, from_net) = rtrb::RingBuffer::new(256);
-        let rx_wake = crate::net::Wake::new();
-        let tx_wake = crate::net::Wake::new();
-        let running = Arc::new(AtomicBool::new(true));
-        let ctl = crate::net::NatControl::new();
-        let controls = ctl.clone();
-        let tw = tx_wake.clone();
-        std::thread::Builder::new()
-            .name("ip32-mec-nat".into())
-            .spawn(move || {
-                crate::net::NatEngine::new(config, tx_cons, rx_prod, rx_wake, tw, running, ctl).run();
-            })
-            .expect("mec NAT thread");
-        self.attach(to_net, from_net, Some(tx_wake));
-        controls
+    /// Connect to the backend `[network]` selected, and run it on a thread of
+    /// its own: frames sent go on `link.to_net`, frames on `link.from_net` are
+    /// received.
+    pub fn attach(&self, mut link: crate::net::Link) {
+        link.spawn("ip32-mec-net");
+        *self.link.lock().unwrap() = Some(link.into_rings());
     }
 
     /// Frames sent and received so far, and received ones dropped for want of
@@ -531,14 +515,13 @@ impl Mec {
         if frames.is_empty() {
             return;
         }
+        self.blink(crate::dev::ng1::rex3::Rex3::HB_ENET_TX);
         if let Some(link) = self.link.lock().unwrap().as_mut() {
             for f in frames {
                 Self::trace("tx", &f);
                 let _ = link.to_net.push(f);
             }
-            if let Some(w) = &link.tx_wake {
-                w.notify();
-            }
+            link.tx_wake.notify();
         }
     }
 
@@ -641,6 +624,7 @@ impl Mec {
             self.ram_write(u64::from(buf), &stat.to_be_bytes());
             s.int_status |= bits::INT_RX_THRESHOLD;
             s.rx_frames += 1;
+            self.blink(crate::dev::ng1::rex3::Rex3::HB_ENET_RX);
         }
     }
 }
@@ -881,9 +865,8 @@ mod tests {
     #[test]
     fn a_descriptor_is_sent_and_reports_back() {
         let (m, ram) = mec();
-        let (to_net, mut tx_cons) = rtrb::RingBuffer::new(8);
-        let (_rx_prod, from_net) = rtrb::RingBuffer::new(8);
-        m.attach(to_net, from_net, None);
+        let (link, mut tx_cons, _rx_prod) = crate::net::Link::loopback();
+        m.attach(link);
         let (irq, line) = crate::irq::LevelProbe::line();
         m.connect_irq(line);
         let ring = 0x2000usize;
@@ -918,9 +901,8 @@ mod tests {
     #[test]
     fn a_frame_is_received_into_the_oldest_buffer() {
         let (m, ram) = mec();
-        let (to_net, _tx_cons) = rtrb::RingBuffer::new(8);
-        let (mut rx_prod, from_net) = rtrb::RingBuffer::new(8);
-        m.attach(to_net, from_net, None);
+        let (link, _tx_cons, mut rx_prod) = crate::net::Link::loopback();
+        m.attach(link);
         let (irq, line) = crate::irq::LevelProbe::line();
         m.connect_irq(line);
         m.write64(reg::STATION, 0x0800_6912_3456);

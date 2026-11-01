@@ -46,19 +46,9 @@ pub const VICE_SIZE: u32 = 0x0100_0000;
 /// MACE, the I/O ASIC (`crate::dev::mace`): PCI, Ethernet, the ISA block.
 pub const MACE_BASE: u32 = 0x1f00_0000;
 pub const MACE_SIZE: u32 = 0x0080_0000;
-/// MACE's ISA-block register holding the flash write-enable and the Dallas
-/// 1-Wire ("NIC") data line. The PROM bit-bangs the serial-ID chip here.
+/// MACE's ISA-block register holding the flash write-enable, the Dallas
+/// identity line and the front LEDs (`crate::dev::mace_id`).
 pub const MACE_ISA_FLASH_NIC_REG: u32 = MACE_BASE + 0x0031_0008;
-
-/// Bits in [`MACE_ISA_FLASH_NIC_REG`], as named by NetBSD's `macereg.h`.
-pub mod nic_bit {
-    /// 1 => flash writes enabled.
-    pub const FLASH_WE: u8 = 0x01;
-    /// Release the 1-Wire line (let it float high).
-    pub const DEASSERT: u8 = 0x04;
-    /// The 1-Wire data line itself.
-    pub const DATA: u8 = 0x08;
-}
 
 /// `com0`, the PROM's console UART. NetBSD attaches it at `mace0 offset
 /// 0x390000`; `com1` follows at 0x398000.
@@ -128,8 +118,9 @@ pub use crate::dev::mace_pci::*;
 pub use crate::dev::mace_ps2::*;
 pub use crate::dev::mace_sdma::*;
 pub use crate::dev::mace_ust::*;
+pub use crate::dev::mace_uart::*;
 pub use crate::dev::ns16550::*;
-pub use crate::dev::onewire::*;
+pub use crate::dev::mace_id::*;
 
 
 pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
@@ -142,6 +133,17 @@ pub const RAM_WINDOW_SIZE: u32 = 8 * 128 * 1024 * 1024;
 pub const NO_ECC_BASE: u64 = 0x8000_0000;
 /// How much of memory also answers from address 0: the first 256 MB.
 pub const LOW_ALIAS_SIZE: u32 = 0x1000_0000;
+
+/// Where an O2 can answer with memory. The no-ECC alias is left out: the CPU
+/// folds it onto [`RAM_BASE`], so no other code sees an address in it.
+pub fn memory_map() -> crate::memory_map::MemoryMap {
+    use crate::memory_map::{MemKind, MemRange, MemoryMap};
+    MemoryMap::new(vec![
+        MemRange::new("low alias", MemKind::Alias, 0, LOW_ALIAS_SIZE as u64),
+        MemRange::new("prom", MemKind::Rom, PROM_BASE as u64, (PROM_BASE + PROM_SIZE) as u64),
+        MemRange::new("ram", MemKind::Ram, RAM_BASE as u64, RAM_BASE as u64 + RAM_WINDOW_SIZE as u64),
+    ])
+}
 
 /// Boot PROM. Same address as the Indy's, which is the one thing that carries
 /// over: the MIPS reset vector is 0xbfc00000 on both.
@@ -161,11 +163,12 @@ pub const MACE_RTC_SIZE: u32 = 0x0001_0000;
 /// What is plugged into an O2 beyond its memory: the SCSI controllers (the
 /// machine attaches their disks from `[scsi.N]`, see `O2Machine::new`), and
 /// where the PROM's flash (its environment) is kept.
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 pub struct Ip32Options {
-    /// The two on-board AIC-7880s. Without them the PROM finds nothing to
-    /// boot from.
-    pub scsi: bool,
+    /// The buses of the two on-board AIC-7880s (internal, external), with
+    /// their targets attached. Without the controllers the PROM finds nothing
+    /// to boot from.
+    pub scsi: Option<[crate::scsi::ScsiBus; 2]>,
     /// A file holding the flash, so `setenv` survives from run to run.
     pub flash_file: Option<std::path::PathBuf>,
     /// A PS/2 keyboard on port 0, and a mouse on port 1 if `Some(true)`.
@@ -430,6 +433,12 @@ pub struct Ip32Bus {
 }
 
 impl Ip32Bus {
+    /// Flush the disks on every SCSI controller.
+    pub fn flush_disks(&self) -> std::io::Result<()> {
+        let controllers = self.scsi.lock().unwrap().clone();
+        controllers.iter().try_for_each(|c| c.bus().flush())
+    }
+
     /// `ram_bytes` of memory in the usual fitting for that size, or, for a
     /// size no O2 can have, one bank of it (power-of-two sizes only). `prom`
     /// must be the raw 512 KiB IP32 PROM image.
@@ -465,8 +474,10 @@ impl Ip32Bus {
             scsi: Mutex::new(Vec::new()),
         };
         if let Some(mac) = opts.mac {
-            bus.mace.onewire = crate::dev::onewire::OneWireId::from_mac(mac);
+            bus.mace.id = crate::dev::mace_id::MaceId::new(mac);
         }
+        // The status bar's lights, from the register's heartbeat.
+        bus.mace.mec.set_heartbeat(bus.mace.id.heartbeat.clone());
         if let Some(mouse) = opts.keyboard {
             // With a keyboard the PROM and IRIX take the graphics console;
             // without one, the serial console. The graphics hardware is
@@ -474,14 +485,16 @@ impl Ip32Bus {
             bus.mace.enable_ps2(mouse);
         }
         bus.gbe.connect_irq(bus.crime.regs.clone());
-        if opts.scsi {
+        if let Some([bus_a, bus_b]) = opts.scsi {
             // The controller fetches its work from host memory, which it
             // reaches through the PCI bridge it is attached to.
-            let scsi = crate::dev::aic7880::Aic7880::new();
+            let scsi = crate::dev::aic7880::Aic7880::new_at(0, bus_a);
             // The second controller. Real hardware has it whether or not
             // anything is plugged into it, and a kernel that expects two
             // waits on the one that is missing.
-            let scsi_b = crate::dev::aic7880::Aic7880::new_at(1);
+            let scsi_b = crate::dev::aic7880::Aic7880::new_at(1, bus_b);
+            scsi.set_heartbeat(bus.mace.id.heartbeat.clone());
+            scsi_b.set_heartbeat(bus.mace.id.heartbeat.clone());
             bus.mace.pci.attach(IP32_SCSI_SLOT_B, "aic7880-b", scsi_b.clone());
             bus.mace.pci.attach(IP32_SCSI_SLOT, "aic7880", scsi.clone());
             let mut list = bus.scsi.lock().unwrap();
@@ -651,6 +664,9 @@ impl crate::traits::Saveable for Ip32Bus {
         t.insert("mace".into(), self.mace.save_state());
         let scsi = self.scsi.lock().unwrap().iter().map(|c| c.save_state()).collect();
         t.insert("scsi".into(), toml::Value::Array(scsi));
+        if let Some(words) = self.ram.stack_page_words() {
+            t.insert("stack_page".into(), toml::Value::Array(words.into_iter().map(crate::snapshot::hex_u64).collect()));
+        }
         toml::Value::Table(t)
     }
 
@@ -677,6 +693,10 @@ impl crate::traits::Saveable for Ip32Bus {
                 c.load_state(s)?;
             }
         }
+        if let Some(toml::Value::Array(a)) = get_field(v, "stack_page") {
+            let words: Option<Vec<u64>> = a.iter().map(crate::snapshot::toml_u64).collect();
+            self.ram.restore_stack_page(&words.ok_or("stack_page: not a list of dwords")?)?;
+        }
         Ok(())
     }
 }
@@ -687,10 +707,11 @@ impl Ip32Bus {
     /// on the hardware. The PROM sets up the rest again as it starts.
     pub fn power_on(&self) {
         use crate::traits::Resettable;
+        self.ram.set_stack_page(false);
         self.crime.regs.power_on();
         let m = &self.mace;
         let devices: [&dyn Resettable; 8] =
-            [&*m.ust, &m.rtc, &m.ps2, &m.onewire, &m.com0, &m.com1, &m.sdma, &*m.isa];
+            [&*m.ust, &m.rtc, &m.ps2, &m.id, &m.com0, &m.com1, &m.sdma, &*m.isa];
         for d in devices {
             d.power_on();
         }
@@ -749,6 +770,7 @@ impl BusDevice for Ip32Bus {
     fn write16(&self, addr: u64, val: u16) -> u32 { self.phys.write16(addr, val) }
     fn write32(&self, addr: u64, val: u32) -> u32 { self.phys.write32(addr, val) }
     fn write64(&self, addr: u64, val: u64) -> u32 { self.phys.write64(addr, val) }
+    fn describe_fault(&self, addr: u64, size: usize) -> Option<String> { self.phys.describe_fault(addr, size) }
     fn mem_ptr(&self, addr: u64) -> Option<*const u64> { self.phys.mem_ptr(addr) }
     fn read_block(&self, addr: u64, buf: &mut [u64]) -> u32 { self.phys.read_block(addr, buf) }
     fn write_block(&self, addr: u64, buf: &[u64]) -> u32 { self.phys.write_block(addr, buf) }

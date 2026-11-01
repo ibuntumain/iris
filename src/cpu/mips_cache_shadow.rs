@@ -155,11 +155,15 @@ pub struct ShadowCache<
     /// tcache path can serve this model too (`jit_dc_geometry`).
     tc_base: UnsafeCell<*mut u8>,
     tc_bitmap: UnsafeCell<u64>,
+    /// The window's `ppmem::window_shift`, set before the CPU runs.
+    tc_shift: UnsafeCell<u32>,
     #[cfg(feature = "jitv2")]
     tc_gen: UnsafeCell<*mut std::sync::atomic::AtomicU64>,
     /// Decoded instructions, by physical page. Never touches the shadow
     /// arrays above — see `decode_cache`.
     decode: UnsafeCell<crate::cpu::decode_cache::DecodeCache>,
+    /// See [`MipsCache::set_pd_tag_store_hook`]. Consulted by `cache_op` only.
+    pd_tag_hook: UnsafeCell<Option<Box<dyn Fn(u32) + Send + Sync>>>,
 }
 
 // Safety: the CPU thread is the only accessor, as for every other cache model
@@ -208,9 +212,11 @@ impl<
             l2: UnsafeCell::new(Shadow::new(Self::L2_LINES, if Self::R10K { L2_SIZE / 8 } else { 0 })),
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
             tc_bitmap: UnsafeCell::new(0),
+            tc_shift: UnsafeCell::new(crate::ppmem::BITMAP_SHIFT),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
             decode: UnsafeCell::new(crate::cpu::decode_cache::DecodeCache::new()),
+            pd_tag_hook: UnsafeCell::new(None),
         }
     }
 
@@ -220,7 +226,7 @@ impl<
     /// set bit also means the base is valid.
     #[inline(always)]
     fn ram(&self, phys: u64) -> Option<*mut u8> {
-        if crate::ppmem::bitmap_maps(unsafe { *self.tc_bitmap.get() }, phys) {
+        if crate::ppmem::bitmap_maps_at(unsafe { *self.tc_bitmap.get() }, unsafe { *self.tc_shift.get() }, phys) {
             Some(unsafe { *self.tc_base.get() })
         } else {
             None
@@ -366,9 +372,20 @@ impl<
         unsafe { *self.tc_base.get() = base };
     }
 
+    fn set_tcache_shift(&self, shift: u32) {
+        unsafe {
+            *self.tc_shift.get() = shift;
+            (*self.decode.get()).set_window_shift(shift);
+        }
+    }
+
     fn tcache_bitmap_ptr(&self) -> *mut u64 { self.tc_bitmap.get() }
 
     fn tcache_base_ptr(&self) -> *mut u8 { unsafe { *self.tc_base.get() } }
+
+    fn set_pd_tag_store_hook(&self, hook: Box<dyn Fn(u32) + Send + Sync>) {
+        unsafe { *self.pd_tag_hook.get() = Some(hook) };
+    }
 
     /// Tags only: a fetch reads memory through the decode cache and changes
     /// nothing a guest can see.
@@ -392,6 +409,7 @@ impl<
             return crate::cpu::mips_cache_v2::JitDcGeometry {
                 supported: true,
                 tagless: true,
+                window_shift: unsafe { *self.tc_shift.get() },
                 ..crate::cpu::mips_cache_v2::JitDcGeometry::unsupported()
             };
         }
@@ -482,11 +500,15 @@ impl<
 
     fn write64_masked(&self, _virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
         if let Some(base) = self.ram(phys_addr) {
+            // Compare-exchange, not a read and a store: another CPU's store
+            // to the rest of this doubleword must not be lost. No lock would
+            // do, because plain stores would not take it.
             let p = unsafe { base.add((phys_addr & !7) as usize) as *mut u64 };
-            unsafe {
-                let cur = (*p).rotate_left(32);
-                *p = ((cur & !mask) | (val & mask)).rotate_left(32);
-            }
+            let (v, m) = (val.rotate_left(32), mask.rotate_left(32));
+            let word = unsafe { std::sync::atomic::AtomicU64::from_ptr(p) };
+            let _ = word.fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed, |cur| {
+                Some((cur & !m) | (v & m))
+            });
             self.bump_gen(phys_addr);
             return BUS_OK;
         }
@@ -508,6 +530,12 @@ impl<
     fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u64 {
         let sel = cache_op & 3;
         let op = cache_op & 0x1C;
+
+        if op == C_IST && sel == CACH_PD {
+            if let Some(hook) = unsafe { &*self.pd_tag_hook.get() } {
+                hook(phys_addr as u32);
+            }
+        }
 
         // Tag operations under `op`, the whole data-array walk only under
         // `hit` as well — see `l2_op_log`.
@@ -651,6 +679,33 @@ impl<
         self.downstream.clone()
     }
 
+    fn cas_ram32(&self, phys: u64, old: u32, new: u32) -> Option<bool> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Memory beyond the window (the Octane's above 4 GB) is on the bus.
+        let Some(base) = self.ram(phys) else {
+            return self.downstream.cas32(phys, old, new);
+        };
+        let word = unsafe { AtomicU32::from_ptr(base.add(phys as usize) as *mut u32) };
+        let ok = word.compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed).is_ok();
+        if ok {
+            self.bump_gen(phys);
+        }
+        Some(ok)
+    }
+
+    fn cas_ram64(&self, phys: u64, old: u64, new: u64) -> Option<bool> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let Some(base) = self.ram(phys) else {
+            return self.downstream.cas64(phys, old, new);
+        };
+        let word = unsafe { AtomicU64::from_ptr(base.add(phys as usize) as *mut u64) };
+        let ok = word.compare_exchange(old.rotate_left(32), new.rotate_left(32), Ordering::AcqRel, Ordering::Relaxed).is_ok();
+        if ok {
+            self.bump_gen(phys);
+        }
+        Some(ok)
+    }
+
     fn check_and_clear_llbit(&self, _phys_addr: u64) {
         unsafe { *self.llbit.get() = false };
     }
@@ -677,6 +732,16 @@ impl<
 /// Reports revision 2.5, matching R10000Cache and enabling the IP28 boot tune.
 pub type R10000ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
+
+/// SGI O2 R10000 (IP32): the IP28 model with 64-byte secondary-cache lines.
+///
+/// The O2 PROM (4.18 and earlier) handles only that line size. With Config's
+/// SB bit set (128-byte lines, as on an IP28) its sizing code keeps the
+/// secondary cache's *size* as the line size, then aligns every DMA buffer to
+/// 1 MB, runs out of heap, and panics on the first SCSI command. So O2 R10000
+/// modules have SB clear, and so does this model.
+pub type R10000O2ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 1048576, 64, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
 
 /// SGI Indy / Indigo2 R4400: the full model's geometry and identity — 16 KB
 /// direct-mapped primaries with 16-byte lines, a 1 MB secondary with 128-byte
@@ -893,6 +958,32 @@ mod tests {
         same::<R4400ShadowCache, R4400Cache>();
         same::<R5000ShadowCache, R5000Cache>();
         assert_eq!(<R10000ShadowCache as CpuModel>::NAME, "shadow", "existing IP28 snapshots");
+    }
+
+    /// The O2 R10000 differs from the IP28's only in its secondary line size.
+    #[test]
+    fn the_o2_r10000_is_the_ip28_part_with_shorter_secondary_lines() {
+        type O2 = R10000O2ShadowCache;
+        type Ip28 = R10000ShadowCache;
+        assert_eq!(<O2 as MipsCache>::L2_LINE, 64);
+        assert_eq!((<O2 as MipsCache>::IC_SIZE, <O2 as MipsCache>::IC_LINE, <O2 as MipsCache>::DC_SIZE, <O2 as MipsCache>::DC_LINE, <O2 as MipsCache>::L2_SIZE),
+                   (<Ip28 as MipsCache>::IC_SIZE, <Ip28 as MipsCache>::IC_LINE, <Ip28 as MipsCache>::DC_SIZE, <Ip28 as MipsCache>::DC_LINE, <Ip28 as MipsCache>::L2_SIZE));
+        assert_eq!((<O2 as CpuModel>::PRID, <O2 as CpuModel>::FIR, <O2 as CpuModel>::MIPS4, <O2 as CpuModel>::TLB_ENTRIES, <O2 as CpuModel>::VA_BITS, <O2 as CpuModel>::R10K_CACHE_OPS),
+                   (<Ip28 as CpuModel>::PRID, <Ip28 as CpuModel>::FIR, <Ip28 as CpuModel>::MIPS4, <Ip28 as CpuModel>::TLB_ENTRIES, <Ip28 as CpuModel>::VA_BITS, <Ip28 as CpuModel>::R10K_CACHE_OPS));
+    }
+
+    /// The tag store hook sees primary data tag stores and nothing else.
+    #[test]
+    fn the_tag_store_hook_sees_only_primary_data_tag_stores() {
+        let c = cache();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        c.set_pd_tag_store_hook(Box::new(move |tag| s.lock().unwrap().push(tag)));
+        c.cache_op(C_IST | CACH_PI, 0x8000_0000, 0x11);
+        c.cache_op(C_IST | CACH_SD, 0x8000_0000, 0x22);
+        c.cache_op(C_ILT | CACH_PD, 0x8000_0000, 0x33);
+        c.cache_op(C_IST | CACH_PD, 0x8000_0000, 0xc8);
+        assert_eq!(*seen.lock().unwrap(), vec![0xc8]);
     }
 
     /// Index_Store_Tag then Index_Load_Tag returns exactly what the full model

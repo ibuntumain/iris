@@ -28,7 +28,7 @@
 //! working either way.
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use std::cell::UnsafeCell;
@@ -41,18 +41,35 @@ use crate::traits::{
 #[cfg(feature = "jitv2")]
 const JITV2_PAGE_SIZE: usize = crate::cpu::jitv2::jitv2::PAGE_SIZE as usize;
 
-/// Size of the emulated physical address space the window covers: 4GB.
+/// Size of the emulated physical address space the window covers: 4GB, unless
+/// the machine asks for [`LARGE_WINDOW_SIZE`].
 pub const WINDOW_SIZE: u64 = 1 << 32;
 
 /// Granularity of [`MappedMemory::mapped_bitmap`]: 4GB / 64 bits = 64MB/bit.
 pub const BITMAP_SHIFT: u32 = 26;
+
+/// The window of a machine whose memory runs past 4GB (`PpMemSpace::over_window`).
+pub const LARGE_WINDOW_SIZE: u64 = 1 << 34;
+
+/// The bitmap has 64 bits whatever the window's size, so a larger window has
+/// larger regions: 16GB / 64 bits = 256MB/bit. A smaller bank at the top of
+/// memory leaves its region to the bus path.
+pub const fn window_shift(window: u64) -> u32 {
+    window.trailing_zeros() - 6
+}
 
 /// Does `bitmap` (a [`MappedMemory::mapped_bitmap`]) say `phys` is in the
 /// window? False above 4GB, where a plain `1 << (phys >> BITMAP_SHIFT)`
 /// would overflow the shift.
 #[inline(always)]
 pub fn bitmap_maps(bitmap: u64, phys: u64) -> bool {
-    let region = phys >> BITMAP_SHIFT;
+    bitmap_maps_at(bitmap, BITMAP_SHIFT, phys)
+}
+
+/// [`bitmap_maps`] for a window of any size: `shift` is its [`window_shift`].
+#[inline(always)]
+pub fn bitmap_maps_at(bitmap: u64, shift: u32, phys: u64) -> bool {
+    let region = phys >> shift;
     region < 64 && bitmap & (1u64 << region) != 0
 }
 
@@ -65,7 +82,7 @@ pub fn bitmap_maps(bitmap: u64, phys: u64) -> bool {
 pub const GEN_RATIO: u64 = (JITV2_PAGE_SIZE as u64) / 8;
 
 /// Size of the generation window: one `AtomicU64` per 4KB page of the 4GB
-/// physical space = 8MB.
+/// physical space = 8MB. A larger window scales with it.
 #[cfg(feature = "jitv2")]
 pub const GEN_WINDOW_SIZE: u64 = WINDOW_SIZE / GEN_RATIO;
 
@@ -554,14 +571,40 @@ impl BusDevice for PpMemory {
         unsafe {
             let p = (self.base as *mut u64).add(self.off(addr) >> 3);
             // Storage keeps qwords rotate_left(32); rotate val/mask to match.
-            let old = *p;
             let v = val.rotate_left(32);
             let m = mask.rotate_left(32);
-            *p = (old & !m) | (v & m);
+            // Compare-exchange: another CPU or a DMA engine may store to the
+            // rest of this doubleword meanwhile.
+            let _ = AtomicU64::from_ptr(p).fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
+                Some((old & !m) | (v & m))
+            });
         }
         #[cfg(feature = "jitv2")]
         self.bump_gen(addr);
         BUS_OK
+    }
+
+    fn cas32(&self, addr: u64, old: u32, new: u32) -> Option<bool> {
+        let p = unsafe { (self.base as *mut u32).add(self.off(addr) >> 2) };
+        let ok = unsafe { AtomicU32::from_ptr(p) }.compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed).is_ok();
+        #[cfg(feature = "jitv2")]
+        if ok {
+            self.bump_gen(addr);
+        }
+        Some(ok)
+    }
+
+    fn cas64(&self, addr: u64, old: u64, new: u64) -> Option<bool> {
+        // Storage keeps qwords rotate_left(32).
+        let p = unsafe { (self.base as *mut u64).add(self.off(addr) >> 3) };
+        let ok = unsafe { AtomicU64::from_ptr(p) }
+            .compare_exchange(old.rotate_left(32), new.rotate_left(32), Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok();
+        #[cfg(feature = "jitv2")]
+        if ok {
+            self.bump_gen(addr);
+        }
+        Some(ok)
     }
 
     #[cfg(feature = "jitv2")]
@@ -593,6 +636,8 @@ impl BusDevice for Arc<PpMemory> {
     fn write64_masked(&self, addr: u64, val: u64, mask: u64) -> u32 {
         (**self).write64_masked(addr, val, mask)
     }
+    fn cas32(&self, addr: u64, old: u32, new: u32) -> Option<bool> { (**self).cas32(addr, old, new) }
+    fn cas64(&self, addr: u64, old: u64, new: u64) -> Option<bool> { (**self).cas64(addr, old, new) }
     #[inline]
     fn mem_ptr(&self, addr: u64) -> Option<*const u64> { (**self).mem_ptr(addr) }
     #[inline]
@@ -652,6 +697,8 @@ pub struct PpMemSpace {
 }
 
 struct SpaceState {
+    /// The window's size in bytes. Never changes.
+    window: u64,
     mappings: Vec<Mapping>,
     /// Where the bitmap is published. Points at `own_bitmap` until a consumer
     /// hands over its own inline field, so it is never null and publication is
@@ -662,6 +709,8 @@ struct SpaceState {
     /// path is one load instead of two — hence one sink per consumer rather
     /// than a shared indirection. Points at `own_bitmap` until claimed.
     sink2: *mut u64,
+    /// Further CPUs' inline copies (`PpMemSpace::add_bitmap_sink`).
+    more_sinks: Vec<*mut u64>,
 }
 
 /// The bitmap `PpMemSpace` publishes into before a CPU claims it.
@@ -678,7 +727,8 @@ struct OwnBitmap(Box<u64>);
 //   * Every mutating entry point — `map_bank`, `map_alias`, `clear_mappings`,
 //     `set_bitmap_sink` — is reached only from `Physical::remap_banks`, which
 //     the MC invokes synchronously inside the CPU's store to MEMCFG. That is
-//     always the CPU thread.
+//     always a CPU thread, and with several CPUs the others are parked for it
+//     (`smp::World::stop_others`, wired where HEART's descriptors reach memory).
 //   * Device threads (MC-DMA, seeq, VINO) reach RAM through `BusDevice` on the
 //     individual `PpMemory` banks. They never touch `PpMemSpace`.
 //   * `mapped_bitmap()` reads the sink and is likewise CPU-thread-only; the
@@ -695,7 +745,12 @@ impl PpMemSpace {
     /// Under `jitv2` this also reserves the parallel generation window and
     /// takes each bank's gen object, so the two can be mapped in lockstep.
     pub fn over(banks: &[PpMemory]) -> io::Result<Self> {
-        let space = AddrSpace::reserve(WINDOW_SIZE as usize)?;
+        Self::over_window(banks, WINDOW_SIZE)
+    }
+
+    /// [`Self::over`] with a window of `window` bytes.
+    pub fn over_window(banks: &[PpMemory], window: u64) -> io::Result<Self> {
+        let space = AddrSpace::reserve(window as usize)?;
         let own_bitmap = OwnBitmap(Box::new(0u64));
         let sink = &*own_bitmap.0 as *const u64 as *mut u64;
         let sink2 = sink;
@@ -703,16 +758,23 @@ impl PpMemSpace {
             space,
             banks: banks.iter().map(|b| b.shared().clone()).collect(),
             #[cfg(feature = "jitv2")]
-            gen_space: AddrSpace::reserve(GEN_WINDOW_SIZE as usize)?,
+            gen_space: AddrSpace::reserve((window / GEN_RATIO) as usize)?,
             #[cfg(feature = "jitv2")]
             gen_banks: banks.iter().map(|b| b.gen_shared().clone()).collect(),
             own_bitmap,
             state: UnsafeCell::new(SpaceState {
+                window,
                 mappings: Vec::new(),
                 sink,
                 sink2,
+                more_sinks: Vec::new(),
             }),
         })
+    }
+
+    /// The window's size in bytes.
+    pub fn window_size(&self) -> u64 {
+        unsafe { (*self.state.get()).window }
     }
 
     /// Test/bench helper: allocate fresh banks of the given sizes in MB and
@@ -746,7 +808,7 @@ impl PpMemSpace {
     pub fn map_range(&self, bank: usize, src: u64, offset: u64, size: u64) -> io::Result<()> {
         let b = &self.banks[bank];
         assert!(src + size <= b.len() as u64, "ppmem: range [{src:#x}, +{size:#x}) escapes bank {bank}");
-        assert!(offset + size <= WINDOW_SIZE, "ppmem: [{offset:#x}, +{size:#x}) escapes the 4GB window");
+        assert!(offset + size <= self.window_size(), "ppmem: [{offset:#x}, +{size:#x}) escapes the window");
         unsafe {
             self.space.map(offset as usize, size as usize, b, src, Prot::ReadWrite)?;
         }
@@ -767,17 +829,17 @@ impl PpMemSpace {
         Ok(())
     }
 
-    /// Recompute the 64MB-granularity bitmap from the live mapping list.
+    /// Recompute the bitmap from the live mapping list.
     ///
-    /// A bit is set only if the whole 64MB region is covered, so a region that
+    /// A bit is set only if the whole region (64MB in a 4GB window) is covered, so a region that
     /// is partially mapped — or mapped alongside MMIO — reads as unmapped and
     /// keeps taking the bus path.
     fn recompute_bitmap(state: &mut SpaceState) {
-        const REGION: u64 = 1 << BITMAP_SHIFT;
+        let region = 1u64 << window_shift(state.window);
         let mut bits = 0u64;
         for bit in 0..64u32 {
-            let start = (bit as u64) * REGION;
-            let end = start + REGION;
+            let start = (bit as u64) * region;
+            let end = start + region;
             // Covered iff some mapping spans the entire region. Mappings are
             // bank-sized (>= 8MB) and region-aligned in practice, but check
             // the general case rather than assuming.
@@ -803,6 +865,9 @@ impl PpMemSpace {
         unsafe {
             *state.sink = bits;
             *state.sink2 = bits;
+            for &s in &state.more_sinks {
+                *s = bits;
+            }
         }
     }
 
@@ -813,6 +878,18 @@ impl PpMemSpace {
             .retain(|m| !(m.at >= at && m.at + m.len <= at + len));
         state.mappings.push(Mapping { at, len });
         Self::recompute_bitmap(state);
+    }
+}
+
+impl PpMemSpace {
+    /// Publish the bitmap to one more `u64` as well: a second CPU's inline
+    /// copies. Same contract as [`MappedMemory::set_bitmap_sink`]. The value
+    /// arrives with the next remap.
+    ///
+    /// # Safety
+    /// `ptr` must stay valid for as long as this space exists.
+    pub unsafe fn add_bitmap_sink(&self, ptr: *mut u64) {
+        unsafe { (*self.state.get()).more_sinks.push(ptr) };
     }
 }
 
@@ -839,6 +916,9 @@ impl MappedMemory for PpMemSpace {
         unsafe {
             *st.sink = 0;
             *st.sink2 = 0;
+            for &s in &st.more_sinks {
+                *s = 0;
+            }
         }
     }
 
@@ -852,8 +932,8 @@ impl MappedMemory for PpMemSpace {
             "ppmem: mirror period {period:#x} exceeds bank size {bank_size:#x}"
         );
         assert!(
-            offset + size <= WINDOW_SIZE,
-            "ppmem: [{offset:#x}, +{size:#x}) escapes the 4GB window"
+            offset + size <= self.window_size(),
+            "ppmem: [{offset:#x}, +{size:#x}) escapes the window"
         );
 
         // Lay down consecutive `period`-sized views of the bank's first
@@ -905,8 +985,8 @@ impl MappedMemory for PpMemSpace {
             b.len()
         );
         assert!(
-            offset + size <= WINDOW_SIZE,
-            "ppmem: alias [{offset:#x}, +{size:#x}) escapes the 4GB window"
+            offset + size <= self.window_size(),
+            "ppmem: alias [{offset:#x}, +{size:#x}) escapes the window"
         );
         unsafe {
             self.space
@@ -1004,10 +1084,41 @@ impl MappedMemory for PpMemSpace {
 mod tests {
     use super::*;
 
+    /// Two CPUs storing to different bytes of one doubleword, as SWL/SWR do:
+    /// neither may lose the other's. A read and a store here loses them within
+    /// a few thousand rounds on any multicore host.
+    #[test]
+    fn masked_stores_to_one_doubleword_keep_each_others_bytes() {
+        let m = std::sync::Arc::new(PpMemory::try_new(8).unwrap());
+        const ROUNDS: u64 = 200_000;
+        let store = |mask: u64, shift: u32| {
+            let m = m.clone();
+            std::thread::spawn(move || {
+                for i in 1..=ROUNDS {
+                    m.write64_masked(0x1000, i << shift, mask);
+                    let seen = (m.read64(0x1000).data & mask) >> shift;
+                    assert_eq!(seen, i, "this CPU's own bytes were overwritten");
+                }
+            })
+        };
+        let (a, b) = (store(0xffff_ffff_0000_0000, 32), store(0x0000_0000_ffff_ffff, 0));
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(m.read64(0x1000).data, ROUNDS << 32 | ROUNDS);
+    }
+
     const MB: usize = 1024 * 1024;
 
     /// Above 4GB the region index is 64 or more; a raw `1 << region` would
     /// wrap onto region 0 in release and panic in debug.
+    #[test]
+    fn a_larger_window_has_larger_regions() {
+        assert_eq!(window_shift(WINDOW_SIZE), BITMAP_SHIFT);
+        assert_eq!(window_shift(LARGE_WINDOW_SIZE), 28);
+        assert!(bitmap_maps_at(u64::MAX, 28, LARGE_WINDOW_SIZE - 1));
+        assert!(!bitmap_maps_at(u64::MAX, 28, LARGE_WINDOW_SIZE));
+    }
+
     #[test]
     fn bitmap_maps_is_false_above_the_window() {
         let all = u64::MAX;

@@ -229,6 +229,13 @@ pub struct JitDcGeometry {
     /// probe, no LRU and no dirty bit (the R10000's shadow cache). The other
     /// fields are then unused.
     pub tagless: bool,
+    /// Inline stores bump the page generation with an atomic add: other writers
+    /// are active, and a plain add landing after theirs would move the counter
+    /// backwards and let stale code publish.
+    pub atomic_gen: bool,
+    /// The ppmem window's `window_shift`: its bitmap's region size, baked
+    /// into the mapped test on every guest load and store.
+    pub window_shift: u32,
 }
 
 impl JitDcGeometry {
@@ -236,7 +243,8 @@ impl JitDcGeometry {
         Self {
             supported: false, line_shift: 0, num_lines_mask: 0, data_mask: 0,
             has_l2: false, l2_line_shift: 0, l2_num_lines_mask: 0,
-            ways: 1, num_lines_shift: 0, tagless: false,
+            ways: 1, num_lines_shift: 0, tagless: false, atomic_gen: false,
+            window_shift: crate::ppmem::BITMAP_SHIFT,
         }
     }
 }
@@ -325,8 +333,8 @@ impl From<L1DTag> for u32 {
 /// Convert a tag word from before `dc_tag_format`, which put `PTag` at `[31:8]`
 /// so that `W` overlapped its bit 19, physical address bit 31. A v0 word is
 /// ambiguous there, `phys_bit31 | dirty`, and this resolves it in favour of
-/// dirty: no cacheable mapping exists at or above `0x8000_0000`, since the
-/// highest range in `device_map` is `HIMEM_END` at `0x3000_0000`.
+/// dirty: the format predates every machine with memory at or above
+/// `0x8000_0000`, so no v0 tag can mean an address up there.
 pub fn migrate_l1d_tag_word_v0(word: u32) -> u32 {
     let raw_ptag = (word >> 8) & L1_PTAG_MASK & !(1 << 19);
     let cs = (word >> 6) & 0x3;
@@ -563,6 +571,12 @@ pub trait MipsCache: Send + Sync {
     /// Share the L1-I hit/fetch counters with the status display. No-op where absent.
     fn set_l1i_counters(&mut self, _hit: Arc<AtomicU64>, _fetch: Arc<AtomicU64>) {}
 
+    /// Have `hook` called with TagLo on every Index Store Tag to the primary
+    /// data cache: a machine whose firmware builds memory out of cache tags
+    /// (the O2's POST stack, see `O2Memory::stack_tag_store`). No-op where
+    /// absent. Set once, before the CPU runs.
+    fn set_pd_tag_store_hook(&self, _hook: Box<dyn Fn(u32) + Send + Sync>) {}
+
     /// tcache: point the cache at ppmem's window and mapped-region bitmap, so
     /// cacheable RAM accesses read/write RAM directly instead of copying line
     /// data (docs/tcache-design.md). Default no-op — a cache with no
@@ -572,6 +586,8 @@ pub trait MipsCache: Send + Sync {
     /// `base` must be ppmem's window base and `bitmap` a live `u64` that
     /// outlives this cache.
     unsafe fn set_tcache_window(&self, _base: *mut u8) {}
+    /// The ppmem window's `window_shift`, when it is not the 4GB window's.
+    fn set_tcache_shift(&self, _shift: u32) {}
 
     /// Whether `fetch` of cacheable RAM only reads: no line fill, no LRU or
     /// tag change, no exception. Then a caller that does not need the
@@ -771,6 +787,14 @@ pub trait MipsCache: Send + Sync {
 
     /// Set Load-Linked bit state
     fn set_llbit(&self, val: bool);
+
+    /// Atomically store `new` to the RAM word at `phys` if it still holds
+    /// `old`. `None`: this model cannot, or `phys` is not RAM it can reach
+    /// directly, and the caller stores the ordinary way. Only models that keep
+    /// no data of their own can serve several CPUs.
+    fn cas_ram32(&self, _phys: u64, _old: u32, _new: u32) -> Option<bool> { None }
+    /// The doubleword form of [`Self::cas_ram32`].
+    fn cas_ram64(&self, _phys: u64, _old: u64, _new: u64) -> Option<bool> { None }
 
     /// Get Load-Linked address
     fn get_lladdr(&self) -> u64;
@@ -3672,7 +3696,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             l2_num_lines_mask: if HAS_L2 { (L2_CACHE_SIZE / L2_LINE - 1) as u64 } else { 0 },
             ways: DC_WAYS as u32,
             num_lines_shift: Self::DC_NUM_LINES_SHIFT as u32,
+            atomic_gen: false,
             tagless: false,
+            window_shift: crate::ppmem::BITMAP_SHIFT,
         }
     }
 

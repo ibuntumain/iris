@@ -23,6 +23,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 
 | Note | Kind | Title |
 |---|---|---|
+| [cached-flash-is-a-cache-with-two-cpus.md](cpu/cached-flash-is-a-cache-with-two-cpus.md) | rule | With two CPUs, cached flash reads must hold their lines: a fetch through to a chip in status mode executes `0x80808080` |
 | [cache-attributes-and-fetch-alignment.md](cpu/cache-attributes-and-fetch-alignment.md) | rule | Cache attributes and fetch alignment: three hardcodings, all wrong |
 | [cache-tag-index-and-check-bits.md](cpu/cache-tag-index-and-check-bits.md) | rule | Cache tags: index ops index by address; check bits are generated, not stored |
 | [cop0-requires-kernel-or-cu0.md](cpu/cop0-requires-kernel-or-cu0.md) | rule | CP0 instructions must be gated on Kernel-or-CU0 |
@@ -62,6 +63,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [callout-arg0-is-core-ptr.md](jitv2/callout-arg0-is-core-ptr.md) | rule | JIT→Rust callouts: arg 0 is always the `MipsCore` pointer |
 | [code-size-does-not-predict-speed.md](jitv2/code-size-does-not-predict-speed.md) | measure | Emitted-code size did not predict speed — four changes, one marginal win |
 | [codegen-gotchas.md](jitv2/codegen-gotchas.md) | rule | JIT v2 codegen gotchas |
+| [compile-pool-starts-after-the-windows.md](jitv2/compile-pool-starts-after-the-windows.md) | rule | Start the compile pool after the ppmem windows: workers read the cache geometry once, and an early one compiles every load and store as a call out |
 | [compile-churn-avoidance-snapshot.md](jitv2/compile-churn-avoidance-snapshot.md) | design | Compile churn avoidance: skip a recompile whose inputs did not change |
 | [cop0-does-not-have-to-end-a-region.md](jitv2/cop0-does-not-have-to-end-a-region.md) | design | CP0 does not have to end a region |
 | [corpus-capture-from-the-pcp-cache.md](jitv2/corpus-capture-from-the-pcp-cache.md) | howto | Corpus capture: `j2 corpus`, and the two bitmaps that look interchangeable |
@@ -99,17 +101,20 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | Note | Kind | Title |
 |---|---|---|
 | [empty-gio-slot-reads-bus-error.md](devices/empty-gio-slot-reads-bus-error.md) | rule | Reads of an empty GIO slot end in a bus error (ABORT_EN); all ones made the PROM poll a phantom Newport 200 000 times headless |
+| [audio-test-suite.md](devices/audio-test-suite.md) | howto | The audio test suite (`test/audiotest`): rates x channels x widths through the audio library, playaiff and sfplay, checked against the Octane's capture |
 | [cpal-alsa-busy-poll.md](devices/cpal-alsa-busy-poll.md) | rule | cpal's ALSA backend can spin a core: `[audio] host = "pulseaudio"` |
 | [decode-table-is-host-mapped.md](devices/decode-table-is-host-mapped.md) | rule | The physical decode table is a sparse host mapping over 40 bits: change it only through `fill`, set the default first, compare entries with `entry_eq` |
 | [mc-decodes-32-physical-bits.md](devices/mc-decodes-32-physical-bits.md) | rule | Indy/Indigo2/O2 decode 32 physical bits; IRIX PTE software bits reach PA[35:32]; fold with `MipsExecutor::phys_mask`, never decode them |
 | [extended-ram-memcfg.md](devices/extended-ram-memcfg.md) | rule | Extended RAM — MEMCFG synthesis for himem banks |
-| [hpc3-rx-channel-refused-while-active.md](devices/hpc3-rx-channel-refused-while-active.md) | rule | A receive channel that refuses while reporting itself active |
+| [hpc3-rx-channel-refused-while-active.md](devices/hpc3-rx-channel-refused-while-active.md) | history | A receive channel that refuses while reporting itself active |
 | [indigo2-eeprom-byte-lane-gap.md](devices/indigo2-eeprom-byte-lane-gap.md) | rule | Indigo2 motherboard EEPROM: PROM writes via byte access, HPC3 only handled 32-bit |
 | [ip28-512mb-banks.md](devices/ip28-512mb-banks.md) | howto | IP28 512 MB banks |
 | [o2-readback-transfer-registers.md](devices/o2-readback-transfer-registers.md) | rule | O2 glReadPixels: the frame-buffer-to-linear transfer, GL vertices, edge type, src steps and linStride as IRIX uses them |
 | [ip32-o2-bringup-log.md](devices/ip32-o2-bringup-log.md) | history | The O2 (IP32) bring-up log: PROM, POST, CRIME/MACE/GBE, SCSI, PCI, the OSes |
 | [ip32-headless-irix-panics.md](devices/ip32-headless-irix-panics.md) | rule | O2 TLBMISS at 0xff800000 in early boot was `crmFifoWait` timing out on our host-thread RE; status polls now wait for the engine (fixed) |
 | [ip30-octane-bringup.md](devices/ip30-octane-bringup.md) | rule | What the Octane's PROM insists on (memory sizing, the Bridge status bit, empty slots, IOC3 bits, the one-wire parts' formats, its device tree) and what booting it through to IRIX added (cached flash lines, low-memory JIT counters, the ISP stall, HQ4 before a context switch) |
+| [ip30-memory-past-4gb-takes-a-16gb-window.md](devices/ip30-memory-past-4gb-takes-a-16gb-window.md) | design | Octane past 4 GB: 16 GB window, 256 MB per bitmap bit, per-machine shift |
+| [ip30-module-name-must-match-active-cpus.md](devices/ip30-module-name-must-match-active-cpus.md) | rule | Octane: the module record must say PM10 for one CPU and PM20 for two, or the PROM fails its NIC diagnostic |
 | [ip30-low-memory-aliases-sdram.md](devices/ip30-low-memory-aliases-sdram.md) | rule | Octane: the 16 KiB at physical 0 is the first 16 KiB of SDRAM, which the processor reaches only there (0x2000_0000..+16 KiB bus-errors, as the stock IDE memory diagnostics expect); shares its JIT page generations; the guard holds on the table path only (the ppmem window maps whole units); DMA reach unknown |
 | [ip30-prom-stores-into-flash-stay-in-cache.md](devices/ip30-prom-stores-into-flash-stay-in-cache.md) | rule | Octane: the PROM's cached stores into its own flash never reach the Bridge; `CachedFlashLines` holds them (approximation: no write-back) |
 | [ip30-device-timing-on-hptimer.md](devices/ip30-device-timing-on-hptimer.md) | design | Octane: IOC3, RAD1 and ISP1040 pace themselves on `hptimer` one-shots, with threads only where something blocks (the ISP1040 ring, serial receive, NVRAM writer) |
@@ -118,7 +123,8 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [aic7880-seqdis.py](devices/aic7880-seqdis.py) | howto | Disassembler for an AIC-7xxx sequencer image in a C byte array (the HIM's image the O2 downloads) |
 | [aic7880-patchsim.py](devices/aic7880-patchsim.py) | howto | Reproduces the Linux aic7xxx firmware patch selection and critical sections for a 7880 |
 | [o2-no-ecc-alias-is-memory.md](devices/o2-no-ecc-alias-is-memory.md) | rule | O2: physical 0x00_8000_0000 is CRIME's no-ECC memory alias, folded onto RAM by the CPU (netstat/Netscape hang, /dev/mem all ones) |
-| [o2-cache-handover-full-to-shadow.md](devices/o2-cache-handover-full-to-shadow.md) | design | O2 cache: the full model through POST, the shadow model after; switched by PC range and a tag-store trigger, and why the log flips during a reboot |
+| [o2-cache-handover-full-to-shadow.md](devices/o2-cache-handover-full-to-shadow.md) | history | O2 cache as it was until 2026-10-30: the full model through POST, the shadow model after, switched by PC range and a tag-store trigger |
+| [o2-prom-stack-is-a-cached-page-at-phys-0.md](devices/o2-prom-stack-is-a-cached-page-at-phys-0.md) | design | O2 PROM stack: one tag-installed page at physical 0 that the memory test overwrites through KSEG1; a 4 KB page in the bus decode answers for it uncached, so the shadow cache runs from reset |
 | [memcfg-limit-is-not-the-bank-size.md](devices/memcfg-limit-is-not-the-bank-size.md) | rule | MEMCFG: `limit` is the slot, `addr_mask+1` is the mirror period — they differ |
 | [nvram-persistence.md](devices/nvram-persistence.md) | design | Battery-backed state on Stop |
 | [ps2-aux-mux-probe-and-status-bit.md](devices/ps2-aux-mux-probe-and-status-bit.md) | rule | PS/2 mouse not detected under Linux 3.2 guests (and keyboard sometimes flaky too) |
@@ -266,6 +272,8 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [cycles-ptr-must-be-cleared-before-dropping-the-machine.md](gui/cycles-ptr-must-be-cleared-before-dropping-the-machine.md) | rule | iris-gui: clear the cached `CyclesPtr` before dropping the Machine |
 | [egui-default-font-glyph-coverage-avoid-tofu.md](gui/egui-default-font-glyph-coverage-avoid-tofu.md) | rule | egui default fonts: which glyphs render, which are tofu |
 | [gfxdisplay-is-generic-new-boards-need-no-gui-wiring.md](gui/gfxdisplay-is-generic-new-boards-need-no-gui-wiring.md) | design | A new graphics board needs no `iris-gui` capture wiring |
+| [gui-frame-sink-carries-only-the-damaged-band.md](gui/gui-frame-sink-carries-only-the-damaged-band.md) | rule | iris-gui's frame sink carries only the damaged band — screenshots and VNC read `screen.rgba`, never the sink |
+| [gui-owns-the-winit-event-loop.md](gui/gui-owns-the-winit-event-loop.md) | rule | iris-gui must not create a `winit::EventLoop` — eframe owns the process's one, which is why `IRIS_GUI_GL` always fell back |
 | [gl-teardown-must-run-on-the-refresh-thread.md](gui/gl-teardown-must-run-on-the-refresh-thread.md) | rule | GL teardown must run on the REX3-Refresh thread |
 | [gui_mouse_integration.md](gui/gui_mouse_integration.md) | design | GUI mouse integration — current approach, and the classic-Mac absolute-mouse pattern |
 | [i18n-catalog-gotchas.md](gui/i18n-catalog-gotchas.md) | rule | GUI text catalogs (i18n) gotchas |
@@ -282,7 +290,7 @@ The VNC server, the host input layer (`screen`/`ptr`/`key`) and pointer steering
 | Note | Kind | Title |
 |---|---|---|
 | [pointer-steering-and-hotspots.md](vnc/pointer-steering-and-hotspots.md) | design | Steering the relative mouse by the hardware cursor: X's acceleration curve, hotspots from corner pinning, busy guests |
-| [frame-capture-and-damage.md](vnc/frame-capture-and-damage.md) | design | What VNC reads (rgba + frame_seq), Newport capture and forced SW compositor, tile damage |
+| [frame-capture-and-damage.md](vnc/frame-capture-and-damage.md) | design | What VNC reads (rgba + frame_seq), which boards keep rgba current themselves, Newport capture and forced SW compositor, tile damage |
 
 ## macos/
 
@@ -318,7 +326,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 |---|---|---|
 | [bench-first-numbers.md](perf/bench-first-numbers.md) | history | First benchmark matrix — 2026-08-21 |
 | [gfifo-backend-experiment.md](perf/gfifo-backend-experiment.md) | history | GFIFO backend: swappable ring for benchmarking — 2026-09-14 |
-| [gui-idle-refresh.md](perf/gui-idle-refresh.md) | rule | Status-bar-only heartbeat refresh skips full 16 MB FB copy and (in iris-gui) |
+| [gui-idle-refresh.md](perf/gui-idle-refresh.md) | rule | Status-bar-only heartbeat refresh skips the compose and (in iris-gui) publishes nothing; iris-gui uploads only the damaged scanlines |
 | [hal2-pump-thread.md](perf/hal2-pump-thread.md) | rule | HAL2 dedicated pump thread — reverted, do not reintroduce as-is |
 | [hardware-profiles.md](perf/hardware-profiles.md) | design | Hardware profiles vs MAME (Phase 3) |
 | [hot-path-inlining-must-be-explicit.md](perf/hot-path-inlining-must-be-explicit.md) | rule | Hot-path inlining must be stated, not left to the inliner |
@@ -337,6 +345,7 @@ Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk h
 
 | Note | Kind | Title |
 |---|---|---|
+| [cpu-tests-make-dry-run-is-a-fork-bomb.md](testing/cpu-tests-make-dry-run-is-a-fork-bomb.md) | rule | `make -n` in cpu-tests recurses without end: 11k processes and an OOM |
 | [arcs-console-from-bare-metal.md](testing/arcs-console-from-bare-metal.md) | howto | Calling ARCS firmware from the bare-metal harness |
 | [bare-metal-harness-platform-assumptions.md](testing/bare-metal-harness-platform-assumptions.md) | howto | What the bare-metal suites assume about the machine |
 | [benchmark-suite-gotchas.md](testing/benchmark-suite-gotchas.md) | howto | Writing benchmark kernels for `bench/` — things that bit |
@@ -398,4 +407,5 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [networking-tab-redesign.md](plans/networking-tab-redesign.md) | plan | Networking tab redesign — design & plan |
 | [nfsudp-plan.md](plans/nfsudp-plan.md) | plan | Plan: in-core NFSv3-over-UDP server (`src/net/nfsudp.rs`) |
 | [pcap-release-plan.md](plans/pcap-release-plan.md) | plan | PCAP release + elevation plan |
+| [smp-octane.md](plans/smp-octane.md) | plan | Two CPUs on the Octane: HEART MP registers and PROM/kernel slave flow, CPU core → N instances (park-request bit, CpuShared, debugger extraction), jitv2 shared pool audit and fixes, milestones and foreseen problems |
 | [vnc-server-plan.md](plans/vnc-server-plan.md) | plan | Built-in VNC server: board-agnostic frame tap, damage from frame diffs, pointer steered by the HW cursor, monitor/MCP screenshot + click for agents |

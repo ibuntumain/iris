@@ -93,18 +93,24 @@ automatically. You'll be asked for:
 - **Name** — names the machine folder and its TOML file. Conflicts get a
   numeric suffix (`indy`, `indy-2`, …). Names cannot contain path separators
   or reserved filename characters.
-- **Machine model** — Indy (IP24), Indigo2 (IP22), or Indigo2 IMPACT (IP28).
-  **Processor** offers R4400, R5000, and R10000. Selecting IP28 defaults to
-  R10000 and IMPACT Solid graphics.
+- **Machine model** — Indy (IP24), Indigo2 (IP22), Indigo2 IMPACT (IP28),
+  O2 (IP32) or Octane (IP30). **Processor** offers the CPUs that machine
+  takes: R4400, R5000 and R10000 on the Indy and the Indigo2, R5000 and
+  R10000 on the O2, R10000 on the Octane. Selecting IP28 defaults to R10000
+  and IMPACT Solid graphics.
 - **PROM image** — defaults to "Use embedded PROM (bundled with iris)",
   which lets iris fall back to its built-in PROM blob with no disk file
   needed for IP24, IP22, or IP28. Each profile selects its own embedded image.
+  The O2 and the Octane have no embedded PROM: pick an image (IP32 and IP30
+  respectively) or the machine will not boot.
 - **NVRAM file** — defaults to `nvram.bin` in the machine folder (see Storage) and is
   seeded with a default NVRAM on first use. Indigo2 profiles also have a
   **NVRAM EEPROM file**, which stores their PROM environment and MAC.
 - **Total RAM** — preset totals. Tick **Advanced: configure individual banks**
   to set each of the four banks yourself (0, 8, 16, 32, 64, 128 MB; IP28
-  also allows 256 and 512 MB). IP28 presets extend to 1024 MB.
+  also allows 256 and 512 MB; the Octane starts at 64 MB and reaches 2 GB a
+  bank). On the O2 a bank is a DIMM pair's kit — 32, 64, 128 or 256 MB,
+  filled from pair A. IP28 presets extend to 1024 MB.
 - **Boot disk (SCSI #1)** — optional path. For a fresh install, create a blank
   image afterwards from the SCSI menu (**Create blank HDD image…**).
 - **CD-ROM (SCSI #4)** — optional install media.
@@ -160,15 +166,63 @@ IRIX with a media-change Unit Attention, no restart needed.
 
 | Tab | What's there |
 | --- | --- |
-| **General** | Platform, CPU, cache model (auto/full/shadow), CP0 Count clock, JIT compile threads and persistent code cache (jitv2 builds), RTC offset, graphics board (Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum), Newport heads/resolution, PROM, NVRAM, motherboard EEPROM, ttyd1 serial log, monitor and serial ports |
+| **General** | Platform, CPU, cache model (auto/full/shadow), CP0 Count clock, RTC offset, graphics board (Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum), Newport heads/resolution, PROM, NVRAM, motherboard EEPROM, ttyd1 serial log, monitor and serial ports, Ultra-64 test mode, O2 options (O2 only) |
 | **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, second controller (IP22) |
 | **Networking** | Ethernet address (`eaddr`, written to NVRAM on Indy or the NVRAM EEPROM on Indigo2/IP28 while stopped), NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), TFTP boot folder and rsh install folder (NAT mode), NFS share, PCAP interface, **Check networking** diagnostics |
 | **Memory** | RAM banks and the resulting total |
 | **Display** | Display resolution, window scale, headless, audio on/off and buffering, keyboard shape (ANSI/ISO/JIS) |
 | **Video-In** | VINO source: **off** (default), **test_pattern**, **camera** (with a Test Camera preview), **black**; standard; camera index |
-| **Debug** | Build features (including the REX3, GR2 and IMPACT graphics JITs and jitv2), GDB stub port, Perfetto trace Start/Stop (`perfetto` builds), capture renderer, idle park, devlog spec, thread affinity. Hidden in lightning builds |
+| **Performance** | Thread affinity and per-thread core pinning, processor count, jitv2 compile threads and persistent code cache, VNC server. See [Performance](#performance) |
+| **Debug** | Build features (including the REX3, GR2 and IMPACT graphics JITs and jitv2), GDB stub port, Perfetto trace Start/Stop (`perfetto` builds), capture renderer, idle park, devlog spec. Hidden in lightning builds |
 | **CI / Automation** | CI socket, `--ci-display`, serial transcript, SCSI interrupt deferral. Hidden in App Store builds |
 | **Benchmark** | The bare-metal benchmark suite, run in-process on a headless machine (see `bench/README.md`) |
+
+### Platforms
+
+Five machines, each with the PROM it needs:
+
+| Platform | CPU | PROM |
+| --- | --- | --- |
+| **SGI Indy (IP24)** | R4400 / R5000 / R10000 | built-in, or your own image |
+| **SGI Indigo2 (IP22)** | R4400 / R5000 / R10000 | built-in, or your own image |
+| **SGI Indigo2 IMPACT (IP28)** | R10000 | built-in, or your own image |
+| **SGI O2 (IP32)** | R5000 / R10000 | **your own IP32 image — no built-in PROM** |
+| **SGI Octane (IP30)** | R10000 | **your own IP30 flash image — no built-in PROM** |
+
+The O2 and the Octane have no embedded PROM, so both need a real image before
+the machine will boot; the dialog and the General tab say so rather than letting
+the machine fail at Start. An O2's memory is also DIMM-pair kits (32, 64, 128 or
+256 MB, filled from pair A) rather than free-form banks, and the pickers only
+offer those sizes. Switching a saved machine to the O2 re-fits its RAM to kits
+and drops an R4400 the machine would refuse.
+
+### Performance
+
+The **Performance** tab collects the knobs that decide how much of the host the
+emulator costs — useful on a two-core laptop or a mini PC, where the defaults
+are not always the right trade:
+
+| Setting | Effect |
+| --- | --- |
+| **Pin threads to cores** | Keep the CPU, graphics and refresh threads on separate host cores. Helps when there are cores to spare; on a two-core machine it costs more than it saves, so leave it off |
+| **Processors** | Emulated CPUs. Only the Octane takes more than one |
+| **JIT compile threads** | How many threads jitv2 builds pages with. One is enough on a small host, where extra threads only compete with the emulated CPU |
+| **Keep compiled code between runs** | jitv2's persistent page cache, and its folder |
+
+The frame path is built for the same reason. The renderer publishes only the
+band of scanlines that changed since the frame on screen, the GUI uploads just
+that band, and it sleeps between frames instead of polling — a settled desktop
+costs no texture upload at all, and a blinking cursor costs one row.
+
+### VNC
+
+Set **Serve on** in the Performance tab (a port for `127.0.0.1`, or
+`host:port`) and the machine's screen is served over the network with keyboard
+and mouse, for as long as the machine runs. Anyone who can reach the port
+controls the guest, so keep it on the loopback. **Frame rate** caps how often a
+connected viewer is sent a frame; lower costs less host CPU. The server starts
+with the machine and stops with it, and a port that is already in use is
+reported rather than failing the start.
 
 ### Input and shortcuts
 
@@ -468,6 +522,11 @@ iris/
   that the main thread drains each frame.
 - Input flows the other way: the GUI thread reads egui events each frame and,
   while captured, drives the guest's `Ps2Controller` directly.
+- Frames go from the board's display thread to the GUI thread through
+  `framebuffer.rs::FrameSink`: the renderer fills a pooled buffer and publishes
+  it, the GUI takes that same buffer (a move, not a copy), uploads it, and hands
+  it straight back. Publishing wakes the GUI, so it sleeps until a frame exists
+  and only keeps an idle repaint floor (250 ms) in between.
 
 ### Command and event vocabulary
 

@@ -1,10 +1,13 @@
 //! What the UI, CI socket and GUI front-end need from whichever graphics board
 //! drives the screen (Newport/REX3 or GR2).
 //!
-//! Each board owns its display thread and composition; this trait only exposes
-//! the hand-off points: the renderer slot the front-end installs into, the
+//! Each board owns its display thread and composition (the status bar's
+//! inputs come from the machine's shared `StatusSource`); this trait only
+//! exposes the hand-off points: the renderer slot the front-end installs into, the
 //! last-presented screen (screenshots, VNC), the hardware cursor, and the CPU
 //! cycle counter.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
@@ -13,6 +16,9 @@ use crate::cpu::mips_core::CyclesPtr;
 use crate::dev::ng1::rex3::Renderer;
 
 pub trait GfxDisplay: Send + Sync {
+    /// The board's [`DisplayStop`], which its stop and its display thread use.
+    fn display_stop(&self) -> &DisplayStop;
+
     /// Slot the front-end installs its renderer into. The board's display
     /// thread presents every frame through whatever is installed here.
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>>;
@@ -51,6 +57,37 @@ pub trait GfxDisplay: Send + Sync {
     /// The hardware cursor as the guest has set it, read live from the
     /// board's registers (not the last composed frame).
     fn hw_cursor(&self) -> Option<HwCursor> { None }
+}
+
+/// Whether the display thread tears its renderer down when it ends.
+///
+/// Releasing a renderer's GL context has to happen on the thread that made
+/// it current, so the display thread does it as its last act. On macOS
+/// glutin runs that release on the main thread, and the main thread is the
+/// one stopping the machine when the window closes, waiting in the join.
+/// Neither goes on, and the disks are never flushed. So a board calls
+/// [`request`](Self::request) first thing in its stop, and its display
+/// thread ends with [`finish`](Self::finish), which leaves the renderer
+/// alone when the stop came from the main thread. That stop is final: the
+/// process is ending, and the renderer cannot be set up again.
+#[derive(Default)]
+pub struct DisplayStop(AtomicBool);
+
+impl DisplayStop {
+    pub fn request(&self) {
+        // std has no is-main-thread test. The platform ones exist where the
+        // hang does (pthread_main_np on macOS), but Rust names the main
+        // thread, and the name lets a test on Linux stand in for it.
+        self.0.store(std::thread::current().name() == Some("main"), Ordering::Release);
+    }
+
+    pub fn finish(&self, renderer: &Mutex<Option<Box<dyn Renderer>>>) {
+        if !self.0.load(Ordering::Acquire) {
+            if let Some(r) = renderer.lock().as_mut() {
+                r.stop();
+            }
+        }
+    }
 }
 
 /// The hardware cursor: where the board draws its glyph and which of the

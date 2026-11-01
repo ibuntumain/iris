@@ -209,6 +209,12 @@ pub struct Hot {
     /// elide or reorder the write away, which a plain non-volatile write
     /// technically could across an unbounded loop.
     pub cycles: u64,
+    /// The part of `cycles` that was host-pacing while the CPU slept in an
+    /// idle park or a WAIT stall, not instructions retired (see
+    /// `idle_park::advance_parked`). Written by the CPU thread only, and
+    /// never read by the guest: `cycles - parked_cycles` is the retired
+    /// count the status bars turn into MIPS.
+    pub parked_cycles: u64,
 }
 
 /// A raw pointer into `Hot::cycles`, handed out by `MipsExecutor::cycles_ptr`/
@@ -228,7 +234,7 @@ pub struct Hot {
 /// `ptr::read_volatile` itself — see `Hot::cycles`'s doc comment for why a
 /// volatile read, not a plain one.
 #[derive(Clone, Copy)]
-pub struct CyclesPtr(*const u64);
+pub struct CyclesPtr(*const u64, *const u64);
 
 unsafe impl Send for CyclesPtr {}
 unsafe impl Sync for CyclesPtr {}
@@ -237,14 +243,20 @@ impl CyclesPtr {
     /// Construct from a raw pointer obtained via `MipsExecutor::cycles_ptr`/
     /// `MipsCpu::cycles_ptr` — never call this with anything else.
     pub fn new(ptr: *const u64) -> Self {
-        Self(ptr)
+        Self(ptr, std::ptr::null())
+    }
+
+    /// As [`new`](Self::new), also reading the CPU's `Hot::parked_cycles`
+    /// word so [`retired`](Self::retired) can leave out parked time.
+    pub fn with_parked(cycles: *const u64, parked: *const u64) -> Self {
+        Self(cycles, parked)
     }
 
     /// A `CyclesPtr` that reads as `0` forever — for fields not yet wired up
     /// (`Rex3`/`Wd33c93a` are constructed before the CPU exists; see
     /// `set_cpu_cycles` on each).
     pub const fn dangling() -> Self {
-        Self(std::ptr::null())
+        Self(std::ptr::null(), std::ptr::null())
     }
 
     /// Read the current cycle count. Volatile: see `Hot::cycles`'s doc
@@ -252,6 +264,16 @@ impl CyclesPtr {
     /// `CyclesPtr` hasn't been wired up yet (`dangling()`/not yet set).
     pub fn get(self) -> u64 {
         if self.0.is_null() { 0 } else { unsafe { std::ptr::read_volatile(self.0) } }
+    }
+
+    /// Cycles that retired instructions: [`get`](Self::get) less the time the
+    /// CPU spent parked. This is what a MIPS figure should divide; `get`
+    /// keeps moving through a park so timing readers see progress. Reads the
+    /// parked word first, so a park ending between the two reads can only
+    /// overstate the result by that one slice, never wrap it.
+    pub fn retired(self) -> u64 {
+        let parked = if self.1.is_null() { 0 } else { unsafe { std::ptr::read_volatile(self.1) } };
+        self.get().saturating_sub(parked)
     }
 
     /// The counter's address (null when dangling), for readers that keep it
@@ -866,6 +888,15 @@ pub struct MipsCore {
 
     /// Counts every CP0 Count==Compare match (i.e. every fastick interrupt).
     pub fasttick_count: Arc<AtomicU64>,
+    /// Which processor this is: what HEART's PRID answers it.
+    pub cpu_id: u8,
+    /// More than one CPU shares this memory, so SC must be a host
+    /// compare-exchange (`exec_sc`).
+    pub smp: bool,
+    /// What the last LL/LLD loaded and from where: the compare-exchange's
+    /// expected value, and whether an SC is to the same word.
+    pub ll_value: u64,
+    pub ll_phys: u64,
 
     // Execution state
     pub running: bool,
@@ -1386,6 +1417,10 @@ impl MipsCore {
             reset_fir: 0x0000_0500,
             cp0_random_cycle: 0,
             fasttick_count: Arc::new(AtomicU64::new(0)),
+            cpu_id: 0,
+            smp: false,
+            ll_value: 0,
+            ll_phys: 0,
             running: false,
             halted: false,
             count_hz_atomic: Arc::new(AtomicU64::new(DEFAULT_COUNT_HZ)),
@@ -1446,6 +1481,9 @@ impl MipsCore {
             self.cp0_entryhi = 0;
             self.cp0_compare = 0;
             self.hot.cycles = 0;
+            // Parked time is part of `cycles`; keep it so, or `retired()`
+            // reads 0 until the new run's cycles pass the old run's parks.
+            self.hot.parked_cycles = 0;
             self.count_read_cycle = 0;
             self.count_anchor_instant = std::time::Instant::now();
             #[cfg(feature = "ci_clock")]
@@ -1496,7 +1534,8 @@ impl MipsCore {
     /// Reset the CPU to initial state
     pub fn reset(&mut self, soft: bool) {
         self.reset_registers(soft);
-        self.hot.interrupts.store(0, Ordering::SeqCst);
+        // A reset does not release a CPU another thread is holding.
+        self.hot.interrupts.fetch_and(crate::cpu::smp::HOST_PARK_BIT, Ordering::SeqCst);
     }
 
     /// Read a GPR by index. gpr[0] is always kept at zero.

@@ -388,9 +388,11 @@ impl Hq3Board for Hq4Quirks {
     /// That the register field is nine bits is an inference, not a
     /// published width: every raster register name known runs to 0x1FF, and
     /// the direct packets' decode used for the Octane's port takes the bit
-    /// above as part of the packet class. The IP30 PROM sends one such word
-    /// (0x001A6804) before its first context switch; what the board does
-    /// with it is unknown, so it is dropped and reported.
+    /// above as part of the packet class. The IP30 PROM and the IP30 kernel
+    /// both send one such word (0x001A6804, decoded as a write of 0 to
+    /// register 0x268, which no datasheet names); the kernel's copies can
+    /// arrive after a context switch has started. What the board does with
+    /// it is unknown, so it is dropped and reported.
     fn drop_raster_write(&self, cmd: u32) -> Option<String> {
         (cmd & 0x200 != 0).then(|| format!("raster command {cmd:#x} past register 0x1FF dropped"))
     }
@@ -668,24 +670,22 @@ impl ImpactXio {
         widget: u8,
         irq: Arc<dyn InterruptController>,
         mem: Arc<dyn BusDevice>,
-        heartbeat: Arc<AtomicU64>,
-        fasttick: Arc<AtomicU64>,
+        status: Arc<crate::disp::StatusSource>,
     ) -> Arc<Self> {
-        Self::with_board(widget, GraphicsBoard::SolidImpact, irq, mem, heartbeat, fasttick)
+        Self::with_board(widget, GraphicsBoard::SolidImpact, irq, mem, status)
     }
 
     /// An IMPACT board of kind `kind` (Solid, High for SI with texture,
     /// Maximum for MXI) at `widget` (one of the four graphics ports):
     /// its interrupts are vectors on `irq` (HEART), its DMA reaches `mem`
-    /// (the bus masters' view of memory). `heartbeat` and `fasttick` feed
-    /// the status bar, as for the Indigo2 board. `Device::start` starts it.
+    /// (the bus masters' view of memory). `status` feeds the status bar, as
+    /// for the Indigo2 board. `Device::start` starts it.
     pub fn with_board(
         widget: u8,
         kind: GraphicsBoard,
         irq: Arc<dyn InterruptController>,
         mem: Arc<dyn BusDevice>,
-        heartbeat: Arc<AtomicU64>,
-        fasttick: Arc<AtomicU64>,
+        status: Arc<crate::disp::StatusSource>,
     ) -> Arc<Self> {
         let board = ImpactBoard::for_kind(kind).expect("an IMPACT board kind");
         let shared = Arc::new(Shared {
@@ -700,8 +700,7 @@ impl ImpactXio {
         let mgras = Mgras::new(
             kind,
             [IrqLine::new(lines.clone(), 0), IrqLine::new(lines.clone(), 1), IrqLine::new(lines, 2)],
-            heartbeat,
-            fasttick,
+            status,
         );
         // CMAP 0's revision register carries the monitor ID in bits 7:4;
         // CMAP 1's RA revision in 6:4 and, in bit 7, that there is no video
@@ -713,8 +712,8 @@ impl ImpactXio {
             board.ge_revision as u32,
         );
         mgras.set_phys(mem);
-        // The Octane X server arms a pixel read with XFRCONTROL 8 and kicks
-        // the DMA last, which starts the read.
+        // The Octane X server arms a pixel read with XFRCONTROL 8, kicks the
+        // DMA, which starts the read, and then writes XFRCONTROL 9.
         mgras.start_reads_at_kick();
         // The HQ4 microcode keeps its GE state at other addresses, and the
         // IP30 kernel's idle waits are shorter than the model's long lists.
@@ -870,7 +869,9 @@ impl ImpactXio {
             o if is_plain(o) => s.plain.get(&o).copied().unwrap_or(0),
             _ => {
                 drop(s);
-                self.shared.note(format!("read of {off:#08x}"));
+                // The CPU's PC at its last batch boundary: the caller, to within a batch.
+                let pc = crate::ip30::LAST_PC[crate::cpu::smp::current_cpu()].load(Ordering::Relaxed);
+                self.shared.note(format!("read of {off:#08x} at pc {pc:#x}"));
                 0
             }
         };
@@ -1038,7 +1039,8 @@ impl ImpactXio {
             true
         });
         if !known {
-            self.shared.note(format!("write of {v:#x} to {off:#08x}"));
+            let pc = crate::ip30::LAST_PC[crate::cpu::smp::current_cpu()].load(Ordering::Relaxed);
+            self.shared.note(format!("write of {v:#x} to {off:#08x} at pc {pc:#x}"));
             return BUS_OK;
         }
         for (o, v) in board {
@@ -1201,6 +1203,7 @@ impl Resettable for ImpactXio {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::record::tests::poll_until;
     use crate::traits::BUS_BUSY;
 
     fn gl() -> Box<Gl> {
@@ -1317,8 +1320,7 @@ mod tests {
     fn rig() -> Rig {
         let heart = Arc::new(Heart::default());
         let ram = Arc::new(Ram(Mutex::new(vec![0; 1 << 20])));
-        let hb = Arc::new(AtomicU64::new(0));
-        let b = ImpactXio::new(11, heart.clone(), ram.clone(), hb.clone(), hb);
+        let b = ImpactXio::new(11, heart.clone(), ram.clone(), crate::disp::StatusSource::detached());
         b.mgras().start_engines();
         Rig { b, heart, ram }
     }
@@ -1578,7 +1580,7 @@ mod tests {
         assert!(!is_whole_packet(0x8000_0004_0000_0000), "pixel data");
     }
 
-    /// The IP30 PROM's pre-switch packet 0x001A6804 names a raster register
+    /// The IP30 PROM's and kernel's packet 0x001A6804 names a raster register
     /// past 0x1FF: it is dropped and reported, and leaves the raster
     /// registers alone.
     #[test]
@@ -1668,14 +1670,7 @@ mod tests {
         for _ in 0..2 {
             r.w32(COMMAND, 0x37 << 8); // SCHEDULE_SWAP
             // The HQ thread raises the source, then sends the packet.
-            let mut got = Vec::new();
-            for _ in 0..1_000_000 {
-                got = r.packets();
-                if !got.is_empty() {
-                    break;
-                }
-                std::thread::yield_now();
-            }
+            let got = poll_until(|| Some(r.packets()).filter(|g| !g.is_empty())).expect("swap packet never arrived");
             assert_eq!(got, [(18, true)]);
             assert_eq!(r.r32(0x011020) & 0x400, 0x400);
             assert_eq!(r.r32(0x020010) & 0x400, 0);
@@ -1767,14 +1762,7 @@ mod tests {
             r.w32(0x011070, 18 << 8);
             r.w32(0x011040, 0x400);
             r.w32(COMMAND, 0x37 << 8); // SCHEDULE_SWAP
-            let mut got = Vec::new();
-            for _ in 0..1_000_000 {
-                got = r.packets();
-                if !got.is_empty() {
-                    break;
-                }
-                std::thread::yield_now();
-            }
+            let got = poll_until(|| Some(r.packets()).filter(|g| !g.is_empty())).expect("swap packet never arrived");
             assert_eq!(got, [(18, true)], "round {round}");
             // Not acknowledged: the board is reset instead.
             r.b.reset();
@@ -1887,8 +1875,7 @@ mod tests {
         // No engine thread, so nothing drains the command FIFO.
         let heart = Arc::new(Heart::default());
         let ram = Arc::new(Ram(Mutex::new(vec![0; 1 << 20])));
-        let hb = Arc::new(AtomicU64::new(0));
-        let r = Rig { b: ImpactXio::new(11, heart.clone(), ram.clone(), hb.clone(), hb), heart, ram };
+        let r = Rig { b: ImpactXio::new(11, heart.clone(), ram.clone(), crate::disp::StatusSource::detached()), heart, ram };
         let mut accepted = 0u32;
         let st = loop {
             let st = r.b.write(SH + hq4::RE_STATUS as u64, 32, 0);

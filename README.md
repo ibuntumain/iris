@@ -78,8 +78,10 @@ boots to a usable system: shell, networking, X11, the works.
   in-process NFSv2/v3 server, TFTP for PROM network boot, and FTP/XDMCP helpers;
   or PCAP bridging onto a real LAN
 - Headless mode and a CI control socket (`iris-ci`) for automation
-- Optional egui front-end (`iris-gui`) with machine management and a benchmark tab;
-  machines use the CLI TOML schema in isolated folders with relative paths
+- Optional egui front-end (`iris-gui`) with machine management, a Performance
+  tab for tuning the host cost on small machines, a built-in VNC server, and a
+  benchmark tab; machines use the CLI TOML schema in isolated folders with
+  relative paths
 - DaynaPort SCSI/Link Ethernet and the N64 development board (Ultra64), both enabled per machine in the config
 - Other guests: Linux (Debian 7, Gentoo), NetBSD and OpenBSD have had SCSI,
   interrupt and timer fixes land for them. They are not regularly tested, so
@@ -251,6 +253,10 @@ BSD 3-Clause (`LICENSE`).
 IRIS links `libchdman-rs` (>= 0.288.8), which — along with the MAME CHD core
 it vendors — is also BSD 3-Clause, so the whole binary stays BSD 3-Clause. See `LICENSE-libchdman-rs.txt` for that third-party
 notice.
+
+The status bar and debug overlays use SGI's Screen 16 bitmap font, copyright
+Silicon Graphics, Inc., under the MIT license. `src/vga_font.rs` is generated
+from it by `tools/gen-screen-font.py`.
 
 The Octane's device models are ported from [Origami](https://github.com/jamesbraid/origami)'s
 [QEMU models](https://github.com/jamesbraid/qemu-sgi-origami), by the same

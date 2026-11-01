@@ -397,8 +397,7 @@ fn the_graphics_port_reaches_impact_with_its_link_up() {
         WIDGET_GFX,
         heart.clone(),
         ram.dma_view(),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
+        crate::disp::StatusSource::detached(),
     );
     let id = widget_small_base(WIDGET_GFX) + 4;
     for (links, alive) in [(0x8100u16, false), (0x8100 | 1 << WIDGET_GFX, true)] {
@@ -466,14 +465,13 @@ impl Octane {
         let bridge = Bridge::new(mem.clone(), heart.clone());
 
         let eth = Ioc3Eth::with_negotiation_delay(MAC, std::time::Duration::ZERO);
-        let (to_net, sent) = rtrb::RingBuffer::new(64);
-        let (inject, from_net) = rtrb::RingBuffer::new(64);
-        eth.attach(to_net, from_net, None, None);
+        let (link, sent, inject) = crate::net::Link::loopback();
+        eth.attach(link);
         let ioc3 = Arc::new(Ioc3::octane(MAC, false));
         ioc3.attach_eth(eth.clone());
         ioc3.connect_superio_interrupt(bridge.pin_line(SUPERIO_PIN as u8));
 
-        let isp = [Arc::new(Isp1040::new_at(0)), Arc::new(Isp1040::new_at(1))];
+        let isp = [Arc::new(Isp1040::new_at(0, Isp1040::new_bus())), Arc::new(Isp1040::new_at(1, Isp1040::new_bus()))];
         bridge.attach(SLOT_ISP0 as u8, isp[0].clone());
         bridge.attach(SLOT_ISP1 as u8, isp[1].clone());
         bridge.attach(SLOT_IOC3 as u8, ioc3.clone());
@@ -689,7 +687,7 @@ impl IspDisk {
         static N: AtomicU32 = AtomicU32::new(0);
         let p = std::env::temp_dir().join(format!("iris-ip30-xtests-{}-{}-{name}.img", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         std::fs::write(&p, vec![0u8; 64 * 512]).unwrap();
-        isp.attach_disk_at(target, &p).unwrap();
+        isp.bus().attach_image(target, &p, false).unwrap();
         IspDisk(p)
     }
 }

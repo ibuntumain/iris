@@ -128,6 +128,63 @@ fn identity_and_bar() {
     assert_eq!(cfg.read(4), 0xfff0_0000, "one megabyte of memory space");
 }
 
+/// The reference Octane2's PROM monitor reads the chip's type 0
+/// configuration space as 32 bytes repeated: dwords 0x20-0x3f read 0x00-0x1f,
+/// so the latency word shows at 0x2c where a subsystem id might sit and the
+/// interrupt pin byte at 0x3d reads zero. The firmware's own programming is
+/// replayed (BAR 0 0x500000, latency timer 0x28, command 0x146). The dword at
+/// 0x1c reads the BAR 0 value on that machine for a reason no public source
+/// gives, so it is not asserted.
+///
+/// QEMU: octane2/ioc3-config-repeats.
+#[test]
+fn configuration_space_repeats_its_first_32_bytes() {
+    let r = Rig::new();
+    let cfg = r.c.config();
+    cfg.write(4, 0x0050_0000);
+    cfg.write(3, 0x2800);
+    cfg.write(1, 0x146);
+
+    for (index, want) in [(0, 0x0003_10a9), (1, 0x0280_0146), (2, 0xff00_0001), (3, 0x0000_2800), (4, 0x0050_0000), (5, 0), (6, 0)] {
+        assert_eq!(r.c.config_dword(index), want, "dword {index}");
+    }
+    for index in 8..16 {
+        if index != 15 {
+            assert_eq!(r.c.config_dword(index), r.c.config_dword(index - 8), "dword {index} repeats");
+        }
+    }
+    assert_eq!(r.c.config_dword(11), 0x0000_2800, "the latency word, not a subsystem id");
+    assert_eq!(r.c.config_dword(15) >> 8 & 0xff, 0, "no interrupt pin byte");
+    // The stored header keeps both for the board's wiring.
+    assert_eq!(cfg.read(11), 0xc304_10a9);
+    assert_eq!(cfg.interrupt_pin(), PCI_INTA);
+}
+
+/// The first five dwords of the register block are the configuration header
+/// the same monitor reads back as 0x310a9, 0x2800146, 0xff000001, 0x2800 and
+/// 0x500000. Pin control clear reads the control word, as the monitor reads
+/// 0x2000f3 at both 0x34 and 0x38.
+///
+/// QEMU: octane2/ioc3-register-header.
+#[test]
+fn the_register_block_starts_with_the_configuration_header() {
+    let r = Rig::new();
+    let cfg = r.c.config();
+    cfg.write(4, 0x0050_0000);
+    cfg.write(3, 0x2800);
+    cfg.write(1, 0x146);
+
+    for off in (0..=0x10).step_by(4) {
+        assert_eq!(r.r32(off), r.c.config_dword(off as usize / 4), "offset {off:#x}");
+    }
+    assert_eq!(r.r32(0x04), 0x0280_0146);
+    assert_eq!(r.r32(0x10), 0x0050_0000);
+
+    r.w32(reg::PIN_CONTROL_SET, 0x0020_00f3);
+    assert_eq!(r.r32(reg::PIN_CONTROL_SET), 0x0020_00f3);
+    assert_eq!(r.r32(reg::PIN_CONTROL_CLR), 0x0020_00f3);
+}
+
 // ---------------------------------------------------------------------------
 // SuperIO window: the two 16550s
 // ---------------------------------------------------------------------------
@@ -192,6 +249,7 @@ fn the_scratch_register_programs_the_predivider_under_dlab() {
     r.w8(reg::SERIAL_A + 7, 6);
     assert_eq!(r.r8(reg::SERIAL_A + 7), 6, "reads back what was written");
     assert_eq!(r.c.sh.st.lock().uart[0].predivider, 6);
+    assert_eq!(r.c.sh.st.lock().uart[0].core.baudbase(), 22_118_400 / 3 / 16, "the divisor's clock follows it");
     // Written 0 or 1 means nothing.
     r.w8(reg::SERIAL_A + 7, 1);
     assert_eq!(r.c.sh.st.lock().uart[0].predivider, 6);
@@ -713,20 +771,79 @@ fn host_input_arrives_in_the_receive_ring_after_the_timer() {
     let r = Rig::new();
     r.aim_engines();
     r.w32(reg::SDMA_RING_LO, 0x2000 | 1);
-    // 0x200 ticks of 62.5 us: 32 ms, well clear of a slow test host.
+    // 0x200 ticks of 62.5 us: 32 ms.
     r.w32(A + sdma_off::RX_TIMER, 0x200);
     r.w32(A + sdma_off::RX_CONSUME, ARM_RX_TIMER);
     r.w32(A, sdma_ctl::ENABLE | 4);
     r.wire[0].inp.lock().unwrap().extend(b"hi");
+    let before = Instant::now();
     r.c.service();
+    let after = Instant::now();
+    // Every register access first expires a deadline already past, so a
+    // test thread descheduled past it would see the entry posted before it
+    // looked. Hold the timer off while looking, then let it run out.
+    let wait = Duration::from_nanos(0x200 * TIMER_TICK_NS);
+    let due = {
+        let mut st = r.c.sh.st.lock();
+        let port = &mut st.sdma.port[0];
+        let due = port.rx_deadline.expect("the first character started the timer");
+        assert!(due >= before + wait && due <= after + wait, "the reload's 32 ms from the character");
+        port.rx_deadline = Some(Instant::now() + Duration::from_secs(3600));
+        due
+    };
     assert_eq!(r.r32(A + sdma_off::RX_PRODUCE) >> HELD_SHIFT & 7, 2, "two held in the packer");
     assert_eq!(r.r32(A + sdma_off::RX_CONSUME) & ARM_RX_TIMER, ARM_RX_TIMER);
-    std::thread::sleep(Duration::from_millis(60));
+    r.c.sh.st.lock().sdma.port[0].rx_deadline = Some(due);
+    std::thread::sleep(due.saturating_duration_since(Instant::now()));
     r.c.service();
     assert_eq!(r.r32(A + sdma_off::RX_PRODUCE), 8, "posted when the timer ran out");
     assert_eq!(&get(&r, 0x3000, 2), b"hi");
     assert_ne!(r.r32(reg::INT_STATUS) & int::serial(0, int::RX_TIMER), 0);
     assert_eq!(r.r32(A + sdma_off::RX_CONSUME) & ARM_RX_TIMER, 0, "the arm is spent");
+}
+
+/// Receive-ring-full is a level, a model choice: set while ring DMA is on
+/// and an entry waits that the ring had no room for. An acknowledgement
+/// leaves it, running the engine again with no new character does not raise
+/// it afresh, and it falls when software makes room. A ring filled exactly,
+/// with nothing waiting, does not raise it.
+///
+/// QEMU: sn0/ioc3-serial/receive-ring-full-is-a-level.
+#[test]
+fn receive_ring_full_is_a_level() {
+    let r = Rig::new();
+    let full = int::serial(0, int::RX_RING_FULL);
+    r.aim_engines();
+    r.w32(reg::SDMA_RING_LO, 0x2000 | 1);
+
+    // Full to the last entry, but nothing waits for room.
+    r.w32(A + sdma_off::RX_CONSUME, 8);
+    r.w32(A, sdma_ctl::ENABLE);
+    assert_eq!(r.r32(reg::INT_STATUS) & full, 0);
+
+    // Room for one entry; the second waits.
+    r.w32(A + sdma_off::RX_CONSUME, 16);
+    r.wire[0].inp.lock().unwrap().extend(b"ringfull");
+    r.c.service();
+    assert_eq!(r.r32(A + sdma_off::RX_PRODUCE) & 0xff8, 8);
+    assert_eq!(r.r32(reg::INT_STATUS) & full, full);
+
+    // An acknowledgement does not clear it, and running the engine again
+    // does not matter: it is the ring that is full.
+    r.w32(reg::INT_STATUS, full);
+    r.w32(A + sdma_off::TX_PRODUCE, 0);
+    assert_eq!(r.r32(reg::INT_STATUS) & full, full);
+
+    // Ring DMA off, the source with it; on again, it is back.
+    r.w32(A, 0);
+    assert_eq!(r.r32(reg::INT_STATUS) & full, 0);
+    r.w32(A, sdma_ctl::ENABLE);
+    assert_eq!(r.r32(reg::INT_STATUS) & full, full);
+
+    // Room for the waiting entry: it posts and fills the ring exactly.
+    r.w32(A + sdma_off::RX_CONSUME, 24);
+    assert_eq!(r.r32(A + sdma_off::RX_PRODUCE) & 0xff8, 16);
+    assert_eq!(r.r32(reg::INT_STATUS) & full, 0);
 }
 
 #[test]
@@ -860,6 +977,19 @@ fn the_parallel_port_presents_the_probe_values() {
     let r = Rig::new();
     assert_eq!(r.r8(ECP + 0xa), PAR_ECR_FIFO_EMPTY, "empty, not full: the driver's presence check");
     assert_eq!(r.r8(ECP + 1) & 0x08, 0x08, "no fault");
+}
+
+/// The status register reads what is on the cable. A connector with nothing
+/// on it sits at the five input pull-ups, 0x78, with bit 7 (the inverse of
+/// Busy) clear; a host backend reads as a printer that can take data, 0xd8.
+///
+/// QEMU: sn0/ioc3-parallel (empty connector and file backend cases).
+#[test]
+fn the_parallel_status_follows_what_is_attached() {
+    let r = Rig::new();
+    assert_eq!(r.r8(ECP + 1), 0x78, "empty connector");
+    r.c.set_parallel_backend(Arc::new(Wire::default()));
+    assert_eq!(r.r8(ECP + 1), 0xd8, "a ready printer");
 }
 
 #[test]
@@ -1238,6 +1368,15 @@ fn running_rig() -> (Rig, Arc<TimerManager>) {
     (r, tm)
 }
 
+/// Whether a timer is pending for deadline `kind`, read while no timer
+/// callback is running. A callback clears its slot on entry and arms the
+/// next deadline before it returns, so between those a chip that holds a
+/// deadline briefly shows none; the callback holds `gate` throughout.
+fn timer_pending(r: &Rig, kind: usize) -> bool {
+    let _idle = r.c.sh.gate.lock();
+    r.c.sh.armed.lock()[kind].is_some()
+}
+
 /// Poll `cond` for up to two seconds.
 fn within_two_seconds(cond: impl Fn() -> bool) -> bool {
     let end = Instant::now() + Duration::from_secs(2);
@@ -1302,6 +1441,38 @@ fn a_transmit_delay_ends_with_no_guest_access() {
     r.c.stop();
 }
 
+/// Poll `done` until it holds, giving up after a minute. The timer and the
+/// NVRAM writer run on other threads and the suite runs many tests at once, so
+/// a bound counted in milliseconds gives up on a busy host before either has
+/// had a core; the deadline only has to catch a write that never comes.
+fn eventually(mut done: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + Duration::from_secs(60);
+    while !done() {
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    true
+}
+
+/// A guest write to the clock's RAM leaves the file alone: it only marks the
+/// RAM changed, for the debounce to save later. The chip is not started, so
+/// no timer or writer exists that could save it behind the test's back; with
+/// them running, a read of the file "before the debounce" would race the
+/// debounce itself on a slow host.
+#[test]
+fn an_nvram_write_marks_the_ram_dirty_and_leaves_the_file_alone() {
+    let path = std::env::temp_dir().join(format!("ioc3-nvram-perbyte-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let (r, _tm) = running_rig();
+    r.c.set_nvram_file(&path).unwrap();
+    rtc_w(&r, 0x45, 0x66);
+    assert_eq!(std::fs::read(&path).unwrap()[NVRAM_OFF_NV + 5], 0, "not written per byte");
+    assert!(r.c.sh.st.lock().rtc.dirty_since.is_some(), "the RAM counts as unsaved");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The file catches up once the guest's NVRAM writes have paused, written by
 /// the chip's own writer with nobody calling a flush.
 #[test]
@@ -1313,12 +1484,7 @@ fn nvram_reaches_the_file_after_the_debounce_with_no_flush() {
     r.c.start();
     rtc_w(&r, 0x45, 0x66);
     let in_file = || std::fs::read(&path).map(|f| f[NVRAM_OFF_NV + 5]).unwrap_or(0);
-    assert_eq!(in_file(), 0, "not written per byte");
-    let end = Instant::now() + Duration::from_secs(5);
-    while in_file() == 0 && Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(in_file(), 0x66);
+    assert!(eventually(|| in_file() == 0x66), "the writer saved the RAM");
     r.c.stop();
     let _ = std::fs::remove_file(&path);
 }
@@ -1335,7 +1501,7 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     assert_eq!(r.c.threads.lock().len(), 3, "two receive threads and the NVRAM writer");
     r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
     r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000);
-    assert!(r.c.sh.armed.lock()[K_INT_OUT].is_some());
+    assert!(timer_pending(&r, K_INT_OUT));
     r.c.stop();
     r.c.stop();
     assert!(!r.c.is_running());
@@ -1344,10 +1510,24 @@ fn stop_joins_the_threads_and_removes_the_timers() {
     // Typed input waits in the backend while stopped.
     r.wire[0].inp.lock().unwrap().extend(b"x");
     std::thread::sleep(Duration::from_millis(20));
-    assert!(r.c.sh.st.lock().uart[0].rx.is_empty());
+    assert!(r.c.sh.st.lock().uart[0].core.rx_pending() == 0);
     r.c.start();
-    assert!(within_two_seconds(|| !r.c.sh.st.lock().uart[0].rx.is_empty()));
-    assert!(r.c.sh.armed.lock()[K_INT_OUT].is_some(), "start arms the deadlines the chip holds");
+    assert!(within_two_seconds(|| r.c.sh.st.lock().uart[0].core.rx_pending() != 0));
+    assert!(timer_pending(&r, K_INT_OUT), "start arms the deadlines the chip holds");
+    r.c.stop();
+}
+
+/// A repeating output keeps a timer pending whenever no callback is in the
+/// middle of re-arming it, however often the callbacks run.
+#[test]
+fn a_periodic_output_always_has_a_timer_pending_between_callbacks() {
+    let (r, _tm) = running_rig();
+    r.c.start();
+    r.w32(reg::INT_ENABLE_SET, int::RT_OUTPUT_PULSE);
+    r.w32(reg::INT_OUTPUT, IO_PERIODIC | 1000);
+    for _ in 0..20_000 {
+        assert!(timer_pending(&r, K_INT_OUT));
+    }
     r.c.stop();
 }
 

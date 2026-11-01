@@ -1414,14 +1414,14 @@ fn gl_clip_by_wid() {
 fn fin3_waits_for_queued_finish() {
     let g = &live_gr2(Gr2Variant::Xz);
     gl_setup_window(g);
-    let fl = |v: f32| v.to_bits();
+    g.wait_idle();
+    // Keep Finish queued until its pending flag has been observed. A live
+    // worker can drain any amount of preceding work before the CPU polls.
+    g.stop();
     w32(g, 0x6b000, 1); // stale FIN3, as a context restore leaves it
-    // A frame's worth of work, then Finish.
-    for _ in 0..4000 {
-        for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
-    }
     cmd(g, 0x0a3, 0);
     let early = r32(g, 0x6a040) & 1;
+    g.start();
     g.wait_idle();
     let late = r32(g, 0x6a040) & 1;
     assert_eq!(early, 0, "FIN3 hidden while the Finish is queued");

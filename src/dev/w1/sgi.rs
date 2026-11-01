@@ -102,6 +102,17 @@ pub fn ethernet_address_part(mac: [u8; 6], serial: u64) -> w1::Ds2502 {
     w1::Ds2502::ds2501(0x91, serial, &page)
 }
 
+/// The O2's Ethernet-address part: a DS2502 (family 0x09, the one its PROM
+/// insists on) whose serial is the station address itself, in order, and
+/// whose memory starts with the address reversed, the rest erased.
+pub fn o2_ethernet_address_part(mac: [u8; 6]) -> w1::Ds2502 {
+    let mut rev = mac;
+    rev.reverse();
+    let mut serial = [0u8; 8];
+    serial[..6].copy_from_slice(&mac);
+    w1::Ds2502::new(0x09, u64::from_le_bytes(serial), &rev)
+}
+
 /// The synthetic ROM serial of the Ethernet-address part: the UniqueWare
 /// prefix 0x5e7 in its top twelve bits (what OpenBSD matches on), then the
 /// "EMU" marker and instance 0.

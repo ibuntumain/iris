@@ -24,12 +24,44 @@
 //!   any completion is held.
 //! * The target model has no bus reset, so a bus reset or soft reset does not
 //!   arm a unit attention on the disk as QEMU's SCSI devices do. A bus reset
-//!   does not retire the command in flight either: it completes as it would
-//!   have.
+//!   retires a selection still waiting on an absent target at once, with the
+//!   reset completion the public drivers handle for a command the reset
+//!   destroyed. Inferred: the drivers establish only that they handle that
+//!   completion, not that the firmware sends it for a command still in
+//!   selection, and whether it also raises the bus-reset asynchronous event
+//!   for a driver-issued reset is unknown (the ISP1040 datasheet's
+//!   set-selection-timeout table grades both).
+//! * A bus reset also starts the bus's hold-off: for mailbox 1 seconds the
+//!   chip starts no SCSI activity on it (the datasheet's "Bus-reset
+//!   hold-off"). Established only for the NVRAM setting of that name; that the
+//!   mailbox value does the same is inferred. The rest are model choices:
+//!   a command for the quiet bus waits and starts, oldest first, when the
+//!   hold ends (refusing it would be as well supported); the other bus and
+//!   mailbox commands carry on (inferred, not established); nothing is
+//!   posted when the hold ends; a
+//!   delay of 0 holds nothing and a later reset replaces the hold; the delay
+//!   is not clamped to the vendor's 0-15 s; an absent target then waits its
+//!   selection timeout from the end of the hold; a second reset retires the
+//!   parked commands with the reset completion; a soft reset clears the hold
+//!   and drops them, and a new request ring drops them with the hold kept.
+//!   Request-out stays at the oldest parked entry, because the entry is read
+//!   again when the hold ends: an approximation, a chip that had fetched it
+//!   would plausibly move on. A parked entry the guest rewrites meanwhile is
+//!   answered incomplete. A snapshot carries each bus's remaining hold and
+//!   the parked positions. The ISP12160 would widen `BUSES` and decode the
+//!   bus from mailbox 2 and its request entries; the per-bus state is there.
 //! * Only logical unit 0 of a present target exists. A command for another
 //!   unit is passed to the target with that unit number, which answers as
 //!   SCSI says (INQUIRY: no device at this unit; anything else: check
-//!   condition, logical unit not supported). An absent target times out.
+//!   condition, logical unit not supported). An absent target times out:
+//!   its completion is posted once the selection timeout the driver
+//!   programmed has passed on the adapter's clock. The part is only known to
+//!   wait at least that long; the model answers exactly at the value. A
+//!   programmed value of zero is no wait, and a queue initialisation leaves
+//!   a waiting selection alone: both are model choices, the datasheet being
+//!   silent. That clock is host wall time less the time
+//!   the machine was stopped; iris has no emulated-time source a device can
+//!   read, so the wait does not follow the guest's instruction rate.
 //!
 //! Register windows: BAR 0 is I/O space and BAR 1 memory space, both 256
 //! bytes onto the same sixteen-bit registers. Accesses of any other width
@@ -39,15 +71,16 @@
 //! Ported from hw/scsi/qlogic-isp.c in jamesbraid/qemu-sgi-origami.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::devlog::LogModule;
 use crate::irq::IrqLine;
 use crate::pci::{Bar, PciBusDevice, PciConfig, PciDma, PCI_INTA};
-use crate::scsi::{scsi_cmd, ScsiDataLength, ScsiDevice, ScsiIdentity, ScsiRequest};
+use crate::scsi::{scsi_cmd, ScsiBus, ScsiDataLength, ScsiIdentities, ScsiRequest, CDROM_IDENTITY, DISK_IDENTITY};
 use crate::snapshot::{get_field, hex_u16, hex_u32, load_u16_slice, toml_u16, toml_u32, toml_u8, u16_slice_to_toml, u8_slice_to_toml};
 
 pub const PCI_VENDOR_QLOGIC: u16 = 0x1077;
@@ -55,11 +88,6 @@ pub const PCI_DEVICE_ISP1040: u16 = 0x1020;
 pub const PCI_REVISION_ISP1040: u8 = 0x05;
 /// Mass storage controller, SCSI.
 pub const PCI_CLASS_SCSI: u32 = 0x0001_0000;
-
-/// What a disk or CD-ROM attached here answers INQUIRY with (the same
-/// identity the O2's controller gives its targets).
-pub const ISP_DISK: ScsiIdentity = ScsiIdentity::new(b"SGI     ", b"IRIS EMULATED   ", b"1.0 ");
-pub const ISP_CDROM: ScsiIdentity = ISP_DISK;
 
 pub const BLOCK_SIZE: usize = 512;
 
@@ -198,6 +226,7 @@ pub const SCSI_STATUS_SENSE_VALID: u16 = 0x0200;
 
 pub const IOCB_COMPLETE: u16 = 0x0000;
 pub const IOCB_INCOMPLETE: u16 = 0x0001;
+pub const IOCB_RESET: u16 = 0x0004;
 pub const IOCB_DATA_UNDERRUN: u16 = 0x0015;
 
 pub const STATE_GOT_BUS: u16 = 0x0100;
@@ -206,6 +235,29 @@ pub const STATE_GOT_SENSE: u16 = 0x2000;
 /// all of them, gated only on whether sense was collected.
 pub const STATE_ALL_PHASES: u16 = 0x7f00;
 pub const STATUS_FLAG_TIMEOUT: u16 = 0x0040;
+
+/// What one unit of the selection timeout (mailbox command 0x0031, mailbox
+/// 1) lasts. Milliseconds is inferred, not established: three public drivers
+/// default the value to 250 and Sun's isp(7D) page says milliseconds, but no
+/// vendor document is held.
+const SELECTION_TIMEOUT_UNIT: Duration = Duration::from_millis(1);
+/// The selection timeout in force until the driver programs one, in
+/// [`SELECTION_TIMEOUT_UNIT`]s: qla1280's default. The chip's own power-on
+/// default is unknown, so this is an approximation that only affects a
+/// driver that never programs a value.
+const DEFAULT_SELECTION_TIMEOUT: u16 = 250;
+
+/// What one unit of the bus-reset delay (mailbox command 0x0018, mailbox 1)
+/// lasts. Seconds is inferred from the vendor's NVRAM setting, which the
+/// drivers pass through; no firmware interface document is held. The
+/// datasheet puts the hold on the guest's virtual clock; iris has no such
+/// source for a device, so it runs on the adapter's clock, host wall time
+/// less the time the machine was stopped, like the selection timeout.
+const BUS_RESET_DELAY_UNIT: Duration = Duration::from_secs(1);
+/// The SCSI buses this part drives. The hold-off, the parked commands and the
+/// selection are all kept per bus, so a two-bus part widens this and decodes
+/// the bus from its own request entries and from mailbox 2.
+const BUSES: usize = 1;
 
 const CHECK_CONDITION: u8 = 0x02;
 const MAX_TARGET: u8 = 15;
@@ -247,6 +299,29 @@ struct Ctl {
     /// The machine is stopped: the thread takes no further entries.
     paused: bool,
     shutdown: bool,
+    /// The selection of an absent target the thread is waiting out. It
+    /// survives the thread being parked meanwhile.
+    selecting: Option<Selection>,
+    /// When the adapter's clock last stopped with the machine, and how long
+    /// it has stood still in all.
+    stopped_at: Option<Instant>,
+    stopped_ns: i64,
+}
+
+/// A selection of an absent target in progress.
+#[derive(Clone, Debug)]
+struct Selection {
+    /// The request ring consumer position of its entry.
+    cons: u32,
+    /// When the adapter's clock says the selection times out.
+    due: i64,
+    /// The completion to post then.
+    done: Pending,
+    /// The bus it is selecting on: a bus reset retires only that bus's.
+    bus: u8,
+    /// The driver replaced the request ring after the entry was read: the
+    /// command ran once all the same, but its entry is not in the new ring.
+    orphan: bool,
 }
 
 /// The request ring as a step of the walk found it, for the part of the
@@ -271,6 +346,16 @@ struct Job {
     described: u64,
 }
 
+/// What carrying out a request entry came to.
+enum Outcome {
+    /// The thread must look at the ring again first.
+    Again,
+    /// The entry could not be read: the walk stops on it.
+    Stop,
+    /// Done, with the completion to post if any.
+    Done(Option<Pending>),
+}
+
 /// What reading a request entry came to.
 enum Prepared {
     /// The fabric refused the entry; the walk stops on it.
@@ -279,7 +364,30 @@ enum Prepared {
     Skipped,
     /// Answered without reaching a target.
     Answered(Pending),
+    /// Answered when selecting an absent target on `bus` times out.
+    Absent(u8, Pending),
+    /// Its bus is in its post-reset hold-off: the entry is parked, unread
+    /// beyond its handle, until the hold ends.
+    Quiet { bus: u8, handle: u32 },
     Run(Job),
+}
+
+/// A command waiting out its bus's post-reset hold-off. Only the ring
+/// position is kept: the entry, its data segments included, is read again
+/// from the guest's ring when the hold ends.
+#[derive(Clone, Debug, PartialEq)]
+struct Parked {
+    /// Told apart from the others after the ring has changed under it.
+    seq: u64,
+    /// The request ring position of its first entry, and how many it spans.
+    cons: u32,
+    count: u8,
+    bus: u8,
+    /// The handle it was parked under: a rewritten entry is answered for it.
+    handle: u32,
+    /// The hold ended and the thread took it up. Such a command runs on
+    /// whatever hold a later reset sets.
+    started: bool,
 }
 
 struct State {
@@ -297,14 +405,24 @@ struct State {
     sxp_bank: [u16; BANK_WORDS],
     risc_ram: Vec<u16>,
     reset_delay: u16,
+    /// Mailbox command 0x0031's value, in [`SELECTION_TIMEOUT_UNIT`]s.
+    selection_timeout: u16,
     rqst_base: u64,
     resp_base: u64,
     rqst_len: u16,
     resp_len: u16,
+    /// Where the ring thread has read up to. The position the guest reads
+    /// is [`State::request_out`].
     rqst_cons: u16,
     resp_prod: u16,
     resp_cons: u16,
     pending: VecDeque<Pending>,
+    /// Per bus, when the adapter's clock ends the hold-off a bus reset
+    /// started. None: no hold.
+    quiet_until: [Option<i64>; BUSES],
+    /// Commands waiting out a hold-off, oldest first.
+    parked: VecDeque<Parked>,
+    park_seq: u64,
     total_cmds: u64,
 }
 
@@ -325,6 +443,7 @@ impl State {
             sxp_bank: [0; BANK_WORDS],
             risc_ram: vec![0; RAM_WORDS],
             reset_delay: 0,
+            selection_timeout: DEFAULT_SELECTION_TIMEOUT,
             rqst_base: 0,
             resp_base: 0,
             rqst_len: 0,
@@ -333,6 +452,9 @@ impl State {
             resp_prod: 0,
             resp_cons: 0,
             pending: VecDeque::new(),
+            quiet_until: [None; BUSES],
+            parked: VecDeque::new(),
+            park_seq: 0,
             total_cmds: 0,
         };
         s.reset();
@@ -360,6 +482,8 @@ impl State {
         // The driver re-downloads firmware after every reset.
         self.risc_ram.iter_mut().for_each(|w| *w = 0);
         self.reset_delay = 0;
+        self.selection_timeout = DEFAULT_SELECTION_TIMEOUT;
+        self.ctl.selecting = None;
         self.rqst_base = 0;
         self.resp_base = 0;
         self.rqst_len = 0;
@@ -368,6 +492,17 @@ impl State {
         self.resp_prod = 0;
         self.resp_cons = 0;
         self.pending.clear();
+        self.quiet_until = [None; BUSES];
+        self.parked.clear();
+    }
+
+    /// The request-out position the guest reads. Approximation: it stays at
+    /// the oldest parked command's slot until that command starts, because
+    /// the model reads the entry again when the hold ends; a chip that had
+    /// fetched the entry would plausibly advance it at once. The datasheet's
+    /// bus-reset hold-off model choices record this.
+    fn request_out(&self) -> u16 {
+        self.parked.front().map_or(self.rqst_cons, |p| p.cons as u16)
     }
 
     /// Only the RISC request bit and its enable drive the line; they share a
@@ -419,37 +554,44 @@ pub struct Core {
     /// Serialises driving the interrupt line; see [`Core::sync_irq`].
     line_order: Mutex<()>,
     /// The targets on the bus, by SCSI id.
-    targets: Mutex<[Option<ScsiDevice>; 16]>,
+    bus: ScsiBus,
     dma: OnceLock<Arc<dyn PciDma>>,
     irq: OnceLock<IrqLine>,
     /// Which of the Octane's two controllers this is (0 internal, 1
     /// external): the monitor's `scsi`/`cow` address the first,
     /// `scsi1`/`cow1` the second.
     index: u8,
-    /// The SCSI id a disk attached without one answers at.
-    target: u8,
     pci: PciConfig,
     notes: Mutex<Vec<String>>,
     dma_misses: Mutex<std::collections::BTreeSet<u64>>,
     odd_accesses: Mutex<u32>,
     /// The status bar's activity bits, shared with the display thread.
     heartbeat: OnceLock<Arc<AtomicU64>>,
-}
-
-impl Default for Isp1040 {
-    fn default() -> Self { Self::new() }
+    /// Where the adapter's clock starts.
+    start: Instant,
+    /// When not `i64::MIN`, the clock in nanoseconds, for tests.
+    fake_ns: AtomicI64,
 }
 
 fn le16(b: &[u8], off: usize) -> u16 { u16::from_le_bytes([b[off], b[off + 1]]) }
 
 impl Isp1040 {
-    pub fn new() -> Self {
-        Self::new_at(0)
+    /// An empty bus of the kind this chip drives: ids 0-15, and the
+    /// emulated disk and CD-ROM. The machine fills it from `[scsi.N]` and
+    /// hands it to [`Self::new_at`].
+    pub fn new_bus() -> ScsiBus {
+        ScsiBus::new(16, ScsiIdentities { disk: DISK_IDENTITY, cdrom: CDROM_IDENTITY })
     }
 
-    /// The controller at `index`: 0 internal, 1 external.
-    pub fn new_at(index: u8) -> Self {
-        Self { core: Arc::new(Core::new_at(index)), worker: Mutex::new(None) }
+    /// The controller on an empty bus, for the tests.
+    #[cfg(test)]
+    pub fn new() -> Self {
+        Self::new_at(0, Self::new_bus())
+    }
+
+    /// The controller at `index` (0 internal, 1 external) on `bus`.
+    pub fn new_at(index: u8, bus: ScsiBus) -> Self {
+        Self { core: Arc::new(Core::new_at(index, bus)), worker: Mutex::new(None) }
     }
 
     /// Start the ring thread (idempotent) and let it take whatever was
@@ -490,7 +632,7 @@ impl Isp1040 {
         for (what, probe) in [
             ("st", (|c: &Core| c.st.is_locked()) as fn(&Core) -> bool),
             ("fence", |c| c.fence.is_locked()),
-            ("targets", |c| c.targets.is_locked()),
+            ("targets", |c| c.bus.is_locked()),
         ] {
             let core = Arc::downgrade(&self.core);
             crate::locks::register_lock(format!("isp1040-{}::{what}", self.index), move || {
@@ -508,7 +650,7 @@ impl Drop for Isp1040 {
 }
 
 impl Core {
-    fn new_at(index: u8) -> Self {
+    fn new_at(index: u8, bus: ScsiBus) -> Self {
         let st = State::new();
         let gen = st.ctl.gen;
         Self {
@@ -517,11 +659,10 @@ impl Core {
             fence: Mutex::new(()),
             wake: Condvar::new(),
             line_order: Mutex::new(()),
-            targets: Mutex::new(std::array::from_fn(|_| None)),
+            bus,
             dma: OnceLock::new(),
             irq: OnceLock::new(),
             index,
-            target: 1,
             // BAR 0 is the I/O window and BAR 1 its memory-space alias, one
             // register file.
             pci: PciConfig::new(
@@ -533,6 +674,8 @@ impl Core {
             dma_misses: Mutex::new(std::collections::BTreeSet::new()),
             odd_accesses: Mutex::new(0),
             heartbeat: OnceLock::new(),
+            start: Instant::now(),
+            fake_ns: AtomicI64::new(i64::MIN),
         }
     }
 
@@ -547,6 +690,7 @@ impl Core {
             let mut st = self.st.lock();
             st.reset();
             self.publish_gen(&st);
+            self.wake.notify_all();
         }
         self.retire_stores();
         self.sync_irq();
@@ -599,10 +743,120 @@ impl Core {
 
     /// Block until the ring thread has run everything it was given and is
     /// waiting for more (or is held on a full response ring).
+    /// A selection still timing out does not hold it.
     pub fn wait_idle(&self) {
         let mut st = self.st.lock();
-        while (st.ctl.work && st.ctl.hold == 0 && !st.ctl.paused) || st.ctl.walking {
+        while (st.ctl.work && st.ctl.hold == 0 && !st.ctl.paused)
+            || (st.ctl.hold == 0 && !st.ctl.paused && !st.ctl.walking && self.release_due(&st))
+            || (st.ctl.walking && !st.ctl.selecting.as_ref().is_some_and(|sel| self.now_ns(&st) < sel.due))
+        {
             self.wake.wait(&mut st);
+        }
+    }
+
+    /// The adapter's clock in nanoseconds: host wall time less the time the
+    /// machine was stopped.
+    fn now_ns(&self, st: &State) -> i64 {
+        match self.fake_ns.load(Ordering::Relaxed) {
+            i64::MIN => {
+                let at = st.ctl.stopped_at.unwrap_or_else(Instant::now);
+                at.duration_since(self.start).as_nanos() as i64 - st.ctl.stopped_ns
+            }
+            t => t,
+        }
+    }
+
+    /// Take the clock off the host's and set it to `ns` (tests). The
+    /// thread reads the clock with `st` held and then waits on `wake`
+    /// with no timeout, so the move is made with `st` held too: made
+    /// outside it, the move and its wake-up can fall between that read and
+    /// that wait, and the thread sleeps through the time it waits for.
+    #[cfg(test)]
+    fn set_test_clock(&self, ns: i64) {
+        let _st = self.st.lock();
+        self.fake_ns.store(ns, Ordering::Relaxed);
+        self.wake.notify_all();
+    }
+
+    /// The buses in their post-reset hold-off now, as a bit mask.
+    fn held_mask(&self, st: &State) -> u8 {
+        let now = self.now_ns(st);
+        (0..BUSES).filter(|&b| st.quiet_until[b].is_some_and(|until| now < until)).fold(0, |m, b| m | 1 << b)
+    }
+
+    /// The parked command to take up next: the oldest whose hold-off has
+    /// ended, or that the thread had already taken up.
+    fn releasable(&self, st: &State) -> Option<usize> {
+        let held = self.held_mask(st);
+        st.parked.iter().position(|p| p.started || held & (1 << p.bus) == 0)
+    }
+
+    /// A parked command could start now, and the thread is not stuck on a
+    /// full response ring (which would leave it waiting for the driver).
+    /// One the thread has already taken up is not counted: it is being
+    /// waited out, or the thread is kicked to resume it.
+    fn release_due(&self, st: &State) -> bool {
+        let held = self.held_mask(st);
+        (st.pending.is_empty() || st.resp_has_room())
+            && st.parked.iter().any(|p| !p.started && held & (1 << p.bus) == 0)
+    }
+
+    /// How long until the first hold-off with a command parked behind it
+    /// ends, when none has ended yet.
+    fn next_release(&self, st: &State) -> Option<i64> {
+        let now = self.now_ns(st);
+        st.parked
+            .iter()
+            .filter_map(|p| st.quiet_until[usize::from(p.bus)])
+            .map(|until| until - now)
+            .filter(|&left| left > 0)
+            .min()
+    }
+
+    /// Wait out the selection of an absent target on the ring entry at
+    /// `cons`, with the state unlocked while the thread waits. True once the
+    /// selection timeout has passed. False when the thread must look at the
+    /// ring again first: it was parked, or a reset took the entry away.
+    ///
+    /// `start` is when the chip begins selecting: now, or for a command that
+    /// waited out a hold-off, the moment the hold ended, so the wait is the
+    /// hold plus the timeout however late the thread got to it.
+    fn select_absent(&self, st: &mut MutexGuard<'_, State>, ring: &Ring, cons: u32, start: i64, bus: u8, done: Pending) -> bool {
+        if !matches!(&st.ctl.selecting, Some(sel) if sel.cons == cons && !sel.orphan) {
+            // A programmed zero is no wait: a model choice, the datasheet
+            // being silent on zero.
+            let wait = SELECTION_TIMEOUT_UNIT * u32::from(st.selection_timeout);
+            let due = start.saturating_add(wait.as_nanos() as i64);
+            st.ctl.selecting = Some(Selection { cons, due, done, bus, orphan: false });
+        }
+        // Whoever waits for the ring to settle may now see it waiting on a
+        // selection, a resumed one included.
+        self.wake.notify_all();
+        self.wait_selection(st, ring.gen)
+    }
+
+    /// Wait for the selection in `ctl.selecting` to time out. False when
+    /// the thread must look again first: parked, or a reset cancelled it.
+    /// A new request ring does not cancel it: a model choice, the datasheet
+    /// being silent on what the chip does to a selection in progress.
+    fn wait_selection(&self, st: &mut MutexGuard<'_, State>, gen: u64) -> bool {
+        loop {
+            let Some(due) = st.ctl.selecting.as_ref().map(|sel| sel.due) else {
+                return false;
+            };
+            if st.ctl.shutdown || st.ctl.hold > 0 || st.ctl.paused || st.ctl.gen != gen {
+                return false;
+            }
+            let left = due - self.now_ns(st);
+            if left <= 0 {
+                return true;
+            }
+            // A test clock only moves when the test moves it.
+            if self.fake_ns.load(Ordering::Relaxed) == i64::MIN {
+                self.wake.wait_for(st, Duration::from_nanos(left as u64));
+            } else {
+                self.wake.wait(st);
+            }
         }
     }
 
@@ -613,6 +867,9 @@ impl Core {
     pub fn pause(&self) {
         let mut st = self.st.lock();
         st.ctl.paused = true;
+        st.ctl.stopped_at.get_or_insert_with(Instant::now);
+        // Parked mid-selection, the thread lets go of its entry.
+        self.wake.notify_all();
         while st.ctl.walking {
             self.wake.wait(&mut st);
         }
@@ -623,6 +880,9 @@ impl Core {
     pub fn resume(&self) {
         let mut st = self.st.lock();
         st.ctl.paused = false;
+        if let Some(t) = st.ctl.stopped_at.take() {
+            st.ctl.stopped_ns += t.elapsed().as_nanos() as i64;
+        }
         self.kick(&mut st);
     }
 
@@ -644,6 +904,7 @@ impl Core {
     fn quiesced<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let mut st = self.st.lock();
         st.ctl.hold += 1;
+        self.wake.notify_all();
         while st.ctl.walking {
             self.wake.wait(&mut st);
         }
@@ -679,64 +940,15 @@ impl Core {
         }
     }
 
-    // ---- attaching targets -------------------------------------------
+    // ---- the bus ------------------------------------------------------
 
-    /// Attach a disk image at a SCSI id.
-    pub fn attach_disk_at(&self, target: u8, path: &std::path::Path) -> std::io::Result<u64> {
-        self.attach_at(target, path, false)
-    }
-
-    pub fn attach_at(&self, target: u8, path: &std::path::Path, cdrom: bool) -> std::io::Result<u64> {
-        self.attach_with(target, path, cdrom, false)
-    }
-
-    /// [`Self::attach_at`], copy-on-write when `overlay` is set: the image is
-    /// never written, writes go to `{path}.overlay`.
-    pub fn attach_with(&self, target: u8, path: &std::path::Path, cdrom: bool, overlay: bool) -> std::io::Result<u64> {
-        let path = path
-            .to_str()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path is not UTF-8"))?;
-        self.attach_device(target, path, cdrom, Vec::new(), overlay, None)
-    }
-
-    /// Attach what a `[scsi.N]` table describes: the image at `path` (empty
-    /// for a CD-ROM with its tray empty), a CD-ROM's changer list `discs`,
-    /// and copy-on-write when `overlay` is set, to `overlay_path` or
-    /// `{path}.overlay`. Returns the size in blocks.
-    pub fn attach_device(
-        &self,
-        target: u8,
-        path: &str,
-        cdrom: bool,
-        discs: Vec<String>,
-        overlay: bool,
-        overlay_path: Option<&str>,
-    ) -> std::io::Result<u64> {
-        let d = ScsiDevice::open(path, cdrom, discs, overlay, overlay_path, if cdrom { ISP_CDROM } else { ISP_DISK })?;
-        let blocks = d.size() / BLOCK_SIZE as u64;
-        let mut targets = self.targets.lock();
-        let slot = targets.get_mut(target as usize).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("SCSI id {target} out of range"))
-        })?;
-        *slot = Some(d);
-        Ok(blocks)
-    }
-
-    /// The id a disk attached without one goes on.
-    pub fn default_target(&self) -> u8 { self.target }
-
-    pub fn attach_disk(&self, path: &std::path::Path) -> std::io::Result<u64> {
-        self.attach_disk_at(self.target, path)
-    }
-
-    /// The ids that have something on them.
-    pub fn attached(&self) -> Vec<u8> {
-        let t = self.targets.lock();
-        (0..t.len() as u8).filter(|&i| t[i as usize].is_some()).collect()
+    /// The SCSI bus: attach targets to it and ask what is on it.
+    pub fn bus(&self) -> &ScsiBus {
+        &self.bus
     }
 
     fn has_target(&self, id: u8) -> bool {
-        self.targets.lock().get(id as usize).is_some_and(|t| t.is_some())
+        self.bus.has_target(id)
     }
 
     // ---- DMA ---------------------------------------------------------
@@ -913,13 +1125,16 @@ impl Core {
             | mbox::SET_ASYNC_DATA_SETUP
             | mbox::SET_ACTIVE_NEGATION
             | mbox::SET_TAG_AGE_LIMIT
-            | mbox::SET_SELECTION_TIMEOUT
             | mbox::SET_INITIATOR_ID
             | mbox::SET_TARGET_PARAMETERS
             | mbox::SET_DEVICE_QUEUE
             | mbox::SET_PCI_CONTROL
             | mbox::SET_SYSTEM_PARAMETER
             | mbox::SET_DATA_OVERRUN_RECOVERY => st.mailbox[0] = mbox::COMPLETE,
+            mbox::SET_SELECTION_TIMEOUT => {
+                st.selection_timeout = st.mailbox[1];
+                st.mailbox[0] = mbox::COMPLETE;
+            }
             mbox::SET_RESET_DELAY_PARAMS => {
                 st.reset_delay = st.mailbox[1];
                 st.mailbox[0] = mbox::COMPLETE;
@@ -934,6 +1149,12 @@ impl Core {
                     st.mailbox[0] = mbox::PARAM_ERROR;
                 } else if cmd == mbox::INIT_REQ_QUEUE || cmd == mbox::INIT_REQ_QUEUE_A64 {
                     st.ctl.rqst_epoch += 1;
+                    if let Some(sel) = st.ctl.selecting.as_mut() {
+                        sel.orphan = true;
+                    }
+                    // Their entries lived in the old ring. The hold-off
+                    // stays: it belongs to the bus.
+                    st.parked.clear();
                     st.rqst_base = addr;
                     st.rqst_len = st.mailbox[1];
                     st.rqst_cons = 0;
@@ -953,9 +1174,53 @@ impl Core {
                 }
             }
             // Resets the bus, not the adapter: chip state survives. Mailbox 1
-            // holds the configured reset delay, not a selector. A command in
-            // flight is not retired; it completes as it would have.
-            mbox::BUS_RESET => st.mailbox[0] = mbox::COMPLETE,
+            // holds the configured reset delay, not a selector. The reset
+            // destroys a selection still waiting on an absent target: it
+            // ends now with the reset completion, and posts once. Inferred:
+            // the drivers only establish that they handle that completion.
+            //
+            // It also starts the bus's hold-off: for mailbox 1 seconds the
+            // chip starts no SCSI activity on that bus (datasheet,
+            // "Bus-reset hold-off"). Commands for it park, to start when the
+            // hold ends; the other bus and mailbox commands carry on. A
+            // second reset retires what the first parked, with the same
+            // reset completion, and replaces the hold; a delay of 0 holds
+            // nothing. The delay is not clamped, and nothing is posted when
+            // the hold ends: model choices, none established.
+            mbox::BUS_RESET => {
+                let now = self.now_ns(st);
+                let bus = usize::from(st.mailbox[2]);
+                if bus >= BUSES {
+                    // A bus this part does not have: nothing to quiet or
+                    // retire, and the datasheet's per-bus hold leaves the
+                    // real bus alone. Noted so a driver that leaves mailbox 2
+                    // unset on this single-bus part is not silently unheld.
+                    self.note(format!("bus reset names bus {bus}, which this part does not have; ignored"));
+                } else {
+                    if let Some(sel) = st.ctl.selecting.as_mut().filter(|sel| usize::from(sel.bus) == bus) {
+                        sel.due = now;
+                        sel.done = Pending { handle: sel.done.handle, completion: IOCB_RESET, ..Default::default() };
+                    }
+                    // The thread posts these in order, with any other held
+                    // completion. Without a response ring there is nowhere
+                    // to post them, as for any completion.
+                    let (retired, kept): (Vec<_>, Vec<_>) =
+                        st.parked.drain(..).partition(|p| usize::from(p.bus) == bus && !p.started);
+                    st.parked.extend(kept);
+                    for p in retired {
+                        if st.resp_len == 0 {
+                            self.note(format!("reset completion for parked handle {:#010x} dropped: no response queue", p.handle));
+                        } else {
+                            st.pending.push_back(Pending { handle: p.handle, completion: IOCB_RESET, ..Default::default() });
+                        }
+                    }
+                    let delay = BUS_RESET_DELAY_UNIT * u32::from(st.mailbox[1]);
+                    st.quiet_until[bus] = (!delay.is_zero()).then(|| now.saturating_add(delay.as_nanos() as i64));
+                    self.kick(st);
+                }
+                self.wake.notify_all();
+                st.mailbox[0] = mbox::COMPLETE;
+            }
             _ => {
                 self.note(format!("mailbox command {cmd:#06x} not modelled"));
                 st.mailbox[0] = mbox::INVALID;
@@ -1148,7 +1413,7 @@ impl Core {
     /// Run a CDB against the target; `data` is what a write sends it. None
     /// when a reset cancelled the command while it waited for the target.
     fn scsi(&self, gen: u64, target: u8, cdb: &[u8], data: Option<Vec<u8>>) -> Option<(Vec<u8>, u8)> {
-        let mut targets = self.targets.lock();
+        let mut targets = self.bus.lock();
         if self.gen.load(Ordering::Acquire) != gen {
             return None;
         }
@@ -1183,12 +1448,15 @@ impl Core {
         let lun = (device & 0xff) as u8;
 
         // A bus this part does not have.
-        if channel >= 1 {
+        if usize::from(channel) >= BUSES {
             return Prepared::Answered(Self::incomplete(handle, 0, 0));
         }
         // GOT_BUS alone is Linux's bad-target; the timeout bit beside it is
         // what lets the empty slot be treated as benign.
-        if target > MAX_TARGET || lun > MAX_LUN || !self.has_target(target) {
+        if target > MAX_TARGET || !self.has_target(target) {
+            return Prepared::Absent(channel as u8, Self::incomplete(handle, STATE_GOT_BUS, STATUS_FLAG_TIMEOUT));
+        }
+        if lun > MAX_LUN {
             return Prepared::Answered(Self::incomplete(handle, STATE_GOT_BUS, STATUS_FLAG_TIMEOUT));
         }
 
@@ -1196,11 +1464,12 @@ impl Core {
         cdb[1] = (cdb[1] & 0x1f) | (lun << 5);
         let cdb = &cdb[..(cdb_len as usize).clamp(1, CDB_FIELD_LEN)];
         let block = self
-            .targets
+            .bus
             .lock()
             .get(target as usize)
             .and_then(|t| t.as_ref())
-            .map(|d| d.block_sizes().1 as usize)
+            .and_then(|t| t.block_size())
+            .map(|b| b as usize)
             .filter(|&b| b != 0)
             .unwrap_or(BLOCK_SIZE);
         let (xfer, to_dev) = Self::cdb_transfer(cdb, block);
@@ -1281,8 +1550,19 @@ impl Core {
     fn run_ring(&self) {
         let mut st = self.st.lock();
         loop {
-            while !st.ctl.shutdown && !(st.ctl.work && st.ctl.hold == 0 && !st.ctl.paused) {
-                self.wake.wait(&mut st);
+            while !st.ctl.shutdown && !(st.ctl.hold == 0 && !st.ctl.paused && (st.ctl.work || self.release_due(&st))) {
+                // Commands parked behind a hold-off start when it ends,
+                // with nobody to wake the thread. A test clock only moves
+                // when the test moves it.
+                let ends = (st.ctl.hold == 0 && !st.ctl.paused && self.fake_ns.load(Ordering::Relaxed) == i64::MIN)
+                    .then(|| self.next_release(&st))
+                    .flatten();
+                match ends {
+                    Some(left) if left > 0 => {
+                        self.wake.wait_for(&mut st, Duration::from_nanos(left as u64));
+                    }
+                    _ => self.wake.wait(&mut st),
+                }
             }
             if st.ctl.shutdown {
                 return;
@@ -1297,7 +1577,12 @@ impl Core {
 
     /// Read the entry at the ring's consumer and what it asks for, with the
     /// state unlocked. Returns how many entries it spans with it.
-    fn read_entry(&self, ring: &Ring, budget: u32) -> (u8, Prepared) {
+    ///
+    /// `held` is the buses in their hold-off: a request for one is parked,
+    /// not read further. `expect` is the handle a parked command was
+    /// parked under, when it is being read again to start: an entry that
+    /// has been rewritten since is answered incomplete for that handle.
+    fn read_entry(&self, ring: &Ring, budget: u32, held: u8, expect: Option<u32>) -> (u8, Prepared) {
         let Some(addr) = Self::entry_addr(ring.base, ring.cons) else {
             // Past the top of the bus: refused, and the walk stops.
             self.dma_miss(u64::MAX, false);
@@ -1305,9 +1590,21 @@ impl Core {
         };
         let entry_type = self.ld8(Some(addr));
         let entry_count = self.ld8(Self::at(addr, 1)).max(1).min(budget.min(255) as u8);
+        let is_request = matches!(entry_type, ENTRY_TYPE_REQUEST | ENTRY_TYPE_COMMAND_A64);
+        if let Some(handle) = expect {
+            if !is_request || self.ld32(Self::at(addr, REQ_OFF_HANDLE)) != handle {
+                self.note(format!("parked request entry {} was rewritten; handle {handle:#010x} answered incomplete", ring.cons));
+                return (entry_count, Prepared::Answered(Self::incomplete(handle, 0, 0)));
+            }
+        }
         let prepared = match entry_type {
             ENTRY_TYPE_REQUEST | ENTRY_TYPE_COMMAND_A64 => {
-                self.prepare_request(ring, addr, entry_count, entry_type == ENTRY_TYPE_COMMAND_A64)
+                let bus = (self.ld16(Self::at(addr, REQ_OFF_DEVICE)) >> 15) as u8 & 1;
+                if usize::from(bus) < BUSES && held & (1 << bus) != 0 {
+                    Prepared::Quiet { bus, handle: self.ld32(Self::at(addr, REQ_OFF_HANDLE)) }
+                } else {
+                    self.prepare_request(ring, addr, entry_count, entry_type == ENTRY_TYPE_COMMAND_A64)
+                }
             }
             // Continuations are stepped past here; reading segments visits
             // them.
@@ -1344,6 +1641,55 @@ impl Core {
                 MutexGuard::unlocked(&mut st, || self.sync_irq());
                 continue;
             }
+            // A selection whose entry the driver replaced the ring under
+            // still ends with its completion.
+            if st.ctl.selecting.as_ref().is_some_and(|sel| sel.orphan) {
+                let gen = st.ctl.gen;
+                self.wake.notify_all();
+                if self.wait_selection(&mut st, gen) {
+                    if let Some(sel) = st.ctl.selecting.take() {
+                        st = self.post(st, sel.done);
+                    }
+                    MutexGuard::unlocked(&mut st, || self.sync_irq());
+                }
+                continue;
+            }
+            // A command whose bus's hold-off has ended starts before anything
+            // read from the ring after it, oldest first.
+            if let Some(i) = self.releasable(&st) {
+                st.parked[i].started = true;
+                let parked = st.parked[i].clone();
+                let now = self.now_ns(&st);
+                // The chip would have begun selecting when the hold ended.
+                let start = st.quiet_until[usize::from(parked.bus)].map_or(now, |until| until.min(now));
+                let len = u32::from(st.rqst_len);
+                let ring = Ring { base: st.rqst_base, len, cons: parked.cons, epoch: st.ctl.rqst_epoch, gen: st.ctl.gen };
+                let (_, prepared) = MutexGuard::unlocked(&mut st, || {
+                    self.read_entry(&ring, u32::from(parked.count), 0, Some(parked.handle))
+                });
+                if st.ctl.gen != ring.gen {
+                    continue;
+                }
+                let (back, outcome) = self.run_prepared(st, &ring, prepared, start);
+                st = back;
+                match outcome {
+                    Outcome::Again => continue,
+                    Outcome::Stop => {
+                        // Refused on this read: the command is dropped.
+                        self.note(format!("parked handle {:#010x} dropped: its request entry could not be read", parked.handle));
+                        st.parked.retain(|p| p.seq != parked.seq);
+                        continue;
+                    }
+                    Outcome::Done(done) => {
+                        st.parked.retain(|p| p.seq != parked.seq);
+                        if let Some(p) = done {
+                            st = self.post(st, p);
+                        }
+                        MutexGuard::unlocked(&mut st, || self.sync_irq());
+                        continue;
+                    }
+                }
+            }
             if st.rqst_len == 0 {
                 return st;
             }
@@ -1360,32 +1706,30 @@ impl Core {
                 return st;
             }
             let ring = Ring { base: st.rqst_base, len, cons, epoch: st.ctl.rqst_epoch, gen: st.ctl.gen };
-            let (count, prepared) = MutexGuard::unlocked(&mut st, || self.read_entry(&ring, budget));
+            let held = self.held_mask(&st);
+            let (count, prepared) = MutexGuard::unlocked(&mut st, || self.read_entry(&ring, budget, held, None));
             // A reset took the ring away while the entry was read.
             if st.ctl.gen != ring.gen {
                 continue;
             }
-            let done = match prepared {
-                Prepared::Refused => {
-                    if st.ctl.rqst_epoch != ring.epoch {
-                        continue;
-                    }
-                    return st;
+            // Behind a hold-off: set aside, and the walk goes on to what
+            // follows it. The consumer the guest reads stays behind.
+            if let Prepared::Quiet { bus, handle } = prepared {
+                if st.ctl.rqst_epoch == ring.epoch {
+                    st.park_seq += 1;
+                    let seq = st.park_seq;
+                    st.parked.push_back(Parked { seq, cons, count, bus, handle, started: false });
+                    st.rqst_cons = ((cons + u32::from(count)) % len) as u16;
                 }
-                Prepared::Skipped => None,
-                Prepared::Answered(p) => Some(p),
-                Prepared::Run(job) => {
-                    st.total_cmds += 1;
-                    st.ctl.busy = true;
-                    let done = MutexGuard::unlocked(&mut st, || self.run_job(job, ring.gen));
-                    st.ctl.busy = false;
-                    self.wake.notify_all();
-                    // A reset cancelled the command.
-                    if st.ctl.gen != ring.gen {
-                        continue;
-                    }
-                    done
-                }
+                continue;
+            }
+            let now = self.now_ns(&st);
+            let (back, outcome) = self.run_prepared(st, &ring, prepared, now);
+            st = back;
+            let done = match outcome {
+                Outcome::Again => continue,
+                Outcome::Stop => return st,
+                Outcome::Done(done) => done,
             };
             // A new request ring starts at its own index 0; the command read
             // from the ring it replaced still ran once.
@@ -1399,6 +1743,48 @@ impl Core {
         }
     }
 
+    /// Carry out what reading the entry at `ring.cons` found, up to the
+    /// completion to post. `start` is when selection of an absent target
+    /// begins.
+    fn run_prepared<'a>(
+        &'a self,
+        mut st: MutexGuard<'a, State>,
+        ring: &Ring,
+        prepared: Prepared,
+        start: i64,
+    ) -> (MutexGuard<'a, State>, Outcome) {
+        let done = match prepared {
+            Prepared::Refused => {
+                if st.ctl.rqst_epoch != ring.epoch {
+                    return (st, Outcome::Again);
+                }
+                return (st, Outcome::Stop);
+            }
+            Prepared::Skipped | Prepared::Quiet { .. } => None,
+            Prepared::Answered(p) => Some(p),
+            Prepared::Absent(bus, p) => {
+                if !self.select_absent(&mut st, ring, ring.cons, start, bus, p) {
+                    return (st, Outcome::Again);
+                }
+                // The wait may have outlived the ring; see `orphan`.
+                st.ctl.selecting.take().map(|sel| sel.done)
+            }
+            Prepared::Run(job) => {
+                st.total_cmds += 1;
+                st.ctl.busy = true;
+                let done = MutexGuard::unlocked(&mut st, || self.run_job(job, ring.gen));
+                st.ctl.busy = false;
+                self.wake.notify_all();
+                // A reset cancelled the command.
+                if st.ctl.gen != ring.gen {
+                    return (st, Outcome::Again);
+                }
+                done
+            }
+        };
+        (st, Outcome::Done(done))
+    }
+
     // ---- registers ---------------------------------------------------
 
     fn reg_read(&self, off: u32) -> u16 {
@@ -1410,7 +1796,7 @@ impl Core {
         // The adapter's consumer position: a driver computes its free ring
         // space from it, so echoing its own write breaks that.
         if off == reg::REQUEST_QUEUE {
-            return if st.rqst_len == 0 { st.mailbox[MBOX_REQ] } else { st.rqst_cons };
+            return if st.rqst_len == 0 { st.mailbox[MBOX_REQ] } else { st.request_out() };
         }
         if (reg::MAILBOX_BASE..MAILBOX_END).contains(&off) {
             return st.mailbox[((off - reg::MAILBOX_BASE) / 2) as usize];
@@ -1479,6 +1865,7 @@ impl Core {
                 if val & CTRL_SOFT_RESET != 0 {
                     st.reset();
                     self.publish_gen(&st);
+                    self.wake.notify_all();
                     drop(st);
                     self.retire_stores();
                 }
@@ -1581,9 +1968,8 @@ impl crate::traits::Device for Isp1040 {
 }
 
 impl crate::scsi_monitor::ScsiTargets for Isp1040 {
-    fn with_targets<R>(&self, f: impl FnOnce(&mut [Option<ScsiDevice>]) -> R) -> R {
-        let mut targets = self.targets.lock();
-        f(&mut targets[..])
+    fn scsi_bus(&self) -> &ScsiBus {
+        &self.bus
     }
 }
 
@@ -1612,12 +1998,21 @@ impl PciBusDevice for Isp1040 {
 
 impl crate::traits::Saveable for Isp1040 {
     fn save_state(&self) -> toml::Value {
-        self.quiesced(|st| Self::save_locked(st))
+        self.quiesced(|st| {
+            // Absolute deadlines mean nothing on another run's clock.
+            let now = self.now_ns(st);
+            let left = st.ctl.selecting.as_ref().map(|sel| sel.due - now);
+            // A hold-off already over but not acted on still crosses: the
+            // commands parked behind it start when the load re-arms it at 0.
+            let quiet_left = st.quiet_until.map(|until| until.map(|u| u - now));
+            Self::save_locked(st, left, quiet_left)
+        })
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         self.quiesced(|st| {
-            Self::load_locked(st, v);
+            let now = self.now_ns(st);
+            Self::load_locked(st, v, now);
             self.publish_gen(st);
         });
         self.sync_irq();
@@ -1626,7 +2021,7 @@ impl crate::traits::Saveable for Isp1040 {
 }
 
 impl Isp1040 {
-    fn save_locked(st: &State) -> toml::Value {
+    fn save_locked(st: &State, selecting_left: Option<i64>, quiet_left: [Option<i64>; BUSES]) -> toml::Value {
         let mut t = toml::map::Map::new();
         for (k, v) in [
             ("bus_cfg1", st.bus_cfg1), ("bus_ctrl", st.bus_ctrl), ("bus_status", st.bus_status),
@@ -1634,6 +2029,7 @@ impl Isp1040 {
             ("dma_cmd_cfg", st.dma_cmd_cfg), ("dma_data_cfg", st.dma_data_cfg),
             ("rqst_len", st.rqst_len), ("resp_len", st.resp_len), ("rqst_cons", st.rqst_cons),
             ("resp_prod", st.resp_prod), ("resp_cons", st.resp_cons), ("reset_delay", st.reset_delay),
+            ("selection_timeout", st.selection_timeout),
         ] {
             t.insert(k.into(), hex_u16(v));
         }
@@ -1661,12 +2057,49 @@ impl Isp1040 {
             toml::Value::Table(m)
         });
         t.insert("pending".into(), toml::Value::Array(pending.collect()));
+        // Each bus's hold-off after a bus reset, as the time left, and the
+        // commands parked behind it by their ring positions: their entries
+        // are in the guest's ring.
+        let holds = quiet_left.iter().enumerate().filter_map(|(bus, left)| {
+            let mut m = toml::map::Map::new();
+            m.insert("bus".into(), toml::Value::Integer(bus as i64));
+            m.insert("left_ns".into(), toml::Value::Integer((*left)?.max(0)));
+            Some(toml::Value::Table(m))
+        });
+        t.insert("bus_hold".into(), toml::Value::Array(holds.collect()));
+        let parked = st.parked.iter().map(|p| {
+            let mut m = toml::map::Map::new();
+            m.insert("cons".into(), toml::Value::Integer(i64::from(p.cons)));
+            m.insert("count".into(), toml::Value::Integer(i64::from(p.count)));
+            m.insert("bus".into(), toml::Value::Integer(i64::from(p.bus)));
+            m.insert("handle".into(), hex_u32(p.handle));
+            m.insert("started".into(), toml::Value::Boolean(p.started));
+            toml::Value::Table(m)
+        });
+        t.insert("parked".into(), toml::Value::Array(parked.collect()));
+        // A selection still timing out: what is left of it, and the
+        // completion it ends in.
+        if let (Some(sel), Some(left)) = (&st.ctl.selecting, selecting_left) {
+            let mut m = toml::map::Map::new();
+            m.insert("left_ns".into(), toml::Value::Integer(left.max(0)));
+            m.insert("cons".into(), toml::Value::Integer(i64::from(sel.cons)));
+            m.insert("orphan".into(), toml::Value::Boolean(sel.orphan));
+            m.insert("bus".into(), toml::Value::Integer(i64::from(sel.bus)));
+            m.insert("handle".into(), hex_u32(sel.done.handle));
+            m.insert("scsi_status".into(), hex_u16(sel.done.scsi_status));
+            m.insert("completion".into(), hex_u16(sel.done.completion));
+            m.insert("state_flags".into(), hex_u16(sel.done.state_flags));
+            m.insert("status_flags".into(), hex_u16(sel.done.status_flags));
+            m.insert("resid".into(), hex_u32(sel.done.resid));
+            m.insert("sense".into(), u8_slice_to_toml(&sel.done.sense));
+            t.insert("selecting".into(), toml::Value::Table(m));
+        }
         toml::Value::Table(t)
     }
 
     /// Unprocessed request entries survive: the ring thread is kicked and
     /// runs them after the load.
-    fn load_locked(st: &mut State, v: &toml::Value) {
+    fn load_locked(st: &mut State, v: &toml::Value, now: i64) {
         {
             let ctl = std::mem::take(&mut st.ctl);
             *st = State::new();
@@ -1674,6 +2107,7 @@ impl Isp1040 {
             st.ctl.gen += 1;
             st.ctl.rqst_epoch += 1;
             st.ctl.resp_epoch += 1;
+            st.ctl.selecting = None;
             st.ctl.work = true;
             let u16f = |k: &str| get_field(v, k).and_then(toml_u16).unwrap_or(0);
             let u32f = |k: &str| get_field(v, k).and_then(toml_u32).unwrap_or(0);
@@ -1691,6 +2125,7 @@ impl Isp1040 {
             st.resp_prod = u16f("resp_prod");
             st.resp_cons = u16f("resp_cons");
             st.reset_delay = u16f("reset_delay");
+            st.selection_timeout = get_field(v, "selection_timeout").and_then(toml_u16).unwrap_or(DEFAULT_SELECTION_TIMEOUT);
             // Indices fold into their rings, whatever the file says.
             if st.rqst_len != 0 {
                 st.rqst_cons %= st.rqst_len;
@@ -1705,22 +2140,69 @@ impl Isp1040 {
             if let Some(m) = get_field(v, "risc_bank") { load_u16_slice(m, &mut st.risc_bank); }
             if let Some(m) = get_field(v, "sxp_bank") { load_u16_slice(m, &mut st.sxp_bank); }
             if let Some(m) = get_field(v, "risc_ram") { load_u16_slice(m, &mut st.risc_ram); }
+            let load_pending = |p: &toml::Value| {
+                let sense = match get_field(p, "sense") {
+                    Some(toml::Value::Array(s)) => s.iter().take(SENSE_MAX).map(|x| toml_u8(x).unwrap_or(0)).collect(),
+                    _ => Vec::new(),
+                };
+                Pending {
+                    handle: get_field(p, "handle").and_then(toml_u32).unwrap_or(0),
+                    scsi_status: get_field(p, "scsi_status").and_then(toml_u16).unwrap_or(0),
+                    completion: get_field(p, "completion").and_then(toml_u16).unwrap_or(0),
+                    state_flags: get_field(p, "state_flags").and_then(toml_u16).unwrap_or(0),
+                    status_flags: get_field(p, "status_flags").and_then(toml_u16).unwrap_or(0),
+                    resid: get_field(p, "resid").and_then(toml_u32).unwrap_or(0),
+                    sense,
+                }
+            };
             if let Some(toml::Value::Array(a)) = get_field(v, "pending") {
                 for p in a {
-                    let sense = match get_field(p, "sense") {
-                        Some(toml::Value::Array(s)) => s.iter().take(SENSE_MAX).map(|x| toml_u8(x).unwrap_or(0)).collect(),
-                        _ => Vec::new(),
-                    };
-                    st.pending.push_back(Pending {
+                    st.pending.push_back(load_pending(p));
+                }
+            }
+            let int = |v: &toml::Value, k: &str| match get_field(v, k) {
+                Some(toml::Value::Integer(n)) => Some(*n),
+                _ => None,
+            };
+            if let Some(toml::Value::Array(a)) = get_field(v, "bus_hold") {
+                for h in a {
+                    if let (Some(bus), Some(left)) = (int(h, "bus"), int(h, "left_ns")) {
+                        if let Some(slot) = usize::try_from(bus).ok().and_then(|b| st.quiet_until.get_mut(b)) {
+                            *slot = Some(now.saturating_add(left.max(0)));
+                        }
+                    }
+                }
+            }
+            if let Some(toml::Value::Array(a)) = get_field(v, "parked") {
+                for p in a {
+                    let bus = int(p, "bus").unwrap_or(0).clamp(0, BUSES as i64 - 1) as u8;
+                    st.park_seq += 1;
+                    let seq = st.park_seq;
+                    st.parked.push_back(Parked {
+                        seq,
+                        // Folded into the ring, whatever the file says.
+                        cons: if st.rqst_len == 0 { 0 } else { int(p, "cons").unwrap_or(0).max(0) as u32 % u32::from(st.rqst_len) },
+                        count: int(p, "count").unwrap_or(1).clamp(1, 255) as u8,
+                        bus,
                         handle: get_field(p, "handle").and_then(toml_u32).unwrap_or(0),
-                        scsi_status: get_field(p, "scsi_status").and_then(toml_u16).unwrap_or(0),
-                        completion: get_field(p, "completion").and_then(toml_u16).unwrap_or(0),
-                        state_flags: get_field(p, "state_flags").and_then(toml_u16).unwrap_or(0),
-                        status_flags: get_field(p, "status_flags").and_then(toml_u16).unwrap_or(0),
-                        resid: get_field(p, "resid").and_then(toml_u32).unwrap_or(0),
-                        sense,
+                        started: matches!(get_field(p, "started"), Some(toml::Value::Boolean(true))),
                     });
                 }
+            }
+            // The wait goes on for what was left of it, from this clock.
+            if let Some(sel) = get_field(v, "selecting") {
+                let left = match get_field(sel, "left_ns") {
+                    Some(toml::Value::Integer(n)) => (*n).max(0),
+                    _ => 0,
+                };
+                let cons = match get_field(sel, "cons") {
+                    Some(toml::Value::Integer(n)) => *n as u32,
+                    _ => 0,
+                };
+                let orphan = matches!(get_field(sel, "orphan"), Some(toml::Value::Boolean(true)));
+                let bus = int(sel, "bus").unwrap_or(0).clamp(0, BUSES as i64 - 1) as u8;
+                st.ctl.selecting =
+                    Some(Selection { cons, due: now.saturating_add(left), done: load_pending(sel), bus, orphan });
             }
         }
     }

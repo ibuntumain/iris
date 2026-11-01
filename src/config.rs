@@ -2,8 +2,12 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
-/// Memory bank sizes in MB; validation restricts 256/512 MB banks to IP28 and the Octane.
-pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512];
+/// Every memory bank size in MB, for the front-ends' menus; `bank_sizes` says
+/// which of them a machine takes.
+pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+/// Bank sizes in MB up to the IP28's and O2's largest; validation restricts
+/// 256/512 MB banks to those machines.
+const MC_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512];
 
 /// What sits at a SCSI id. `cdrom = true` remains the historical spelling for
 /// `kind = "cdrom"`; either works and they mean the same thing.
@@ -132,7 +136,7 @@ impl ScsiDeviceConfig {
     pub fn is_daynaport(&self) -> bool { self.kind() == ScsiKind::Daynaport }
 
     /// Where the `[scsi.KEY]` table puts this target, as (controller, id).
-    /// Keys 1–7 are ids on `controller` (0 unless the key says otherwise);
+    /// Keys 1–15 are ids on `controller` (1–7 off the Octane; 0 unless the key says otherwise);
     /// a key of 16 + id names controller 1 directly, so the same id can be
     /// used on both controllers. See [`scsi_slot`].
     pub fn placement(&self, key: u8) -> (u8, u8) {
@@ -323,8 +327,9 @@ pub enum NetMode {
     /// The guest appears as a real L2 host on the physical LAN; NAT services
     /// (DHCP/DNS/NFS/port-forward) are NOT provided — use the real network's.
     Pcap,
-    /// No Ethernet: the adapter is not plugged into anything. O2 only for now
-    /// (`MachineConfig::validate`); the Indy and Indigo2 always have a network.
+    /// No Ethernet: the adapter is not plugged into anything. O2 and Octane
+    /// only (`MachineConfig::validate`); the Indy and Indigo2 always have a
+    /// network.
     Off,
 }
 
@@ -357,6 +362,8 @@ pub struct NetworkConfig {
     /// Directory served read-only by the gateway's built-in rsh server (TCP
     /// 514). None (the default) disables it.
     pub rsh_dir: Option<std::path::PathBuf>,
+    /// Hold frames for the guest while its receive ring is about to end (Indy).
+    pub rx_hold: bool,
 }
 
 impl Default for NetworkConfig {
@@ -370,6 +377,7 @@ impl Default for NetworkConfig {
             nfs_pcap_ip: None,
             tftp_dir: None,
             rsh_dir: None,
+            rx_hold: true,
             mac: DEFAULT_MAC,
         }
     }
@@ -413,6 +421,12 @@ pub struct NetworkSection {
     /// executed on the host. Unset disables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rsh_dir: Option<String>,
+    /// Indy: hold frames for the guest in the emulator while the next one
+    /// would end its receive ring before the driver has reaped the filled
+    /// descriptors, instead of letting the channel stop in the middle of the
+    /// driver's interrupt pass. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_hold: Option<bool>,
 }
 
 /// Where VINO's video-in capture should come from.
@@ -494,18 +508,25 @@ pub enum MachineProfile {
 }
 
 impl MachineProfile {
-    /// All selectable profiles, in display order. (Not the O2 yet: iris-gui's
-    /// machine editor has no `[o2]` section.) Single source of truth for the
+    /// All selectable profiles, in display order. Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
-    pub const ALL: [Self; 4] = [Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28, Self::OctaneIp30];
+    ///
+    /// The O2 has no embedded PROM: it needs an IP32 PROM image, the same way
+    /// the Octane does, and iris-gui says so in the New-machine dialog.
+    pub const ALL: [Self; 5] = [
+        Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28, Self::O2Ip32, Self::OctaneIp30,
+    ];
 
     /// The bank sizes in MB (0 is an empty bank) that `validate()` accepts
-    /// for this profile. The Octane's banks are matched DIMM pairs of 64 to
-    /// 512 MB; the IP22/IP24 MC stops at 128 MB.
+    /// for this profile. The Octane's banks are matched DIMM pairs of 64 MB
+    /// to 2 GB; the IP22/IP24 MC stops at 128 MB. An O2's banks are DIMM-pair
+    /// kits, so they are the four kit sizes and nothing the MC could express
+    /// (see `dev::crime_mem::check_kits`).
     pub fn bank_sizes(self) -> &'static [u32] {
         match self {
-            Self::OctaneIp30 => &[0, 64, 128, 256, 512],
-            Self::Indigo2Ip28 | Self::O2Ip32 => VALID_BANK_SIZES,
+            Self::OctaneIp30 => &[0, 64, 128, 256, 512, 1024, 2048],
+            Self::O2Ip32 => &[0, 32, 64, 128, 256],
+            Self::Indigo2Ip28 => MC_BANK_SIZES,
             _ => &[0, 8, 16, 32, 64, 128],
         }
     }
@@ -531,6 +552,18 @@ impl MachineProfile {
         }
     }
 
+    /// The highest SCSI id a `[scsi.N]` table can name. The Octane's ISP1040
+    /// buses are wide, with ids 0 to 15 and the controller on 0. The Indy's
+    /// and Indigo2's WD33C93A chips are narrow, with ids 0 to 7. The O2's
+    /// Adaptec buses are wide too, but stay at 7 until they are widened on
+    /// purpose.
+    pub fn max_scsi_id(self) -> u8 {
+        match self {
+            Self::OctaneIp30 => 15,
+            _ => 7,
+        }
+    }
+
     /// How many memory banks the machine has: four on all of them (the MC's
     /// four banks; the O2's four DIMM pairs). `banks` has room for more.
     pub fn memory_banks(self) -> usize {
@@ -539,6 +572,21 @@ impl MachineProfile {
 
     pub fn guinness(self) -> bool {
         matches!(self, Self::IndyIp24)
+    }
+
+    /// The CPU models this machine can be built with. The O2 has an R5000 or
+    /// an R10000 (an R4400 is refused when the machine is built, not by
+    /// `validate()`); the Octane shipped only with the 195 MHz R10000; the
+    /// Indy and the Indigo2 take any of the three.
+    ///
+    /// Single source of truth for the front-ends' Processor pickers, so they
+    /// cannot offer a CPU the machine will refuse.
+    pub fn cpus(self) -> &'static [CpuModel] {
+        match self {
+            Self::OctaneIp30 => &[CpuModel::R10000],
+            Self::O2Ip32 => &[CpuModel::R5000, CpuModel::R10000],
+            _ => &CpuModel::ALL,
+        }
     }
 
     /// The R10000 Indigo2. Selects the IP28 decodes inside the shared
@@ -827,11 +875,18 @@ pub struct MachineSection {
     pub cpu: CpuModel,
     #[serde(default)]
     pub cache: CacheModel,
+    /// Processors fitted. More than one only on the Octane.
+    #[serde(default = "default_cpus")]
+    pub cpus: u8,
+}
+
+fn default_cpus() -> u8 {
+    1
 }
 
 impl Default for MachineSection {
     fn default() -> Self {
-        Self { profile: MachineProfile::default(), cpu: CpuModel::default(), cache: CacheModel::default() }
+        Self { profile: MachineProfile::default(), cpu: CpuModel::default(), cache: CacheModel::default(), cpus: default_cpus() }
     }
 }
 
@@ -1427,6 +1482,15 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_port_b: Option<u16>,
 
+    /// Unix socket paths that serve serial channels A and B as well as their
+    /// TCP ports: raw bytes, one client at a time. Where the machine has a CI
+    /// socket, a console on a socket is also still readable through
+    /// `serial-read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_socket_a: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_socket_b: Option<String>,
+
     /// Physical host keyboard: `ansi` (default), `iso` or `jis`. Set `jis`
     /// with a Japanese keyboard and the PROM's `keybd` set to Japanese. See
     /// [`KeyboardLayout`].
@@ -1510,9 +1574,19 @@ pub struct MachineConfig {
     #[serde(default)]
     pub serial_log_timestamps: crate::dev::serial_log::SerialLogTimestamps,
 
+    /// Files that receive what the guest sends on serial channel A or B when
+    /// that channel is not the console (`serial_log` is the console's):
+    /// channel B on the Octane and O2, channel A on the Indy and Indigo2.
+    /// Written from the start on the Octane and O2, appended to on the Indy
+    /// and Indigo2, like `serial_log`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_log_a: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_log_b: Option<String>,
+
     // --- table / array-of-table fields: must be emitted after all scalars ---
 
-    /// SCSI devices keyed by ID 1–7. Missing IDs are not attached.
+    /// SCSI devices keyed by ID 1–7 (1–15 on the Octane). Missing IDs are not attached.
     #[serde(default = "default_scsi", with = "scsi_keys")]
     pub scsi: std::collections::HashMap<u8, ScsiDeviceConfig>,
 
@@ -1657,6 +1731,15 @@ pub fn banks_from4(four: [u32; 4]) -> [u32; MAX_BANKS] {
     banks
 }
 
+/// The first four banks of a full `banks` array. Every machine today has
+/// four banks or fewer, so the rest of the array is always zeros; the
+/// front-ends' per-bank pickers work on a `[u32; 4]`.
+pub fn banks_to4(banks: [u32; MAX_BANKS]) -> [u32; 4] {
+    let mut four = [0u32; 4];
+    four.copy_from_slice(&banks[..4]);
+    four
+}
+
 /// `banks` as TOML: any length from 1 to [`MAX_BANKS`] is read and padded
 /// with zeros; it is written with at least four entries and no trailing
 /// zeros beyond them, so a four-bank machine's config looks as it always has.
@@ -1715,6 +1798,8 @@ impl Default for MachineConfig {
             monitor_port: None,
             serial_port_a: None,
             serial_port_b: None,
+            serial_socket_a: None,
+            serial_socket_b: None,
             keyboard: KeyboardLayout::default(),
             load_elf: None,
             perfetto: None,
@@ -1729,6 +1814,8 @@ impl Default for MachineConfig {
             ci_display: false,
             serial_log: None,
             serial_log_timestamps: Default::default(),
+            serial_log_a: None,
+            serial_log_b: None,
             vino: VinoConfig::default(),
             vnc: VncConfig::default(),
             network: NetworkSection::default(),
@@ -1890,6 +1977,9 @@ impl MachineConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.machine.cpus != 1 && self.machine.profile != MachineProfile::OctaneIp30 {
+            return Err(format!("[machine] cpus = {}: only the Octane has more than one processor", self.machine.cpus));
+        }
         if self.graphics.heads != 1 && self.graphics.heads != 2 {
             return Err(format!(
                 "graphics.heads {} is invalid (valid: 1, 2)",
@@ -1924,8 +2014,9 @@ impl MachineConfig {
         for key in keys {
             let dev = &self.scsi[&key];
             let (controller, id) = dev.placement(key);
-            if id == 0 || id > 7 {
-                return Err(format!("scsi.{}: SCSI ID {} is out of range (1–7; the controller itself is 0)", key, id));
+            let max_id = self.machine.profile.max_scsi_id();
+            if id == 0 || id > max_id {
+                return Err(format!("scsi.{}: SCSI ID {} is out of range (1–{}; the controller itself is 0)", key, id, max_id));
             }
             if key >= 16 && dev.controller != 0 && dev.controller != controller {
                 return Err(format!(
@@ -1953,15 +2044,21 @@ impl MachineConfig {
                 ));
             }
         }
+        self.validate_serial_sockets()?;
         if self.scale < 1 || self.scale > 4 {
             return Err(format!("scale {} is invalid (valid: 1, 2, 3, 4)", self.scale));
         }
         let bank_count = self.machine.profile.memory_banks();
         for (i, &sz) in self.banks.iter().enumerate().skip(bank_count) {
             if sz != 0 {
+                let hint = if self.machine.profile == MachineProfile::OctaneIp30 {
+                    " (an entry is a bank of two DIMMs: eight 1 GB DIMMs are [2048, 2048, 2048, 2048])"
+                } else {
+                    ""
+                };
                 return Err(format!(
-                    "bank{} size {} MB: {:?} has {} memory banks, so banks beyond the {}th must be 0",
-                    i, sz, self.machine.profile, bank_count, bank_count
+                    "bank{} size {} MB: {:?} has {} memory banks, so banks beyond the {}th must be 0{}",
+                    i, sz, self.machine.profile, bank_count, bank_count, hint
                 ));
             }
         }
@@ -1974,8 +2071,8 @@ impl MachineConfig {
             }
             crate::dev::crime_mem::check_kits(&self.o2_kits()).map_err(|e| format!("banks: {e}"))?;
         } else if self.machine.profile == MachineProfile::OctaneIp30 {
-            // A HEART bank is a matched DIMM pair: 64 to 512 MB, filled from
-            // bank 0 without a gap, 2 GB at most (the Octane owner's guide).
+            // A HEART bank is a matched DIMM pair: 64 MB to 2 GB, filled from
+            // bank 0 without a gap, 8 GB at most (SGI's memory upgrade guide).
             let banks = &self.banks[..bank_count];
             if banks[0] == 0 {
                 return Err("banks: an Octane needs memory in bank 0".into());
@@ -1986,8 +2083,8 @@ impl MachineConfig {
                 }
             }
             for (i, &sz) in banks.iter().enumerate() {
-                if sz != 0 && ![64, 128, 256, 512].contains(&sz) {
-                    return Err(format!("bank{i} size {sz} MB is invalid for an Octane (valid: 64, 128, 256, 512)"));
+                if !MachineProfile::OctaneIp30.bank_sizes().contains(&sz) {
+                    return Err(format!("bank{i} size {sz} MB is invalid for an Octane (valid: 64, 128, 256, 512, 1024, 2048)"));
                 }
             }
             if let Some(old) = &self.octane.graphics {
@@ -2001,10 +2098,10 @@ impl MachineConfig {
             }
         } else {
             for (i, &sz) in self.banks.iter().enumerate().take(bank_count) {
-                if !VALID_BANK_SIZES.contains(&sz) {
+                if !MC_BANK_SIZES.contains(&sz) {
                     return Err(format!(
                         "bank{} size {} MB is invalid (valid: {:?})",
-                        i, sz, VALID_BANK_SIZES
+                        i, sz, MC_BANK_SIZES
                     ));
                 }
                 // The IP22/IP24 MC cannot express banks larger than 128 MB at its base
@@ -2020,12 +2117,6 @@ impl MachineConfig {
         match (self.network.mode, self.machine.profile) {
             (NetMode::Off, p) if p != MachineProfile::O2Ip32 && p != MachineProfile::OctaneIp30 => {
                 return Err("network.mode = \"off\" is only available on the O2 and the Octane for now; the Indy and Indigo2 always have their Ethernet".into());
-            }
-            (NetMode::Pcap, MachineProfile::O2Ip32) => {
-                return Err("network.mode = \"pcap\" is not available on the O2 yet (its Ethernet runs on the NAT gateway)".into());
-            }
-            (NetMode::Pcap, MachineProfile::OctaneIp30) => {
-                return Err("network.mode = \"pcap\" is not available on the Octane yet (its Ethernet runs on the NAT gateway)".into());
             }
             _ => {}
         }
@@ -2085,6 +2176,30 @@ impl MachineConfig {
         Ok(())
     }
 
+    /// The Unix serial sockets and per-line logs: each path names one line,
+    /// and the console line's log is `serial_log`, not a per-line key.
+    fn validate_serial_sockets(&self) -> Result<(), String> {
+        let sockets = [("serial_socket_a", self.serial_socket_a.as_deref()), ("serial_socket_b", self.serial_socket_b.as_deref())];
+        for (i, (setting, path)) in sockets.iter().enumerate() {
+            let Some(path) = path else { continue };
+            if path.is_empty() {
+                return Err(format!("{setting}: the socket path is empty"));
+            }
+            if let Some((other, _)) = sockets[..i].iter().find(|(_, p)| *p == Some(*path)) {
+                return Err(format!("{setting} and {other} both name {path}"));
+            }
+        }
+        match self.machine.profile {
+            MachineProfile::OctaneIp30 | MachineProfile::O2Ip32 if self.serial_log_a.is_some() => {
+                Err("serial_log_a: channel A is the console here; its log is serial_log".into())
+            }
+            MachineProfile::IndyIp24 | MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28 if self.serial_log_b.is_some() => {
+                Err("serial_log_b: channel B is the console here; its log is serial_log".into())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Extract network-related settings into a `NetworkConfig`.
     /// Parses `nat_subnet` from CIDR — safe to unwrap because `validate()` already accepted it.
     pub fn network(&self) -> NetworkConfig {
@@ -2106,6 +2221,7 @@ impl MachineConfig {
             mac,
             tftp_dir:     self.network.tftp_dir.as_ref().map(std::path::PathBuf::from),
             rsh_dir:      self.network.rsh_dir.as_ref().map(std::path::PathBuf::from),
+            rx_hold:      self.network.rx_hold.unwrap_or(true),
         }
     }
 
@@ -2294,6 +2410,14 @@ pub struct Cli {
     #[arg(long = "serial-port-b", value_name = "PORT")]
     pub serial_port_b: Option<u16>,
 
+    /// Also serve serial channel A on this Unix socket.
+    #[arg(long = "serial-socket-a", value_name = "PATH")]
+    pub serial_socket_a: Option<String>,
+
+    /// Also serve serial channel B on this Unix socket.
+    #[arg(long = "serial-socket-b", value_name = "PATH")]
+    pub serial_socket_b: Option<String>,
+
     /// Physical host keyboard: `ansi` (default), `iso` or `jis`. Use `jis`
     /// for a Japanese keyboard with the PROM's `keybd` set to JP.
     #[arg(long = "keyboard", value_name = "LAYOUT")]
@@ -2370,6 +2494,16 @@ pub struct Cli {
     #[arg(long = "serial-log-timestamps", value_name = "MODE")]
     pub serial_log_timestamps: Option<crate::dev::serial_log::SerialLogTimestamps>,
 
+    /// Write what the guest sends on serial channel A to this file when A is
+    /// not the console (Indy, Indigo2).
+    #[arg(long = "serial-log-a", value_name = "FILE")]
+    pub serial_log_a: Option<String>,
+
+    /// Write what the guest sends on serial channel B to this file when B is
+    /// not the console (Octane, O2).
+    #[arg(long = "serial-log-b", value_name = "FILE")]
+    pub serial_log_b: Option<String>,
+
     /// Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28).
     /// IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50.
     #[arg(long = "clock-fixed-mhz", value_name = "MHZ")]
@@ -2425,6 +2559,8 @@ impl Cli {
         if self.ci_display { cfg.ci_display = true; }
         if let Some(p) = &self.serial_log { cfg.serial_log = Some(p.clone()); }
         if let Some(mode) = self.serial_log_timestamps { cfg.serial_log_timestamps = mode; }
+        if let Some(p) = &self.serial_log_a { cfg.serial_log_a = Some(p.clone()); }
+        if let Some(p) = &self.serial_log_b { cfg.serial_log_b = Some(p.clone()); }
         if let Some(mhz) = self.clock_fixed_mhz { cfg.clock.fixed_mhz = Some(mhz); }
         // NB: --ci does NOT imply --headless. REX3 stays alive so screenshots
         // work; main.rs simply skips the host window when ci && !ci_display.
@@ -2443,6 +2579,8 @@ impl Cli {
         if let Some(a) = &self.vnc { cfg.vnc.listen = Some(a.clone()); }
         if let Some(p) = self.serial_port_a { cfg.serial_port_a = Some(p); }
         if let Some(p) = self.serial_port_b { cfg.serial_port_b = Some(p); }
+        if let Some(p) = &self.serial_socket_a { cfg.serial_socket_a = Some(p.clone()); }
+        if let Some(p) = &self.serial_socket_b { cfg.serial_socket_b = Some(p.clone()); }
         if let Some(k) = self.keyboard { cfg.keyboard = k; }
         if let Some(ref p) = self.load_elf { cfg.load_elf = Some(p.clone()); }
         if let Some(ref p) = self.perfetto { cfg.perfetto = Some(p.clone()); }
@@ -2551,6 +2689,28 @@ mod export_tests {
         assert_eq!(back.scsi[&1].path, cfg.scsi[&1].path);
         assert_eq!(back.scsi[&4].cdrom, true);
         println!("--- exported toml ---\n{s}");
+    }
+
+    /// IDs 1 to 15 are valid on the Octane's wide buses, and 1 to 7 on the
+    /// narrow Indy; the controller's own ID 0 is refused everywhere.
+    #[test]
+    fn scsi_id_limit_is_15_on_the_octane_and_7_elsewhere() {
+        let octane = |key: u8| -> MachineConfig {
+            toml::from_str(&format!(
+                "banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n[scsi.{key}]\npath = \"wide.raw\"\n"
+            )).expect("parse")
+        };
+        octane(15).validate().expect("id 15 on controller 0");
+        octane(31).validate().expect("id 15 on controller 1");
+        let err = octane(16).validate().unwrap_err();
+        assert!(err.contains("SCSI ID 0"), "key 16 names controller 1's ID 0: {err}");
+        let indy = |key: u8| -> MachineConfig {
+            toml::from_str(&format!("[scsi.{key}]\npath = \"narrow.raw\"\n")).expect("parse")
+        };
+        indy(7).validate().expect("id 7 on the Indy");
+        let err = indy(8).validate().unwrap_err();
+        assert!(err.contains("SCSI ID 8") && err.contains("1–7"), "{err}");
+        assert!(indy(0).validate().is_err(), "the controller is ID 0");
     }
 
     #[test]
@@ -2770,12 +2930,46 @@ mod export_tests {
         assert!(o2.validate().unwrap_err().contains("largest kit goes in pair A"));
         o2.banks = default_banks();
         o2.network.mode = NetMode::Pcap;
-        assert!(o2.validate().unwrap_err().contains("pcap"));
+        o2.validate().expect("a bridged O2");
         o2.network.mode = NetMode::Off;
         o2.validate().expect("an unplugged O2");
         let mut indy = MachineConfig::default();
         indy.network.mode = NetMode::Off;
         assert!(indy.validate().unwrap_err().contains("only available on the O2"));
+    }
+
+    /// The serial sockets come from the file and the command line, must
+    /// differ, and a log key for the console line is refused.
+    #[test]
+    fn serial_sockets_and_line_logs_are_read_and_checked() {
+        let mut octane: MachineConfig = toml::from_str(r#"
+            serial_socket_a = "/run/a.sock"
+            serial_socket_b = "/run/b.sock"
+            serial_log_b = "b.log"
+            banks = [128, 0, 0, 0]
+            [machine]
+            profile = "octane_ip30"
+            cpu = "r10000"
+        "#).expect("parse");
+        assert_eq!(octane.serial_socket_a.as_deref(), Some("/run/a.sock"));
+        assert_eq!(octane.serial_log_b.as_deref(), Some("b.log"));
+        octane.validate().expect("an Octane serves sockets");
+        octane.serial_socket_b = octane.serial_socket_a.clone();
+        assert!(octane.validate().unwrap_err().contains("both name /run/a.sock"));
+        octane.serial_socket_b = Some("/run/b.sock".into());
+        octane.serial_log_a = Some("a.log".into());
+        assert!(octane.validate().unwrap_err().contains("channel A is the console"));
+
+        let cli = Cli::parse_from(["iris", "--serial-socket-a", "/run/x.sock", "--serial-log-a", "y.log"]);
+        let cfg = cli.apply(MachineConfig::default());
+        assert_eq!(cfg.serial_socket_a.as_deref(), Some("/run/x.sock"));
+        assert_eq!(cfg.serial_log_a.as_deref(), Some("y.log"));
+        cfg.validate().expect("the Indy serves sockets and logs channel A");
+        let mut indy = cfg.clone();
+        indy.serial_log_b = Some("y.log".into());
+        assert!(indy.validate().unwrap_err().contains("channel B is the console"));
+        let back: MachineConfig = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.serial_socket_a.as_deref(), Some("/run/x.sock"));
     }
 
     /// Every old `[o2]` key lands on the shared key it stood for, and the

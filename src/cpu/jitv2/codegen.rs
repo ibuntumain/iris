@@ -131,6 +131,11 @@ pub struct Codegen {
     /// `finalize_batch_nonforced` so a stale `true` can never leak into a
     /// later, unrelated call.
     last_finalize_failed: bool,
+    /// The `JitFn` the most recent successful `finalize_batch_nonforced` resolved
+    /// for its own function, so the caller can tell whether the entries that
+    /// call returned as sealed include its own or only other ranges that its
+    /// seal attempt happened to release.
+    last_finalized_fn: Option<crate::cpu::jitv2::JitFn>,
     /// Shared with the `PagedArenaMemoryProvider` this `Codegen`'s `module`
     /// was built with — see `PagedArenaState`'s own doc comment for why this
     /// indirection exists. Polled via `provider_crossed_page`/`packing_stats`
@@ -375,6 +380,19 @@ pub struct BlockSkeleton {
 /// generated code `speed` produces.
 static CODEGEN_OPT_LEVEL_SPEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(!cfg!(feature = "developer"));
 
+/// Whether Cranelift runs its IR verifier on every compile. It only checks
+/// this codegen's own IR and never changes the emitted code, but it is a large
+/// share of compile time, and the guest interprets every page still waiting
+/// for the compile thread. On in unit tests and `developer` builds; elsewhere
+/// (including integration tests and bins such as `jitv2-verify`) set
+/// `IRIS_JIT_VERIFY=1` to get a panic at compile time instead of a miscompile.
+fn verify_ir_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(any(test, feature = "developer")) || matches!(std::env::var("IRIS_JIT_VERIFY").as_deref(), Ok("1") | Ok("on"))
+    })
+}
+
 /// How many consecutive head instructions may share ONE pending-interrupt
 /// check (`emit_pending_interrupt_preamble`) instead of each paying its own.
 /// `1` (the default) is the historical behaviour: every instruction checks.
@@ -539,10 +557,23 @@ impl Codegen {
         std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
         crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider,
     ) {
+        Self::new_module_verifying(shared, state, verify_ir_enabled())
+    }
+
+    fn new_module_verifying(
+        shared: Option<std::sync::Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>>,
+        state: Option<std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>>,
+        verify_ir: bool,
+    ) -> (
+        cranelift_jit::JITModule,
+        std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
+        crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider,
+    ) {
         let mut flag_builder = settings::builder();
         let opt_level = if Self::opt_level_speed() { "speed" } else { "none" };
         flag_builder.set("opt_level", opt_level).unwrap();
         flag_builder.set("is_pic", "false").unwrap();
+        flag_builder.set("enable_verifier", if verify_ir { "true" } else { "false" }).unwrap();
         let isa_builder = cranelift_native::builder().expect("host ISA not supported");
         let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
         let mut jit_builder = cranelift_jit::JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -623,6 +654,7 @@ impl Codegen {
             #[cfg(feature = "developer")]
             last_decline_was_verifier_error: false,
             last_finalize_failed: false,
+            last_finalized_fn: None,
             paged_state,
             seal_handle,
             func_ranges: std::collections::HashMap::new(),
@@ -895,6 +927,15 @@ impl Codegen {
     /// empty return, before assuming "just gap-blocked, safe to wait."
     pub fn last_finalize_failed(&self) -> bool {
         self.last_finalize_failed
+    }
+
+    /// Whether `sealed`, as returned by the latest `finalize_batch_nonforced`,
+    /// contains that call's own function. A seal attempt also releases other
+    /// ranges (an earlier page this allocation vacated, another worker's
+    /// entries), so a non-empty result does not mean this compile published.
+    pub fn finalized_fn_is_among(&self, sealed: &[crate::cpu::jitv2::paged_memory::PublishInfo]) -> bool {
+        let Some(own) = self.last_finalized_fn else { return false };
+        sealed.iter().any(|e| e.jit_fn.is_some_and(|f| f as usize == own as usize))
     }
 
     /// Whether the most recent `compile_region` call's `None` return came
@@ -2523,6 +2564,7 @@ impl Codegen {
     /// case will ever resolve on its own.
     pub fn finalize_batch_nonforced(&mut self, id: cranelift_module::FuncId, publish: crate::cpu::jitv2::paged_memory::PublishInfo) -> Vec<crate::cpu::jitv2::paged_memory::PublishInfo> {
         self.last_finalize_failed = false;
+        self.last_finalized_fn = None;
         let (start, end) = *self.func_ranges.get(&id).expect("finalize_batch_nonforced: id has no reserved seal-queue range — compile_region_uncommitted must run first");
         if self.module.finalize_definitions().is_err() {
             self.last_finalize_failed = true;
@@ -2531,8 +2573,10 @@ impl Codegen {
         }
         self.func_ranges.remove(&id);
         let code_ptr = self.module.get_finalized_function(id);
+        let jit_fn = unsafe { std::mem::transmute::<*const u8, crate::cpu::jitv2::JitFn>(code_ptr) };
+        self.last_finalized_fn = Some(jit_fn);
         let publish = crate::cpu::jitv2::paged_memory::PublishInfo {
-            jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::cpu::jitv2::JitFn>(code_ptr) }),
+            jit_fn: Some(jit_fn),
             ..publish
         };
         self.seal_handle.patch_pending_publish(start, end, publish, false)
@@ -4114,10 +4158,10 @@ fn emit_tc_mapped(ctx: &mut EmitCtx, phys: Value) -> Value {
     //
     // Cranelift's `ishl` masks the shift count to 6 bits, as x86 and aarch64
     // do, so a page at or above 4GB (the Octane's memory reaches past it)
-    // would wrap onto region `phys >> 26 & 63`: bound it, as `bitmap_maps`
+    // would wrap onto region `phys >> shift & 63`: bound it, as `bitmap_maps`
     // does. That keeps such pages in the nutlb, where the interpreter wants
     // them, at the cost of one compare here.
-    let region = ctx.builder.ins().ushr_imm_s(phys, crate::ppmem::BITMAP_SHIFT as i64);
+    let region = ctx.builder.ins().ushr_imm_s(phys, ctx.dc_geometry.window_shift as i64);
     let one = ctx.builder.ins().iconst(i64t, 1);
     let bit = ctx.builder.ins().ishl(one, region);
     let hit = ctx.builder.ins().band(bits, bit);
@@ -4661,10 +4705,15 @@ fn emit_mem_write_split(
         let page = ctx.builder.ins().ushr_imm_s(path.fast_phys, 12);
         let off = ctx.builder.ins().imul_imm_s(page, 8);
         let gp = ctx.builder.ins().iadd(gen_base, off);
-        let cur = ctx.builder.ins().load(ir::types::I64, mem, gp,
-            ir::immediates::Offset32::new(0));
-        let inc = ctx.builder.ins().iadd_imm_s(cur, 1);
-        ctx.builder.ins().store(mem, inc, gp, ir::immediates::Offset32::new(0));
+        if ctx.dc_geometry.atomic_gen {
+            let one = ctx.builder.ins().iconst(ir::types::I64, 1);
+            ctx.builder.ins().atomic_rmw(ir::types::I64, mem, ir::AtomicRmwOp::Add, gp, one);
+        } else {
+            let cur = ctx.builder.ins().load(ir::types::I64, mem, gp,
+                ir::immediates::Offset32::new(0));
+            let inc = ctx.builder.ins().iadd_imm_s(cur, 1);
+            ctx.builder.ins().store(mem, inc, gp, ir::immediates::Offset32::new(0));
+        }
 
         // tc_invalidate_l2_code: writing the line makes L2's decoded
         // instruction slots for it stale, so clear `has_code` if this line is
@@ -10868,6 +10917,93 @@ mod tests {
     fn inline_mem_on_by_default_without_lockstep() {
         assert!(inline_mem_enabled(),
             "inline memory should be on by default in a non-lockstep build");
+    }
+
+    /// The emulator turns Cranelift's IR verifier off to shorten the wait on
+    /// the compile thread. The verifier only checks, so the same page must
+    /// compile to the same machine code with it on or off. The pages cover the
+    /// shapes that build different IR: integer and FP memory ops, a
+    /// branch-likely, backward and forward branches, a jump.
+    #[test]
+    fn verifier_off_emits_the_same_code() {
+        fn i_type(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
+            (op << 26) | (rs << 21) | (rt << 16) | imm as u32
+        }
+        let jr_ra = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        let simple = [
+            i_type(OP_LW, 4, 2, 0),       // lw    v0, 0(a0)
+            i_type(OP_ADDIU, 2, 2, 1),    // addiu v0, v0, 1
+            i_type(OP_SW, 4, 2, 0),       // sw    v0, 0(a0)
+            i_type(OP_BEQ, 2, 0, 0xfffc), // beq   v0, zero, 0
+            0,                            // delay slot
+            jr_ra,
+            0,
+        ];
+        let narrow = [
+            i_type(OP_LB, 4, 2, 1),       // lb    v0, 1(a0)
+            i_type(OP_SB, 4, 2, 2),       // sb    v0, 2(a0)
+            i_type(OP_ANDI, 2, 3, 0xff),  // andi  v1, v0, 0xff
+            i_type(OP_SD, 4, 3, 8),       // sd    v1, 8(a0)
+            i_type(OP_LD, 4, 5, 8),       // ld    a1, 8(a0)
+            jr_ra,
+            0,
+        ];
+        let fp = [
+            i_type(OP_LWC1, 4, 0, 0),        // lwc1  f0, 0(a0)
+            i_type(OP_LWC1, 4, 1, 4),        // lwc1  f1, 4(a0)
+            r_type(OP_COP1, 16, 1, 0, 2, 0), // add.s f2, f0, f1
+            i_type(OP_SWC1, 4, 2, 8),        // swc1  f2, 8(a0)
+            jr_ra,
+            0,
+        ];
+        let likely = [
+            i_type(OP_LW, 4, 2, 0),       // lw    v0, 0(a0)
+            i_type(OP_BEQL, 2, 0, 2),     // beql  v0, zero, +2
+            i_type(OP_ADDIU, 2, 2, 1),    // addiu v0, v0, 1 (delay slot, annulled if not taken)
+            i_type(OP_SW, 4, 2, 0),       // sw    v0, 0(a0)
+            jr_ra,
+            0,
+        ];
+        let blocks = [
+            i_type(OP_LW, 4, 2, 0),         // lw    v0, 0(a0)
+            i_type(OP_BNE, 2, 0, 3),        // bne   v0, zero, +3
+            0,
+            i_type(OP_ADDIU, 2, 2, 1),      // addiu v0, v0, 1
+            i_type(OP_SW, 4, 2, 4),         // sw    v0, 4(a0)
+            i_type(OP_ADDIU, 5, 5, 0xffff), // addiu a1, a1, -1
+            i_type(OP_BNE, 5, 0, 0xfffb),   // bne   a1, zero, back to the lw
+            0,
+            (OP_J << 26) | 12,              // j     word 12
+            0,
+            0,
+            0,
+            jr_ra,
+            0,
+        ];
+        let pages: [(&str, &[u32]); 5] =
+            [("simple", &simple), ("narrow", &narrow), ("fp", &fp), ("likely", &likely), ("blocks", &blocks)];
+
+        for (name, words) in pages {
+            let mut page = [0u32; ENTRIES_PER_PAGE];
+            page[..words.len()].copy_from_slice(words);
+            let compile = |verify: bool| {
+                let mut analyzer = Analyzer::new();
+                let (instrs, non_empty) = analyzer.walk(&page, 0, 0);
+                assert!(non_empty, "{name}");
+                let mut instrs = *instrs;
+                let mut codegen = Codegen::from_module(Codegen::new_module_verifying(None, None, verify));
+                assert_eq!(codegen.module.isa().flags().enable_verifier(), verify);
+                let f = codegen.compile_region(&mut instrs, 0, true, false).unwrap_or_else(|| panic!("{name} must compile"));
+                let len = codegen.last_code_size() as usize;
+                assert!(len > 0, "{name}");
+                // SAFETY: `f` points at `len` bytes of finalized code that
+                // stay mapped: the module is leaked below.
+                let code = unsafe { std::slice::from_raw_parts(f as *const u8, len) }.to_vec();
+                std::mem::forget(codegen);
+                code
+            };
+            assert_eq!(compile(true), compile(false), "{name}: the verifier must not change the emitted code");
+        }
     }
 
     #[test]

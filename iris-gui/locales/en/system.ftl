@@ -32,6 +32,9 @@ emu-already-running = The machine is already running.
 emu-not-running = The machine isn't running.
 # $error is the reason the machine failed to start.
 emu-start-failed = Couldn't start the machine: { $error }
+# $listen is the address the VNC server was to serve on; $error is why it
+# couldn't bind it (usually another program already has the port).
+emu-vnc-failed = Couldn't start the VNC server on { $listen }: { $error }
 # $subnet is a CIDR such as 192.168.0.0/24.
 emu-nat-subnet-invalid = Can't use { $subnet } as the NAT subnet: { $error }
 emu-chd-compact-failed = Couldn't compact CHD disks on exit: { $error }. Grant access to the disk's folder (File > Grant a disk folder…) so IRIS can write next to it.
@@ -63,4 +66,5 @@ ram-summary = { $total } MB ({ $banks ->
     [one] 1 bank
    *[other] { $banks } banks
 })
-ram-bank-octane-sizes = An Octane bank is 64, 128, 256 or 512 MB.
+ram-bank-octane-sizes = An Octane bank is 64, 128, 256, 512, 1024 or 2048 MB.
+ram-bank-o2-sizes = An O2 bank is a pair of DIMMs of 32, 64, 128 or 256 MB. Fill them from the first pair with no gaps.

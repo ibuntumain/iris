@@ -93,6 +93,7 @@ pub enum Tab {
     Memory,
     Display,
     VideoIn,
+    Performance,
     Debug,
     Ci,
     Bench,
@@ -107,7 +108,7 @@ impl Tab {
     pub fn visible() -> Vec<Tab> {
         let mut tabs = vec![
             Tab::General, Tab::Disks, Tab::Network, Tab::Memory,
-            Tab::Display, Tab::VideoIn,
+            Tab::Display, Tab::VideoIn, Tab::Performance,
         ];
         if !build_features::LIGHTNING {
             tabs.push(Tab::Debug);
@@ -131,6 +132,7 @@ impl Tab {
             Tab::Memory  => t!("config-tab-memory"),
             Tab::Display => t!("config-tab-display"),
             Tab::VideoIn => t!("config-tab-video-in"),
+            Tab::Performance => t!("config-tab-performance"),
             Tab::Debug   => t!("config-tab-debug"),
             Tab::Ci      => t!("config-tab-ci"),
             Tab::Bench   => t!("config-tab-bench"),
@@ -200,6 +202,7 @@ pub fn show_tab(
         Tab::Memory  => { show_memory(ui, cfg, mem_ctx); TabOutcome::default() }
         Tab::Display => { show_display(ui, cfg, mem_ctx.running); TabOutcome::default() }
         Tab::VideoIn => TabOutcome { action: show_vino(ui, cfg), ..Default::default() },
+        Tab::Performance => TabOutcome { action: show_performance(ui, cfg), ..Default::default() },
         Tab::Debug   => TabOutcome { action: show_debug(ui, cfg), ..Default::default() },
         Tab::Ci      => TabOutcome { action: show_ci(ui, cfg), ..Default::default() },
         Tab::Bench   => { crate::bench_ui::show(ui, bench, mem_ctx.running); TabOutcome::default() }
@@ -218,10 +221,14 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
                 ui.selectable_value(&mut cfg.machine.profile, p, p.label());
             }
         });
+    let octane = cfg.machine.profile == MachineProfile::OctaneIp30;
+    let o2 = cfg.machine.profile == MachineProfile::O2Ip32;
     if cfg.machine.profile == MachineProfile::OctaneIp30 && profile_before != MachineProfile::OctaneIp30 {
         octane_defaults(cfg);
     }
-    let octane = cfg.machine.profile == MachineProfile::OctaneIp30;
+    if o2 && profile_before != MachineProfile::O2Ip32 {
+        o2_defaults(cfg);
+    }
     // A board the new machine does not take would fail `validate()` at
     // Start: GR2 Extreme moving to Indy keeps the closest board (XZ); any
     // other falls back to the machine's default.
@@ -229,9 +236,12 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     if !board.supports(cfg.machine.profile) {
         cfg.graphics.board = (board == GraphicsBoard::Extreme && !octane).then_some(GraphicsBoard::Xz);
     }
-    // Only IP28 can express 256/512 MB banks. Clamp them when switching to
-    // IP22/IP24 so the new profile passes `validate()` at Start.
-    if !matches!(cfg.machine.profile, MachineProfile::Indigo2Ip28 | MachineProfile::OctaneIp30) {
+    // Only IP28 can express 256/512 MB banks, and the Octane's start at 64 MB.
+    // Clamp them when switching to IP22/IP24 so the new profile passes
+    // `validate()` at Start. (An O2's banks are re-fitted in `o2_defaults`,
+    // which knows the kit rules; a bare clamp would leave a layout `validate()`
+    // rejects for other reasons — a gap, or a bank that is not a kit size.)
+    if !matches!(cfg.machine.profile, MachineProfile::Indigo2Ip28 | MachineProfile::OctaneIp30 | MachineProfile::O2Ip32) {
         for bank in &mut cfg.banks {
             if *bank > 128 { *bank = 128; }
         }
@@ -244,6 +254,9 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     if octane {
         subtitle(ui, t!("config-octane-subtitle"));
     }
+    if o2 {
+        subtitle(ui, t!("config-o2-subtitle"));
+    }
     if cfg.machine.profile == MachineProfile::Indigo2Ip28 {
         subtitle(ui, t!("config-ip28-subtitle"));
         ui.label(
@@ -252,19 +265,29 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             .small(),
         );
     }
-        ui.heading(t!("config-processor"));
+    // The O2 has no embedded PROM — it boots from an IP32 image, the same way
+    // the Octane does. Say so up front rather than letting the user discover
+    // it as a Start failure.
+    if o2 {
+        ui.label(
+            RichText::new(t!("config-o2-prom-warning"))
+                .color(Color32::from_rgb(220, 170, 90)),
+        );
+    }
+    ui.heading(t!("config-processor"));
     Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label(t!("config-cpu"));
-        // A real setting, not a read-out of how this binary was built. Both
+        // A real setting, not a read-out of how this binary was built. All
         // CPU models are compiled in and `Machine::new` picks between them at
         // construction, so the choice belongs to the machine's config the same
         // way its RAM does.
-        // The Octane has one CPU option, the 195 MHz R10000.
-        ui.add_enabled_ui(!mem_ctx.running && !octane, |ui| {
+        // Only the CPUs this machine can be built with: the Octane has one,
+        // the 195 MHz R10000, and an O2 refuses an R4400.
+        ui.add_enabled_ui(!mem_ctx.running, |ui| {
             ComboBox::from_id_salt("cpu_model")
                 .selected_text(cfg.machine.cpu.label())
                 .show_ui(ui, |ui| {
-                    for c in CpuModel::ALL {
+                    for &c in cfg.machine.profile.cpus() {
                         ui.selectable_value(&mut cfg.machine.cpu, c, c.label());
                     }
                 });
@@ -291,8 +314,16 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
 
         ui.label(t!("config-clock"));
         ui.horizontal(|ui| {
-            // CP0 Count: half the CPU clock on the R10000 machines (the Octane's is 195 MHz).
-            let auto_default = if cfg.machine.profile.ip28() || octane { 97.5 } else { 33.0 };
+            // CP0 Count: half the CPU clock on the R10000 machines (the Octane's
+            // is 195 MHz) and on the O2 (90 MHz); a third of it on the Indy and
+            // the Indigo2 (33 MHz).
+            let auto_default = if cfg.machine.profile.ip28() || octane {
+                97.5
+            } else if o2 {
+                90.0
+            } else {
+                33.0
+            };
             let mut mhz = cfg.clock.fixed_mhz.unwrap_or(auto_default);
             let changed = ui.add(DragValue::new(&mut mhz).range(0.1..=1000.0).suffix(" MHz")).changed();
             if changed { cfg.clock.fixed_mhz = Some(mhz); }
@@ -323,29 +354,8 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     if cfg.machine.cpu == CpuModel::R10000 {
         subtitle(ui, t!("config-r10000-subtitle"));
     }
-    // jitv2 persistent code cache: lives here (not the Debug tab) so it's
-    // reachable from lightning builds too, which hide Debug entirely
-    // (build_features::LIGHTNING check in Tab::visible) even though jitv2
-    // itself is an independent feature from lightning.
-    if build_features::JITV2 {
-        ui.add_space(4.0);
-        Grid::new("jitv2_cache_grid").num_columns(2).striped(true).show(ui, |ui| {
-            ui.label(t!("config-jit-threads"));
-            let max = std::thread::available_parallelism().map_or(8, |n| n.get()).max(1);
-            ui.add(DragValue::new(&mut cfg.jitv2.threads).range(1..=max))
-                .tip(t!("config-jit-threads-tip"));
-            ui.end_row();
-            ui.label(t!("config-jit-cache"));
-            ui.checkbox(&mut cfg.jitv2.cache, "")
-                .tip(t!("config-jit-cache-tip"));
-            ui.end_row();
-            ui.label(t!("config-jit-cache-dir"));
-            ui.add(TextEdit::singleline(&mut cfg.jitv2.cache_dir)
-                .hint_text(t!("config-jit-cache-dir-hint"))
-                .desired_width(280.0));
-            ui.end_row();
-        });
-    }
+    // jitv2's compile pool and its persistent code cache live on the Performance
+    // tab, with the rest of the host-cost knobs.
     ui.separator();
 
     if octane {
@@ -376,22 +386,24 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         // is discoverable instead of "delete the text by hand". Disabled when
         // already empty, so the confirm prompt only ever appears when a custom
         // PROM is selected.
-        // The Octane has no built-in PROM: it needs the IP30 PROM image.
-        if !octane {
-        ui.label("");
-        ui.horizontal(|ui| {
-            let custom = !cfg.prom.is_empty();
-            if ui.add_enabled(custom, egui::Button::new(t!("config-prom-builtin")))
-                .tip(t!("config-prom-builtin-tip"))
-                .clicked()
-            {
-                action = ConfigAction::RequestEmbeddedProm;
-            }
-            if !custom {
-                ui.label(RichText::new(t!("config-prom-builtin-active")).weak());
-            }
-        });
-        ui.end_row();
+        // Neither the Octane nor the O2 has a built-in PROM: the Octane needs
+        // the IP30 flash image and the O2 an IP32 one, so there is nothing to
+        // fall back to and the button would only strand the user.
+        if !octane && !o2 {
+            ui.label("");
+            ui.horizontal(|ui| {
+                let custom = !cfg.prom.is_empty();
+                if ui.add_enabled(custom, egui::Button::new(t!("config-prom-builtin")))
+                    .tip(t!("config-prom-builtin-tip"))
+                    .clicked()
+                {
+                    action = ConfigAction::RequestEmbeddedProm;
+                }
+                if !custom {
+                    ui.label(RichText::new(t!("config-prom-builtin-active")).weak());
+                }
+            });
+            ui.end_row();
         }
 
         ui.label(t!("config-nvram"));
@@ -405,7 +417,9 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             path_row(ui, "octane_flash", &mut flash, Pick::SaveFile, &nvram_filters());
             cfg.octane.flash = if flash.is_empty() { None } else { Some(flash) };
             ui.end_row();
-        } else {
+        } else if !o2 {
+            // The O2's NVRAM is its own PROM flash, already covered by `nvram`
+            // above; it has no separate motherboard EEPROM.
             ui.label(t!("config-nveeprom"))
                 .tip(t!("config-nveeprom-tip"));
             path_row(ui, "nveeprom", &mut cfg.nveeprom, Pick::SaveFile, &nvram_filters());
@@ -421,6 +435,33 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
 
     show_rtc_offset(ui, &mut cfg.rtc_offset, mem_ctx.running);
 
+    // `[o2]` — what only an O2 has. The rest of the machine is the shared keys
+    // handled above and on the other tabs.
+    if o2 {
+        ui.separator();
+        ui.label(RichText::new(t!("config-o2-section")).strong());
+        Grid::new("o2_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label(t!("config-o2-mouse"));
+            ui.checkbox(&mut cfg.o2.mouse, "")
+                .tip(t!("config-o2-mouse-tip"));
+            ui.end_row();
+            ui.label(t!("config-o2-control-port"));
+            let mut port = cfg.o2.control_port.unwrap_or(0) as i32;
+            if ui.add(DragValue::new(&mut port).range(0..=65535))
+                .tip(t!("config-o2-control-port-tip"))
+                .changed()
+            {
+                cfg.o2.control_port = if port == 0 { None } else { Some(port as u16) };
+            }
+            ui.end_row();
+            ui.label(t!("config-o2-arcs-fpu"));
+            ui.checkbox(&mut cfg.o2.arcs_fpu, "")
+                .tip(t!("config-o2-arcs-fpu-tip"));
+            ui.end_row();
+        });
+        subtitle(ui, t!("config-o2-section-subtitle"));
+    }
+
     // N64 development board (Ultra64). A single runtime toggle — the GIO device
     // and POSIX shm bridge (/iris_n64_bridge) are only created when this is on,
     // read once at VM start. The toggle is never shown in App Store builds:
@@ -428,8 +469,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     // process it talks to.
     #[cfg(not(feature = "appstore"))]
     {
-
-    ui.separator();
+        ui.separator();
         ui.checkbox(&mut cfg.ultra64.enabled, t!("config-ultra64"))
             .tip(t!("config-ultra64-tip"));
         subtitle(ui, t!("config-autosave-subtitle"));
@@ -629,8 +669,41 @@ fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bo
 }
 
 /// What switching a machine to the Octane changes so it passes `validate()`:
-/// the R10000, a valid bank layout (bank 0 filled, 64 to 512 MB, no gaps)
+/// the R10000, a valid bank layout (bank 0 filled, 64 MB to 2 GB, no gaps)
 /// and a graphics board it models.
+/// What switching to the O2 has to fix before the machine will start. Called
+/// once, on the frame the profile changes — not every frame, or it would fight
+/// the user's own edits on the Memory tab.
+///
+/// `validate()` rejects an R4400 on an O2 and any bank layout that is not
+/// DIMM-pair kits of 32/64/128/256 MB filled from pair A, so a config that was
+/// an Indy a moment ago carries both.
+fn o2_defaults(cfg: &mut MachineConfig) {
+    if !cfg.machine.profile.cpus().contains(&cfg.machine.cpu) {
+        cfg.machine.cpu = CpuModel::R5000;
+    }
+    // CP0 Count is half the CPU clock here (90 MHz), and a clock carried over
+    // from the Indy (33 MHz) would make IRIX's clock run at the wrong rate.
+    // Unset it so the O2's own default applies.
+    cfg.clock.fixed_mhz = None;
+    // Kits only, filled from pair A. Judge the layout by the core's own rules
+    // rather than restating them here, so the two cannot drift.
+    let pairs = &cfg.banks[..MachineProfile::O2Ip32.memory_banks()];
+    let kits: Vec<u32> = pairs.iter().copied().take_while(|&b| b != 0).collect();
+    let valid = !kits.is_empty()
+        && pairs.iter().skip(kits.len()).all(|&b| b == 0)
+        && iris::dev::crime_mem::check_kits(&kits).is_ok();
+    if !valid {
+        let total: u32 = pairs.iter().sum();
+        cfg.banks = crate::ram::o2_kits_for(total);
+    }
+    if !cfg.graphics_board().supports(MachineProfile::O2Ip32) {
+        cfg.graphics.board = None;
+    }
+    cfg.graphics.heads = 1;
+    cfg.graphics.resolution = NewportResolution::Guest;
+}
+
 fn octane_defaults(cfg: &mut MachineConfig) {
     cfg.machine.cpu = CpuModel::R10000;
     let sizes = MachineProfile::OctaneIp30.bank_sizes();
@@ -639,7 +712,7 @@ fn octane_defaults(cfg: &mut MachineConfig) {
     let valid = filled > 0 && banks[filled..].iter().all(|&b| b == 0) && banks.iter().all(|b| sizes.contains(b));
     if !valid {
         let total: u32 = banks.iter().sum();
-        cfg.banks = crate::dialogs::new_machine::distribute_ram(total.clamp(64, 2048), MachineProfile::OctaneIp30);
+        cfg.banks = crate::dialogs::new_machine::distribute_ram(total.clamp(64, 8192), MachineProfile::OctaneIp30);
     }
     if !cfg.graphics_board().supports(MachineProfile::OctaneIp30) {
         cfg.graphics.board = None;
@@ -716,6 +789,8 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
     ui.label(t!("config-ram-banks"));
     subtitle(ui, if profile == MachineProfile::OctaneIp30 {
         t!("config-ram-banks-octane-subtitle")
+    } else if profile == MachineProfile::O2Ip32 {
+        t!("ram-bank-o2-sizes")
     } else if profile == MachineProfile::Indigo2Ip28 {
         t!("config-ram-banks-ip28-subtitle")
     } else {
@@ -1910,11 +1985,26 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     });
     ui.monospace("cargo build --release --bin iris --features lightning,rex-jit,idle-pause");
     ui.monospace("cargo build -p iris-gui --release --features premiere");
+    action
+}
+
+/// Host performance: where the emulator's threads run, how many processors the
+/// machine has, the JIT's compile pool, and the built-in VNC server.
+///
+/// These are the knobs that matter on a small host (a two-core laptop, a
+/// mini PC), so they live in one place rather than being scattered across the
+/// General, Display and Debug tabs. Nothing here changes what the guest sees;
+/// it changes how much of the host the emulator costs.
+fn show_performance(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
+    ui.heading(t!("config-tab-performance"));
+    subtitle(ui, t!("config-perf-subtitle"));
+
     ui.separator();
-    ui.heading(t!("config-perf"));
+    ui.label(RichText::new(t!("config-perf-threads")).strong());
     Grid::new("perf_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label(t!("config-perf-affinity"));
-        ui.checkbox(&mut cfg.perf.thread_affinity, "");
+        ui.checkbox(&mut cfg.perf.thread_affinity, "")
+            .tip(t!("config-perf-affinity-tip"));
         ui.end_row();
         ui.label(t!("config-perf-cpu-core"));
         let mut cpu = cfg.perf.cpu_core.unwrap_or(0) as i32;
@@ -1935,7 +2025,75 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         }
         ui.end_row();
     });
-    action
+    subtitle(ui, t!("config-perf-affinity-subtitle"));
+
+    ui.separator();
+    ui.label(RichText::new(t!("config-perf-cpu-count")).strong());
+    let octane = cfg.machine.profile == MachineProfile::OctaneIp30;
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(octane, |ui| {
+            ComboBox::from_id_salt("machine_cpus")
+                .selected_text(format!("{}", cfg.machine.cpus))
+                .show_ui(ui, |ui| {
+                    for n in [1u8, 2] {
+                        ui.selectable_value(&mut cfg.machine.cpus, n, format!("{n}"));
+                    }
+                });
+        });
+        if !octane {
+            ui.label(RichText::new(t!("config-perf-cpus-octane-only")).weak());
+        }
+    });
+    subtitle(ui, t!("config-perf-cpus-subtitle"));
+
+    if build_features::JITV2 {
+        ui.separator();
+        ui.label(RichText::new(t!("config-perf-jit")).strong());
+        Grid::new("perf_jit_grid").num_columns(2).striped(true).show(ui, |ui| {
+            let max = std::thread::available_parallelism().map_or(8, |n| n.get()).max(1);
+            ui.label(t!("config-jit-threads"));
+            ui.add(DragValue::new(&mut cfg.jitv2.threads).range(1..=max))
+                .tip(t!("config-jit-threads-tip"));
+            ui.end_row();
+            ui.label(t!("config-jit-cache"));
+            ui.checkbox(&mut cfg.jitv2.cache, "")
+                .tip(t!("config-jit-cache-tip"));
+            ui.end_row();
+            ui.label(t!("config-jit-cache-dir"));
+            ui.add(TextEdit::singleline(&mut cfg.jitv2.cache_dir)
+                .hint_text(t!("config-jit-cache-dir-hint"))
+                .desired_width(280.0));
+            ui.end_row();
+        });
+        subtitle(ui, t!("config-perf-jit-subtitle"));
+    }
+
+    ui.separator();
+    ui.label(RichText::new(t!("config-perf-vnc")).strong());
+    Grid::new("perf_vnc_grid").num_columns(2).striped(true).show(ui, |ui| {
+        ui.label(t!("config-vnc-listen"));
+        let mut listen = cfg.vnc.listen.clone().unwrap_or_default();
+        let resp = ui.add(TextEdit::singleline(&mut listen)
+            .hint_text(t!("config-vnc-listen-hint"))
+            .desired_width(200.0))
+            .tip(t!("config-vnc-listen-tip"));
+        if resp.changed() {
+            cfg.vnc.listen = if listen.trim().is_empty() { None } else { Some(listen.trim().to_string()) };
+        }
+        ui.end_row();
+        ui.label(t!("config-vnc-max-fps"));
+        let mut fps = cfg.vnc.max_fps.unwrap_or(30) as i32;
+        if ui.add(DragValue::new(&mut fps).range(1..=60))
+            .tip(t!("config-vnc-max-fps-tip"))
+            .changed()
+        {
+            cfg.vnc.max_fps = Some(fps.max(1) as u32);
+        }
+        ui.end_row();
+    });
+    subtitle(ui, t!("config-perf-vnc-subtitle"));
+
+    ConfigAction::None
 }
 
 /// Perfetto trace recording (`iris::perfetto`), the GUI's `--perfetto` and

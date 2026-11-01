@@ -7,11 +7,12 @@
 //! - a service thread keeps the devices' interrupts current in CRIME and
 //!   CRIME's in the CPU's IP2, runs the MACE clock from the host clock, and
 //!   ends the run when the guest switches the machine off;
-//! - a batch hook on the CPU thread hands the cache over with where the
-//!   guest is running: the full model holds data until POST has finished
-//!   (the PROM keeps its stack in it while it tests memory), the shadow model
-//!   runs everything after, and POST starting over (a reboot) hands back.
-//!   Both CPUs do this ([`HandoverCache`]).
+//! - a batch hook on the CPU thread lends the firmware the FPU, when
+//!   `arcs_fpu` asks for it, with where the guest is running.
+//!
+//! Both CPUs run on the shadow cache from reset: the JIT reaches RAM through
+//! the ppmem window with no tag probe, LRU or dirty bit on any load or store.
+//! The stack POST keeps in cache tags is [`O2Memory`]'s business.
 //!
 //! The screen is GBE scanned out of RAM by [`O2Display`], presented through
 //! the same renderer the other machines use; keys from the window go to the
@@ -26,8 +27,8 @@ use parking_lot::Mutex;
 use crate::config::{CpuModel, MachineConfig};
 use crate::cpu::mips_core::CyclesPtr;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
+use crate::cpu::mips_cache_shadow::{R10000O2ShadowCache, R5000ShadowCache};
 use crate::cpu::mips_cache_v2::MipsCache;
-use crate::ip32_handover::{HandoverCache, R10000Handover, R5000Handover};
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::crime_mem::O2Memory;
 use crate::dev::ng1::rex3::Renderer;
@@ -49,24 +50,6 @@ fn in_loaded_firmware(pc: u32) -> bool {
 /// Whether `pc` is inside the PROM or its firmware copied into RAM.
 fn in_firmware(pc: u32) -> bool {
     PROM_VA.contains(&pc) || in_loaded_firmware(pc)
-}
-
-/// The kernel takes over (`true`): hand over to the shadow model. The PROM
-/// starts again (`false`): back to the full model. True if the model changed.
-fn switch_model<F, S>(c: &HandoverCache<F, S>, kernel: bool) -> bool
-where
-    F: MipsCache,
-    S: MipsCache,
-{
-    if kernel && !c.on_shadow() {
-        c.hand_over();
-        true
-    } else if !kernel && c.on_shadow() {
-        c.hand_back();
-        true
-    } else {
-        false
-    }
 }
 
 /// Where the batch hook is in the machine's boot, shared with the machine so
@@ -120,6 +103,8 @@ fn put_bank_words(store: &crate::chunk_store::ChunkStore, ram: &crate::dev::crim
 }
 
 pub struct O2Machine {
+    /// Where this machine has memory.
+    pub memory: Arc<crate::memory_map::MemoryMap>,
     pub bus: Arc<Ip32Bus>,
     cpu: Arc<dyn CpuDevice>,
     timer_manager: Arc<TimerManager>,
@@ -132,10 +117,12 @@ pub struct O2Machine {
     monitor_port: u16,
     /// The console UART's in-process host end in CI mode (`--ci`), which the
     /// CI socket types into and reads.
-    ci_serial: Option<Arc<crate::dev::z85c30::CiSerialBackend>>,
+    ci_serial: Option<Arc<crate::dev::serial_host::CiSerialBackend>>,
     /// The NAT's controls and the addresses it hands the guest (client,
     /// gateway, netmask), when the Ethernet is plugged in.
     nat: Option<(Arc<crate::net::NatControl>, (std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr))>,
+    /// Guest frames the network backend has processed.
+    frames: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// The guest switching the machine off, for the machine-events thread.
     events: std::sync::mpsc::SyncSender<MachineEvent>,
     event_rx: Option<std::sync::mpsc::Receiver<MachineEvent>>,
@@ -193,8 +180,16 @@ impl O2Machine {
             Some(mac) => Some(crate::config::parse_mac(mac).map_err(|e| format!("network.mac: {e}"))?),
             None => None,
         };
+        // The SCSI devices, from the same `[scsi.N]` tables as the other
+        // machines; `controller` is the bus (0 internal, 1 external). The
+        // buses are filled before the controllers exist.
+        let scsi = [crate::dev::aic7880::Aic7880::new_bus(), crate::dev::aic7880::Aic7880::new_bus()];
+        let attached = crate::scsi::attach_from_config(cfg, Some("ip32"), &|c| {
+            scsi.get(c as usize)
+                .ok_or_else(|| format!("controller {c} (an O2 has controllers 0 and 1)"))
+        })?;
         let opts = Ip32Options {
-            scsi: true,
+            scsi: Some(scsi),
             flash_file: Some(cfg.nvram.clone().into()),
             keyboard: (!cfg.headless).then_some(o2.mouse),
             mac,
@@ -204,55 +199,10 @@ impl O2Machine {
         if !cfg.no_audio {
             bus.mace.audio.enable_output(cfg.audio.clone());
         }
-        // The SCSI devices, from the same `[scsi.N]` tables as the other
-        // machines; `controller` is the bus (0 internal, 1 external).
-        let mut scratch_path: Option<std::path::PathBuf> = None;
-        {
-            let ctls = bus.scsi.lock().unwrap();
-            let mut ids: Vec<u8> = cfg.scsi.keys().copied().collect();
-            ids.sort();
-            for key in ids {
-                let dev = &cfg.scsi[&key];
-                let (controller, id) = dev.placement(key);
-                let at = crate::config::scsi_label(controller, id);
-                if dev.is_daynaport() {
-                    return Err(format!("{at}: kind = \"daynaport\" is not available on the O2"));
-                }
-                if let Some(path) = dev.prepare_scratch(key) {
-                    if scratch_path.is_some() {
-                        println!("Note: multiple scratch SCSI devices configured; CI socket will use the lowest-id one");
-                    } else {
-                        scratch_path = Some(path);
-                    }
-                }
-                let ctl = ctls.get(controller as usize).ok_or_else(|| {
-                    format!("{at}: controller {controller} (an O2 has controllers 0 and 1)")
-                })?;
-                let (path, discs) = dev.media();
-                let cdrom = dev.is_cdrom();
-                // CI mode keeps each copy-on-write overlay under /tmp, as the
-                // Indy does, so an interactive iris holding PATH.overlay and
-                // any number of CI runs can share the image.
-                let ci_overlay = (cfg.ci && dev.overlay && !cdrom).then(|| crate::config::ScsiDeviceConfig::ci_overlay_path(key));
-                match ctl.attach_device(id, &path, cdrom, discs, dev.overlay, ci_overlay.as_deref()) {
-                    Ok(_) if path.is_empty() => eprintln!("ip32: {at}: CD-ROM, tray empty"),
-                    Ok(blocks) => eprintln!("ip32: {at}: {path} ({blocks} blocks)"),
-                    Err(e) => {
-                        // As on the Indy: a configured disk that will not attach
-                        // ends a command-line run, since booting on without it
-                        // only yields a confusing PROM "no such device" later;
-                        // an embedder (the GUI sets IRIS_NO_EXIT_ON_POWEROFF)
-                        // boots without the device instead.
-                        let msg = format!("could not attach {path} to {at}: {e}");
-                        if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
-                            eprintln!("iris: warning: {msg}; continuing without {at}");
-                        } else {
-                            return Err(msg);
-                        }
-                    }
-                }
-            }
+        if let Some(d) = attached.daynaports.first() {
+            return Err(format!("{}: kind = \"daynaport\" is not available on the O2", crate::config::scsi_label(d.controller, d.id)));
         }
+        let scratch_path = attached.scratch;
         eprintln!(
             "iris: O2 with {} MB ({}), {}",
             kits.iter().sum::<u32>(),
@@ -263,61 +213,21 @@ impl O2Machine {
         // the CI socket types into, otherwise TCP on `serial_port_a` (as the
         // Indy's channel A), either teed to `serial_log` when one is set. The
         // second port serves TCP on `serial_port_b`.
-        let [port_a, port_b] = cfg.serial_ports();
-        let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::z85c30::CiSerialBackend::new()));
-        if let Some(ci) = &ci_serial {
-            if let Some(path) = cfg.serial_log.as_deref() {
-                match crate::dev::serial_log::SerialLog::create(
-                    std::path::Path::new(path),
-                    cfg.serial_log_timestamps,
-                ) {
-                    Ok(log) => {
-                        ci.set_log(log);
-                        eprintln!("iris: O2 serial console mirroring to {path}");
-                    }
-                    Err(e) => eprintln!("iris: O2 serial log {path}: {e}"),
-                }
-            }
-            bus.mace.com0.set_backend(ci.clone());
-        } else {
-            let mut backend = crate::dev::z85c30::null_serial_backend();
-            match crate::dev::z85c30::tcp_serial_backend(port_a) {
-                Some((b, p)) => {
-                    eprintln!("iris: O2 serial port 1 on 127.0.0.1:{p}");
-                    backend = b;
-                }
-                None => eprintln!("iris: O2 serial port 1: port {port_a} unavailable; is another iris using it? (serial_port_a)"),
-            }
-            if let Some(path) = &cfg.serial_log {
-                // A fresh log each boot, as the O2 has always kept it: scripts
-                // look at its tail for this boot's prompts.
-                match crate::dev::serial_log::SerialLog::create(
-                    std::path::Path::new(path),
-                    cfg.serial_log_timestamps,
-                ) {
-                    Ok(log) => {
-                        backend = Arc::new(crate::dev::z85c30::TeeBackend::new(backend.clone(), log));
-                    }
-                    Err(e) => eprintln!("iris: O2 serial log {path}: {e}"),
-                }
-            }
-            bus.mace.com0.set_backend(backend);
-        }
-        match crate::dev::z85c30::tcp_serial_backend(port_b) {
-            Some((b, p)) => {
-                eprintln!("iris: O2 serial port 2 on 127.0.0.1:{p}");
-                bus.mace.com1.set_backend(b);
-            }
-            None => eprintln!("iris: O2 serial port 2: port {port_b} unavailable; is another iris using it? (serial_port_b)"),
+        let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
+        let (console, second) = crate::dev::serial_host::console_backends(cfg, "O2", ci_serial.as_ref());
+        bus.mace.com0.set_backend(console);
+        if let Some(b) = second {
+            bus.mace.com1.set_backend(b);
         }
         // The Ethernet on the NAT gateway `[network]` describes (`mode =
         // "off"` leaves it unplugged; validate refuses pcap here for now).
-        let mut nat = None;
-        if cfg.network.mode != crate::config::NetMode::Off {
-            let net = crate::net::GatewayConfig::from_network(&cfg.network());
+        let (mut nat, mut frames) = (None, None);
+        let net = crate::net::GatewayConfig::from_network(&cfg.network());
+        if let Some(link) = crate::net::Link::with_gateway(net.clone())? {
             eprintln!("iris: O2 Ethernet on NAT: gateway {}, guest {} (DHCP)", net.gateway_ip, net.client_ip);
-            let addrs = (net.client_ip, net.gateway_ip, net.netmask);
-            nat = Some((bus.mace.mec.start_nat(net), addrs));
+            frames = Some(link.frames());
+            nat = Some((link.nat(), (net.client_ip, net.gateway_ip, net.netmask)));
+            bus.mace.mec.attach(link);
         }
 
         let timer_manager = Arc::new(TimerManager::new());
@@ -328,37 +238,12 @@ impl O2Machine {
         let count_mhz = cfg.clock.fixed_mhz.unwrap_or(O2_COUNT_MHZ);
         let cpu_mhz = (count_mhz * 2.0).round().max(1.0) as u32;
         let boot = Arc::new(BootState::new());
+        let memory = Arc::new(crate::ip32::memory_map());
         let cpu: Arc<dyn CpuDevice> = match cfg.machine.cpu {
-            // The full cache model through the PROM and the tagless shadow
-            // model once the kernel is in charge: the JIT then reaches RAM
-            // through the ppmem window with no tag probe, LRU or dirty bit on
-            // every load and store (memory-bound code ran 2.5-4x slower than on
-            // IP28 with the full model).
-            CpuModel::R10000 => Self::build_cpu::<R10000Handover>(sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), switch_model, HandoverCache::take_reset_seen),
-            CpuModel::R5000 => Self::build_cpu::<R5000Handover>(sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), switch_model, HandoverCache::take_reset_seen),
+            CpuModel::R10000 => Self::build_cpu::<R10000O2ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
+            CpuModel::R5000 => Self::build_cpu::<R5000ShadowCache>(memory.clone(), sysad, &timer_manager, arcs_fpu, cpu_mhz, boot.clone(), bus.ram.clone()),
             CpuModel::R4400 => return Err("an O2 has an R5000 or an R10000 ([machine] cpu)".into()),
         };
-
-        #[cfg(feature = "jitv2")]
-        {
-            let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
-            let jit = cpu.jitv2();
-            let mut g = jit.lock();
-            g.compile_queue.set_thread_count(cfg.jitv2.threads.max(1));
-            g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
-            g.compile_queue.set_owner(Arc::downgrade(&jit));
-            // Not under lockstep, as on the other machines: lockstep compiles
-            // inline on the CPU thread, and a running pool both owns the
-            // Codegen inline needs and deadlocks the CPU thread's flush (its
-            // join waits on workers parked on the Jitv2 lock it holds).
-            #[cfg(not(feature = "jitv2_lockstep"))]
-            {
-                let stats = g.stats.clone();
-                g.compile_queue.start(bus.phys.clone() as Arc<dyn BusDevice>, stats);
-            }
-            // The compile pool keeps only a weak handle on the CPU.
-            std::mem::forget(cpu_device);
-        }
 
         // ppmem: the CPU's cache and the JIT reach RAM through the memory's
         // window, publishing the mapped bitmap into the CPU's own fields, as
@@ -381,6 +266,30 @@ impl O2Machine {
             bus.phys.resync_ppmem_bitmap();
         }
 
+        // After the windows above: each compile worker takes the cache's
+        // geometry once, as it starts, and without the windows that geometry
+        // has no inline load or store path.
+        #[cfg(feature = "jitv2")]
+        {
+            let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
+            let jit = cpu.jitv2();
+            let mut g = jit.lock();
+            g.compile_queue.set_thread_count(cfg.jitv2.threads.max(1));
+            g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
+            g.compile_queue.set_owner(Arc::downgrade(&jit));
+            // Not under lockstep, as on the other machines: lockstep compiles
+            // inline on the CPU thread, and a running pool both owns the
+            // Codegen inline needs and deadlocks the CPU thread's flush (its
+            // join waits on workers parked on the Jitv2 lock it holds).
+            #[cfg(not(feature = "jitv2_lockstep"))]
+            {
+                let stats = g.stats.clone();
+                g.compile_queue.start(bus.phys.clone() as Arc<dyn BusDevice>, stats);
+            }
+            // The compile pool keeps only a weak handle on the CPU.
+            std::mem::forget(cpu_device);
+        }
+
         // CRIME's output is the CPU's IP2, pushed the moment it changes.
         bus.mace.ust.use_host_clock();
         bus.connect_cpu_irq(crate::irq::IrqLine::new(Arc::new(CpuIrq(cpu.clone().as_device())), 2));
@@ -390,7 +299,10 @@ impl O2Machine {
         // its interface buffer.
         bus.crime.re.start(bus.clone(), |b: &Ip32Bus| &b.crime.re);
         let running = Arc::new(AtomicBool::new(false));
-        let display = Arc::new(O2Display::new(bus.clone(), cpu.cycles_ptr(), cpu.fasttick_count(), running.clone()));
+        let status = crate::disp::StatusSource::new(bus.mace.id.heartbeat.clone(), cpu.fasttick_count());
+        status.set_cpu_cycles(cpu.cycles_ptr());
+        status.set_count_hz(cpu.count_hz_atomic());
+        let display = Arc::new(O2Display::new(bus.clone(), status, running.clone()));
         if let Some(port) = o2.control_port {
             match std::net::TcpListener::bind(("127.0.0.1", port)) {
                 Ok(l) => {
@@ -405,7 +317,7 @@ impl O2Machine {
         // commands (registers, breakpoints, memory) and the O2's devices'.
         let monitor = crate::monitor::Monitor::new();
         monitor.register_device(crate::devlog::init_devlog());
-        monitor.register_device(cpu.clone().as_device());
+        monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(vec![cpu.clone()])));
         monitor.register_device(bus.clone());
         // `phys`: the physical bus's decode table, memory and traces.
         monitor.register_device(bus.phys.clone());
@@ -423,18 +335,12 @@ impl O2Machine {
 
         let (events, event_rx) = std::sync::mpsc::sync_channel(4);
         // A snapshot's disks by slot (controller * 16 + id) and size.
-        let mut disks: Vec<crate::snapshot::DiskRef> = cfg
-            .scsi
-            .iter()
-            .filter(|(_, d)| !d.is_cdrom())
-            .map(|(&key, d)| crate::snapshot::DiskRef {
-                id: { let (c, id) = d.placement(key); crate::config::scsi_slot(c, id) },
-                path: d.path.clone(),
-                size_bytes: std::fs::metadata(&d.path).map(|m| m.len()).unwrap_or(0),
-            })
+        let disks: Vec<crate::snapshot::DiskRef> = attached.tables.iter()
+            .filter(|t| !t.is_cdrom)
+            .map(|t| crate::snapshot::DiskRef { id: t.slot, path: t.path.clone(), size_bytes: t.size_bytes })
             .collect();
-        disks.sort_by_key(|d| d.id);
         Ok(Self {
+            memory,
             bus,
             cpu,
             timer_manager,
@@ -445,6 +351,7 @@ impl O2Machine {
             monitor_port,
             ci_serial,
             nat,
+            frames,
             events,
             event_rx: Some(event_rx),
             controller_up: Arc::new(AtomicBool::new(false)),
@@ -458,19 +365,16 @@ impl O2Machine {
         })
     }
 
-    /// `kernel_mode(cache, in_kernel)` switches the cache model on leaving the
-    /// firmware for the kernel (true) and on a PROM starting over (false),
-    /// returning whether it changed, so the JIT's memory pointers are
-    /// re-published. `reset_seen(cache)` says the PROM has started over.
-    fn build_cpu<C>(sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32, boot: Arc<BootState>,
-                    kernel_mode: fn(&C, bool) -> bool, reset_seen: fn(&C) -> bool) -> Arc<dyn CpuDevice>
+    fn build_cpu<C>(memory: Arc<crate::memory_map::MemoryMap>, sysad: Arc<dyn BusDevice>, tm: &Arc<TimerManager>, arcs_fpu: bool, mhz: u32, boot: Arc<BootState>,
+                    ram: Arc<O2Memory>) -> Arc<dyn CpuDevice>
     where
-        C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>> + 'static,
+        C: crate::cpu::mips_cache_v2::CpuModel + MipsCache + From<Arc<dyn BusDevice>> + 'static,
         MipsCpu<MipsTlb, C>: CpuDevice,
     {
-        let cfg = MipsCpuConfig::for_model::<C>();
+        let cfg = MipsCpuConfig::for_model::<C>(memory);
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, C> = MipsExecutor::new(sysad, tlb, &cfg);
+        exec.cache.set_pd_tag_store_hook(Box::new(move |tag| ram.stack_tag_store(tag)));
         exec.core.set_timer_manager(tm.clone());
         // Count runs at half the pipeline clock on both CPUs.
         exec.core.set_count_hz(mhz.max(1) as u64 * 500_000);
@@ -507,30 +411,9 @@ impl O2Machine {
                     return;
                 }
             }
-            // The boot PROM starting again (a reboot): the full model, so POST
-            // has a cache that holds its stack. POST initialising the cache
-            // tags says so (`take_reset_seen`), not the PC: `sash` and the
-            // IRIX kernel call into the PROM's own code, which is no reboot,
-            // and IRIX reboots by jumping into the PROM, which a batch
-            // boundary need not catch at the reset vector.
-            if reset_seen(&exec.cache) && kernel_mode(&exec.cache, false) {
-                eprintln!("iris: O2 cache: full model again (PC {pc:#010x}, ra {:#010x})", exec.core.gpr[31] as u32);
-                // Not back to waiting for POST: the PROM's cache routine
-                // (`sash` calls it before starting a kernel) sets the tags too,
-                // and the next code outside the firmware hands over again.
-                boot.inside.store(true, Ordering::Relaxed);
-                #[cfg(feature = "jitv2")]
-                exec.install_jit_mem_ptrs();
-                return;
-            }
             let fw = in_firmware(pc);
             if fw != boot.inside.load(Ordering::Relaxed) {
                 boot.inside.store(fw, Ordering::Relaxed);
-                if !fw && kernel_mode(&exec.cache, true) {
-                    eprintln!("iris: O2 cache: shadow model from PC {pc:#010x}");
-                    #[cfg(feature = "jitv2")]
-                    exec.install_jit_mem_ptrs();
-                }
                 if arcs_fpu {
                     const CU1: u32 = 1 << 29;
                     if fw {
@@ -636,7 +519,9 @@ impl O2Machine {
                     return;
                 }
                 running.store(false, Ordering::SeqCst);
-                std::process::exit(0);
+                crate::workstation::exit_process("power-off", 0, || {
+                    crate::workstation::flushed(bus.flush_disks(), "power-off")
+                });
             }
             std::thread::sleep(poll);
         }
@@ -661,6 +546,11 @@ impl O2Machine {
             eprintln!("iris: O2 stopped with rendering engine writes still queued");
         }
         self.bus.save_flash();
+        // Not through the display: this stop leaves the guest's writes durable
+        // whatever follows it.
+        if let Err(e) = self.bus.flush_disks() {
+            eprintln!("iris: disk flush at stop failed: {e} (guest writes may be lost)");
+        }
         // A machine that was never started has nothing to halt.
         if self.lifecycle != crate::machine_state::GuestState::Idle {
             self.lifecycle = crate::machine_state::GuestState::Halted;
@@ -767,6 +657,12 @@ impl O2Machine {
         }
         if m.schema_version > SCHEMA_VERSION {
             return Err(format!("snapshot schema_version {} is newer than this iris build supports ({SCHEMA_VERSION})", m.schema_version));
+        }
+        if m.schema_version < SCHEMA_VERSION {
+            return Err(format!(
+                "snapshot {name} is schema {}; the O2's UART state changed shape in schema 5, so it cannot be restored",
+                m.schema_version
+            ));
         }
         // As the Indy: build, CPU and disks must match;
         // IRIS_SNAPSHOT_SKIP_CHECK=1 makes those warnings.
@@ -889,10 +785,12 @@ impl Drop for O2Machine {
         if let Some(slot) = self.controller_slot.take() {
             slot.lock().0 = MachineRef::null();
         }
+        self.display.display_stop.request();
         self.running.store(false, Ordering::SeqCst);
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
+        crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
     }
 }
@@ -924,7 +822,7 @@ impl Workstation for O2Machine {
     fn get_timer_manager(&self) -> Arc<TimerManager> { O2Machine::get_timer_manager(self) }
     fn get_cpu_debug(&self) -> Arc<dyn crate::gdb_stub::CpuDebug> { self.cpu.clone().debug_adapter() }
     fn fasttick_count(&self) -> Arc<std::sync::atomic::AtomicU64> { self.cpu.fasttick_count() }
-    fn get_ci_serial(&self) -> Option<Arc<crate::dev::z85c30::CiSerialBackend>> { self.ci_serial.clone() }
+    fn get_ci_serial(&self) -> Option<Arc<crate::dev::serial_host::CiSerialBackend>> { self.ci_serial.clone() }
     /// Typed at serial port 1, the console with `graphics = false`.
     fn inject_serial_console(&self, bytes: &[u8]) {
         match &self.ci_serial {
@@ -944,6 +842,26 @@ impl Workstation for O2Machine {
         self.bus.scsi.lock().unwrap().first().map(|c| c.clone() as Arc<dyn crate::workstation::DiscChanger>)
     }
 
+    fn pending_chd_sync_count(&self) -> usize {
+        self.bus.scsi.lock().unwrap().iter().map(|c| c.bus().pending_chd_sync_count()).sum()
+    }
+    fn flush_disks(&self) -> std::io::Result<()> {
+        self.bus.flush_disks()
+    }
+    fn sync_chd_disks(
+        &self,
+        only: Option<usize>,
+        progress: &mut dyn FnMut(usize, usize, f32),
+        cancel: &dyn Fn() -> bool,
+    ) -> std::io::Result<usize> {
+        let controllers = self.bus.scsi.lock().unwrap().clone();
+        let buses: Vec<_> = controllers.iter().map(|c| c.bus()).collect();
+        crate::scsi::ScsiBus::sync_chd_disks(&buses, only, progress, cancel)
+    }
+
+    fn net_frames(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        self.frames.clone()
+    }
     fn nat_control(&self) -> Option<Arc<crate::net::NatControl>> {
         self.nat.as_ref().map(|(n, _)| n.clone())
     }
@@ -957,24 +875,25 @@ impl Workstation for O2Machine {
 pub struct O2Display {
     bus: Arc<Ip32Bus>,
     renderer: Mutex<Option<Box<dyn Renderer>>>,
+    display_stop: crate::gfx_display::DisplayStop,
     screen: Mutex<Rex3Screen>,
     screenshot_pending: AtomicBool,
-    cycles: CyclesPtr,
-    /// The CPU's Compare-match count: IRIX's clock tick on the O2, which has
-    /// no 8254. The status bar's Hz.
-    ticks: Arc<std::sync::atomic::AtomicU64>,
+    /// The status bar's inputs; the heartbeat is the MACE ID chip's, and the
+    /// Hz is the CPU's Compare-match count (IRIX's clock tick on the O2,
+    /// which has no 8254).
+    status: Arc<crate::disp::StatusSource>,
     running: Arc<AtomicBool>,
 }
 
 impl O2Display {
-    fn new(bus: Arc<Ip32Bus>, cycles: CyclesPtr, ticks: Arc<std::sync::atomic::AtomicU64>, running: Arc<AtomicBool>) -> Self {
+    fn new(bus: Arc<Ip32Bus>, status: Arc<crate::disp::StatusSource>, running: Arc<AtomicBool>) -> Self {
         Self {
             bus,
             renderer: Mutex::new(None),
+            display_stop: Default::default(),
             screen: Mutex::new(Rex3Screen::new()),
             screenshot_pending: AtomicBool::new(false),
-            cycles,
-            ticks,
+            status,
             running,
         }
     }
@@ -1013,18 +932,7 @@ impl O2Display {
                 screen.height = h;
                 screen.status_bar_only = false;
                 let take_shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
-                let stats = crate::disp::BarStats {
-                    now: start,
-                    hb: 0,
-                    cycles: self.cycles.get(),
-                    fasttick: self.ticks.load(Ordering::Relaxed),
-                    decoded_delta: 0,
-                    l1i_hits: 0,
-                    l1i_fetches: 0,
-                    uncached: 0,
-                    count_hz: 0,
-                    gfifo_pending: 0,
-                };
+                let stats = self.status.snapshot(start, 0);
                 if let Some(r) = self.renderer.lock().as_mut() {
                     if (w, h) != size {
                         r.resize(w, h);
@@ -1047,15 +955,16 @@ impl O2Display {
                 std::thread::sleep(frame_time - spent);
             }
         }
-        if let Some(r) = self.renderer.lock().as_mut() {
-            r.stop();
-        }
+        self.display_stop.finish(&self.renderer);
     }
 }
 
 impl crate::gfx_display::GfxDisplay for O2Display {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> {
         &self.renderer
+    }
+    fn display_stop(&self) -> &crate::gfx_display::DisplayStop {
+        &self.display_stop
     }
     fn screen(&self) -> &Mutex<Rex3Screen> {
         &self.screen
@@ -1064,7 +973,7 @@ impl crate::gfx_display::GfxDisplay for O2Display {
         self.screenshot_pending.store(true, Ordering::Relaxed);
     }
     fn cycles(&self) -> CyclesPtr {
-        self.cycles.clone()
+        self.status.cycles()
     }
     fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
         let (x, y, mask) = self.bus.gbe.cursor()?;
@@ -1118,7 +1027,7 @@ impl Device for O2Control {
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("o2".to_string(), "O2 control: o2 shot PATH | status | pixel X Y | type TEXT | key|keydown|keyup NAME | \
             mouse DX DY [BUTTONS] | click [BUTTON] | pc | regs | peek ADDR LEN PATH | \
-            retrace PATH | scsi PATH | unmapped | ps2log PATH | crimelog PATH | nictrace PATH".to_string())]
+            retrace PATH | scsi PATH | unmapped | ps2log PATH | crimelog PATH".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
@@ -1171,16 +1080,6 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
         ),
         // `crimelog PATH`: the guest's recent CRIME interrupt-register
         // accesses, oldest first.
-        "nictrace" => {
-            let mut t = bus.mace.nic_trace.text();
-            for l in bus.mace.onewire.protocol_log() {
-                t.push_str(&format!("# {l}\n"));
-            }
-            match std::fs::write(arg.trim(), t) {
-                Ok(()) => "ok".into(),
-                Err(e) => format!("err {e}"),
-            }
-        }
         "crimelog" => match std::fs::write(arg.trim(), bus.crime.regs.irqlog_text()) {
             Ok(()) => "ok".into(),
             Err(e) => format!("err {e}"),

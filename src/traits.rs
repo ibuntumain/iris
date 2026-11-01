@@ -80,6 +80,13 @@ pub trait BusDevice: Send + Sync {
     fn read64 (&self, _addr: u64) -> BusRead64 { BusRead64::err() }
     fn write64(&self, _addr: u64, _val: u64) -> u32 { BUS_ERR }
 
+    /// Why a failed `size`-byte access at `addr` failed, in a few words, for
+    /// the CPU's bus-error line. Asked only after the access has already
+    /// failed; it never changes the status, the exception or any device
+    /// state. A device overrides it for a failure it can explain, such as a
+    /// probe of a card that is not there.
+    fn describe_fault(&self, _addr: u64, _size: usize) -> Option<String> { None }
+
     /// 64-bit access issued by a DMA engine (e.g. MC's VDMA), as opposed to
     /// CPU-driven PIO. Defaults to plain `read64`/`write64` — most devices don't
     /// distinguish. A device whose PIO protocol has GO-triggered side effects
@@ -193,6 +200,13 @@ pub trait BusDevice: Send + Sync {
         BUS_OK
     }
 
+    /// Atomically replace the aligned word at `addr` if it holds `old`: whether
+    /// it did, or `None` when this is not RAM and the caller stores as usual.
+    /// What a store-conditional does on a machine with several CPUs.
+    fn cas32(&self, _addr: u64, _old: u32, _new: u32) -> Option<bool> { None }
+    /// The doubleword form of [`Self::cas32`].
+    fn cas64(&self, _addr: u64, _old: u64, _new: u64) -> Option<bool> { None }
+
     /// Masked 64-bit write: only bytes where the corresponding mask byte is 0xFF are written.
     /// `addr` must be 8-byte aligned; `val` and `mask` are in big-endian (MIPS) byte order.
     /// Default: decompose into individual write8 calls for set bytes.
@@ -236,7 +250,6 @@ impl DmaStatus {
     pub const EOX:        u32 = 0x02; // end-of-chain: descriptor chain exhausted, channel deactivated
     pub const IRQ:        u32 = 0x04; // DMA interrupt raised (xie was set on EOX)
     pub const NOT_ACTIVE: u32 = 0x08; // transfer refused — channel not active
-    pub const ROWN:       u32 = 0x10; // write refused — ROWN=0, host owns descriptor
     pub const OVERFLOW:   u32 = 0x20; // byte count exhausted mid-transfer
 
     pub fn ok()          -> Self { Self(Self::OK) }
@@ -245,7 +258,7 @@ impl DmaStatus {
     pub fn eox(self)     -> bool { self.0 & Self::EOX        != 0 }
     pub fn irq(self)     -> bool { self.0 & Self::IRQ        != 0 }
     pub fn not_active(self) -> bool { self.0 & Self::NOT_ACTIVE != 0 }
-    pub fn refused(self) -> bool { self.0 & (Self::NOT_ACTIVE | Self::ROWN | Self::OVERFLOW) != 0 }
+    pub fn refused(self) -> bool { self.0 & (Self::NOT_ACTIVE | Self::OVERFLOW) != 0 }
 }
 
 impl std::ops::BitOr for DmaStatus {
@@ -257,19 +270,36 @@ impl std::ops::BitOrAssign for DmaStatus {
 }
 
 pub trait DmaClient: Send + Sync {
-    /// Returns (value, status, writeback).
-    /// writeback is an optional (addr, val16) memory write to be executed by the caller
-    /// under its own lock (e.g. SeeqState) for atomicity with state updates.
-    fn read(&self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)>;
-    /// Write a value to the DMA channel.
-    /// Returns (status, writeback) where writeback is an optional (addr, val16) memory write
-    /// to be executed by the caller under its own lock (e.g. SeeqState) for atomicity.
-    fn write(&self, val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>);
+    /// Read the next value from the DMA channel, with the channel's status.
+    fn read(&self) -> Option<(u32, DmaStatus)>;
+    /// Write a value to the DMA channel. Returns the channel's status.
+    fn write(&self, val: u32, eop: bool) -> DmaStatus;
     /// How far the device may read ahead of the guest: `Some(n)` when the
     /// guest is polling this channel's position and the device has read `n`
     /// words beyond the position the guest last saw (see HAL2's codec A).
     /// `None` when it is not being polled.
     fn read_ahead_of_poll(&self) -> Option<u64> { None }
+    /// The peripheral overran its side of the transfer (the SEEQ's receive
+    /// FIFO filled before the channel drained it). A channel that stops on
+    /// that condition stops here.
+    fn overflow(&self) {}
+    /// Whether a receive channel can take a frame now; see [`RxRoom`].
+    fn rx_room(&self) -> RxRoom { RxRoom::Room }
+}
+
+/// What a receive channel can take now. The emulator's host side uses it to
+/// hold frames off the virtual wire rather than lose them, which is a choice
+/// of the model, not hardware behaviour (see the SEEQ's receive hold).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RxRoom {
+    /// A frame now lands in a descriptor and the channel carries on.
+    Room,
+    /// The channel is stopped: a frame now is lost, as on the wire. The hold
+    /// does not wait for it.
+    Stopped,
+    /// A frame now fills the descriptor that ends the chain, stopping the
+    /// channel, while the driver still has filled descriptors to reap.
+    Last,
 }
 
 /// Asynchronous system-level events sent from devices to the machine event loop.

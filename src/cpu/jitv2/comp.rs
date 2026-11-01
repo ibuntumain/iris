@@ -127,7 +127,7 @@ fn prepare_multi_entry_compile(
     #[cfg(feature = "developer")] stats: &crate::cpu::jitv2::JitStats,
 ) -> PrepareOutcome {
     let page = unsafe { &*req.page };
-    let phys_base = page.pfn * PAGE_SIZE;
+    let phys_base = page.pfn as u64 * PAGE_SIZE as u64;
 
     // Dirty-cache gate. The seqlock snapshot below reads RAM off the bus; the
     // guest CPU sees RAM overlaid with its own dirty L1-D/L2 lines, and a
@@ -166,7 +166,7 @@ fn prepare_multi_entry_compile(
         let gen0 = page.current_gen();
         let mut read_ok = true;
         for (i, w) in words.iter_mut().enumerate() {
-            let r = bus.read32((phys_base + (i as u32) * 4) as u64);
+            let r = bus.read32(phys_base + i as u64 * 4);
             if !r.is_ok() {
                 read_ok = false;
                 break;
@@ -321,7 +321,7 @@ fn prepare_multi_entry_compile(
     // churn-avoidance check ignore writes to it.
     let mut used = [0u64; crate::cpu::jitv2::BITMAP_WORDS];
     let instr_count = {
-        let instrs = analyzer.walk_multi_entry(&words, &candidates, phys_base, max_instrs_per_compile());
+        let instrs = analyzer.walk_multi_entry(&words, &candidates, phys_base as u32, max_instrs_per_compile());
         let mut n = 0usize;
         for instr in crate::cpu::jitv2::analyzer::instrs_linear(instrs) {
             let w = instr.word as usize;
@@ -743,16 +743,18 @@ pub fn handle_request_deferred(
                 jit_fn: None,
             };
             let sealed = codegen.finalize_batch_nonforced(func_id, publish);
-            if sealed.is_empty() {
-                if codegen.last_finalize_failed() {
-                    page.mark_finalize_failed();
-                } else {
-                    page.mark_seal_gap_blocked();
-                    *pending += 1;
-                }
-            } else {
-                publish_all(&sealed);
+            if codegen.last_finalize_failed() {
+                page.mark_finalize_failed();
+            } else if !codegen.finalized_fn_is_among(&sealed) {
+                // Own range still unsealed. `sealed` may be non-empty all the
+                // same (this allocation vacated the previous host page and
+                // released what waited there), so test for our own function,
+                // not for emptiness: an uncounted range leaves `pending` at 0
+                // and the idle sweep never runs for it.
+                page.mark_seal_gap_blocked();
+                *pending += 1;
             }
+            publish_all(&sealed);
             #[cfg(feature = "developer")]
             {
                 // Count fallback words/regions and the successful-compile
@@ -938,6 +940,7 @@ mod tests {
 
     #[test]
     fn handle_request_publishes_a_compilable_instruction() {
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -964,6 +967,7 @@ mod tests {
         // (confirmed live via a boot traceback: `[jit:entry]` immediately
         // followed by the interpreter silently re-executing the same
         // instruction, on every single hit of an older entry).
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -989,6 +993,7 @@ mod tests {
 
     #[test]
     fn handle_request_skips_already_valid_entry() {
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -1047,6 +1052,7 @@ mod tests {
 
         // Outcome 1: publishes successfully.
         {
+            let _stable = crate::cpu::jitv2::opcode_support::table_stable();
             let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
             let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
             page.mark_requested(4);
@@ -1116,6 +1122,7 @@ mod tests {
         // force-seal machinery (force_publish_pending) expects to find it —
         // this isn't "gap-blocked behind another worker," just "not yet a
         // whole page's worth."
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -1154,6 +1161,7 @@ mod tests {
 
     #[test]
     fn handle_request_deferred_clears_scheduled_bit() {
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -1167,5 +1175,45 @@ mod tests {
         handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
 
         assert!(page.try_schedule_page(), "scheduled bit must be cleared even though publish itself is deferred");
+    }
+
+    #[test]
+    fn handle_request_deferred_counts_a_compile_the_seal_attempt_did_not_publish() {
+        // A seal attempt can return entries and still leave the caller's own
+        // compile behind: when this compile's allocation moved the bump
+        // cursor into a new host page, the call seals the previous (now
+        // vacated) page and publishes what was waiting in it, while this
+        // compile's own range sits in the page that is still open. The
+        // caller must count that range as pending, or nothing will ever
+        // force its page closed once the worker idles, and the entry stays
+        // unpublished for good. One request per call with a fresh counter,
+        // so a count left over from an earlier request cannot hide it.
+        let _stable = crate::cpu::jitv2::opcode_support::table_stable();
+        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
+        const N: usize = 64;
+        let counters: Vec<AtomicU64> = (0..N).map(|_| AtomicU64::new(0)).collect();
+        let mut pages: Vec<PhysicalCodePage> = counters.iter().enumerate()
+            .map(|(i, c)| PhysicalCodePage::new(i as u32, c as *const AtomicU64))
+            .collect();
+        let mut analyzer = Analyzer::new();
+        let mut codegen = Codegen::new();
+        let mut released_others = false;
+        for i in 0..N {
+            let before = pages.iter().filter(|p| p.is_runnable(4)).count();
+            pages[i].mark_requested(4);
+            let req = CompileRequest { page: &mut pages[i] as *mut PhysicalCodePage, compiled_for_fr1: true };
+            let mut pending: PendingCount = 0;
+            handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
+            let own_published = pages[i].is_runnable(4);
+            let after = pages.iter().filter(|p| p.is_runnable(4)).count();
+            if !own_published {
+                assert_eq!(pending, 1, "request {i} was not published and must be counted so the idle sweep finds it");
+                released_others |= after > before;
+            }
+        }
+        assert!(released_others, "setup: some request must have released earlier pages while leaving itself queued, or the page-crossing case was never reached");
+        let mut pending: PendingCount = 1;
+        force_publish_pending(&mut codegen, &mut pending);
+        assert!(pages.iter().all(|p| p.is_runnable(4)), "the forced sweep must leave every page published");
     }
 }

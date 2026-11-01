@@ -323,7 +323,7 @@ fn the_flash_is_readable_and_writable() {
 /// silently inert — every register reads zero and nothing is ever sent.
 #[test]
 fn the_uart_decodes_maces_register_spacing() {
-    let c = Com16550::new();
+    let c = MaceUart::new();
     // Transmit register is offset 0, so byte lane +7 of the first slot.
     c.write8((MACE_COM0 + 7) as u64, b'A');
     assert_eq!(c.output(), "A");
@@ -340,7 +340,7 @@ fn the_uart_decodes_maces_register_spacing() {
 /// With DLAB set, writes to register 0 are the baud divisor, not characters.
 #[test]
 fn the_baud_divisor_is_not_mistaken_for_output() {
-    let c = Com16550::new();
+    let c = MaceUart::new();
     c.write8((MACE_COM0 + 0x307) as u64, com_reg::LCR_DLAB);
     c.write8((MACE_COM0 + 7) as u64, 0x0c);
     assert_eq!(c.output(), "", "divisor writes are not characters");
@@ -354,7 +354,7 @@ fn the_baud_divisor_is_not_mistaken_for_output() {
 /// prompt — which looks exactly like a hang.
 #[test]
 fn a_typed_character_becomes_readable() {
-    let c = Com16550::new();
+    let c = MaceUart::new();
     let lsr = (MACE_COM0 + 0x507) as u64;
     assert_eq!(c.read8(lsr).data & com_reg::LSR_DR, 0, "nothing typed yet");
 
@@ -382,6 +382,29 @@ fn sdma_bus() -> std::sync::Arc<Ip32Bus> {
     let bus = Ip32Bus::new(16 << 20, vec![0u8; PROM_SIZE as usize]);
     bus.write64(MACE_ISA_RING_BASE as u64, SDMA_RING as u64);
     bus
+}
+
+/// IRIX paces its audio by MACE's read pointer: it reads it about once a
+/// millisecond and writes about 2 ms of sound past it. The pointer it reads
+/// is where the engine is, not where the last service pass (up to 2 ms ago
+/// on a quiet machine) left it; otherwise the next pass ran the ring dry.
+#[test]
+fn an_audio_register_read_sees_the_ring_as_it_stands() {
+    use crate::dev::mace_audio::MACE_AUDIO;
+    let bus = sdma_bus();
+    let a = MACE_AUDIO as u64;
+    let codec = |reg: u64, v: u64| bus.write64(a + 8, reg << 17 | v);
+    bus.write64(a, 0);
+    codec(28, 0x0800); // clock 1 on, converters up
+    codec(17, 8000);
+    codec(15, 1 << 8); // DAC1 from clock 1
+    codec(27, 1 << 8); // DAC1 on
+    bus.write64(a + 0x40, 0x200); // output 1 running
+    bus.write64(a + 0x50, 0xfe0); // a full ring
+    bus.service();
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let rptr = bus.read64(a + 0x48).data;
+    assert!(rptr >= 0x280, "10 ms at 8 kHz is 20 blocks with no service pass between, read {rptr:#x}");
 }
 
 fn sdma_reg(p: u32, reg: u32) -> u64 {
@@ -748,189 +771,143 @@ fn resetting_a_channel_clears_its_pointers_latches_and_level() {
 
 
 
-/// The CRC is how firmware decides the chip is real. Maxim's published
-/// example ROM is the standard check.
-#[test]
-fn the_dallas_crc_matches_the_published_example() {
-    assert_eq!(crc8_dallas(&[0x02, 0x1c, 0xb8, 0x01, 0x00, 0x00, 0x00]), 0xa2);
-}
-
-#[test]
-fn a_rom_built_from_a_mac_is_self_consistent() {
-    let ow = OneWireId::from_mac([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]);
-    let rom = ow.rom();
-    assert_eq!(rom[0], OW_FAMILY_DS2502, "family code must be the DS2502's");
-    assert_eq!(&rom[1..7], &[0x08, 0x00, 0x69, 0x12, 0x34, 0x56]);
-    assert_eq!(rom[7], crc8_dallas(&rom[..7]), "CRC must cover the first seven bytes");
-}
-
-/// A reset long enough to qualify must be answered with a presence pulse —
-/// the line pulled low — or the master concludes nothing is attached.
-/// The pulse is a window in time, not a one-shot cleared by the first
-/// read: the firmware polls it around 150 times, and a pulse that
-/// vanished after the first look would be missed by every later one.
-#[test]
-fn a_reset_is_answered_with_a_presence_pulse_of_real_duration() {
-    let ow = OneWireId::from_mac([1, 2, 3, 4, 5, 6]);
-    ow.master_drive(0, true);
-    let released = OW_RESET_US + 100;
-    ow.master_drive(released, false);
-
-    assert!(ow.line_level(released + 1),
-            "the device must not answer instantly; the master is still letting go");
-    let inside = released + OW_PRESENCE_DELAY_US + OW_PRESENCE_LEN_US / 2;
-    assert!(!ow.line_level(inside), "presence pulse must pull the line low");
-    // Every sample inside the window sees it, however many there are.
-    for k in 0..20 {
-        let t = released + OW_PRESENCE_DELAY_US + k * (OW_PRESENCE_LEN_US / 25);
-        assert!(!ow.line_level(t), "presence pulse vanished at +{k}");
-    }
-    let after = released + OW_PRESENCE_DELAY_US + OW_PRESENCE_LEN_US + 1;
-    assert!(ow.line_level(after), "and the device must let go afterwards");
-}
-
-/// A low too short to be a reset is a write slot, and must not be
-/// mistaken for one — otherwise every command byte restarts the device.
-#[test]
-fn a_short_low_is_not_a_reset() {
-    let ow = OneWireId::from_mac([1, 2, 3, 4, 5, 6]);
-    ow.master_drive(0, true);
-    let released = OW_RESET_US - 1;
-    ow.master_drive(released, false);
-    assert!(ow.line_level(released + OW_PRESENCE_DELAY_US + 1),
-            "a sub-reset low must not produce a presence pulse");
-}
-
-/// READ ROM, clocked in a bit at a time, must stream the ROM back LSB
-/// first — that is what carries the MAC address to the firmware.
-/// A tiny 1-Wire master, so the protocol tests read like the transaction
-/// they are rather than a list of pulse widths.
-struct OwMaster<'a> {
-    ow: &'a OneWireId,
+/// A 1-wire master on the identity register's terms: it clears RELEASE to
+/// hold the line low for a time and reads SAMPLE back, `t` standing in for
+/// the guest clock in microseconds.
+struct IdMaster<'a> {
+    id: &'a MaceId,
     t: u64,
+    /// How long a reset, a zero and a one hold the line low.
+    widths: (u64, u64, u64),
 }
 
-impl<'a> OwMaster<'a> {
-    fn new(ow: &'a OneWireId) -> Self {
-        Self { ow, t: 0 }
+impl<'a> IdMaster<'a> {
+    fn new(id: &'a MaceId) -> Self {
+        Self { id, t: 0, widths: (500, 90, 8) }
+    }
+
+    fn pulse(&mut self, low: u64) {
+        self.id.write(self.t, 0);
+        self.t += low;
+        self.id.write(self.t, RELEASE);
     }
 
     fn reset(&mut self) {
-        self.ow.master_drive(self.t, true);
-        self.t += OW_RESET_US + 100;
-        self.ow.master_drive(self.t, false);
-        let pulse = self.t + OW_PRESENCE_DELAY_US + OW_PRESENCE_LEN_US / 2;
-        assert!(!self.ow.line_level(pulse), "no presence pulse after a reset");
-        self.t += OW_PRESENCE_DELAY_US + OW_PRESENCE_LEN_US + 10;
-    }
-
-    fn write_bit(&mut self, bit: bool) {
-        self.ow.master_drive(self.t, true);
-        self.t += if bit { 20 } else { OW_WRITE0_US + 200 };
-        self.ow.master_drive(self.t, false);
-        self.t += 50;
+        self.t += 500;
+        self.pulse(self.widths.0);
+        assert_eq!(self.id.read(self.t + 80) & SAMPLE, 0, "no presence pulse after a reset");
+        self.t += 160;
     }
 
     fn write_byte(&mut self, b: u8) {
         for i in 0..8 {
-            self.write_bit((b >> i) & 1 != 0);
+            self.pulse(if (b >> i) & 1 != 0 { self.widths.2 } else { self.widths.1 });
+            self.t += 70;
         }
-    }
-
-    fn read_bit(&mut self) -> bool {
-        self.ow.master_drive(self.t, true);
-        self.t += 20;
-        self.ow.master_drive(self.t, false);
-        self.t += 20;
-        let v = self.ow.line_level(self.t);
-        self.t += 50;
-        v
     }
 
     fn read_byte(&mut self) -> u8 {
-        let mut b = 0u8;
-        for i in 0..8 {
-            if self.read_bit() {
-                b |= 1 << i;
-            }
-        }
-        b
+        (0..8).fold(0, |b, i| {
+            self.pulse(self.widths.2);
+            let bit = self.id.read(self.t + 1) & SAMPLE != 0;
+            self.t += 70;
+            b | (bit as u8) << i
+        })
+    }
+
+    fn read_bytes(&mut self, n: usize) -> Vec<u8> {
+        (0..n).map(|_| self.read_byte()).collect()
     }
 }
 
-/// The whole transaction the firmware performs: identify the part, then
-/// read its memory. Every byte of it is checked, because each one was a
-/// separate gate — the family code, the address CRC, the data, and the
-/// trailing CRC that nothing in the datasheet summary mentions.
-#[test]
-fn the_firmwares_whole_ds2502_transaction_is_answered() {
-    let mac = [0x08u8, 0x00, 0x69, 0x12, 0x34, 0x56];
-    let ow = OneWireId::from_mac(mac);
-    let mut m = OwMaster::new(&ow);
+const TEST_MAC: [u8; 6] = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
 
+/// The bytes the O2's Ethernet-address chip gives the PROM, recorded from
+/// the model before it moved onto the shared bus, for the address 08:00:69:12:34:56.
+#[test]
+fn the_ethernet_address_chip_answers_with_the_recorded_bytes() {
+    let rom = [0x09, 0x08, 0x00, 0x69, 0x12, 0x34, 0x56, 0x7b];
+    let mut memory = vec![0x8d, 0x56, 0x34, 0x12, 0x69, 0x00, 0x08];
+    memory.extend([0xff; 122]);
+    memory.push(0x50);
+
+    // READ ROM, then straight on to READ MEMORY without a reset.
+    let id = MaceId::new(TEST_MAC);
+    let mut m = IdMaster::new(&id);
     m.reset();
-    m.write_byte(onewire_cmd::READ_ROM);
-    let mut rom = [0u8; 8];
-    for b in rom.iter_mut() {
-        *b = m.read_byte();
-    }
-    assert_eq!(rom, ow.rom(), "READ ROM must stream the identity back");
-
-    // No reset in between: the firmware goes straight on to the memory
-    // read, and a device still stuck in "sending" would swallow it.
-    m.write_byte(onewire_cmd::READ_MEMORY);
+    m.write_byte(0x33);
+    assert_eq!(m.read_bytes(8), rom);
+    m.write_byte(0xf0);
     m.write_byte(0);
     m.write_byte(0);
-    assert_eq!(
-        m.read_byte(),
-        crc8_dallas(&[onewire_cmd::READ_MEMORY, 0, 0]),
-        "the device must answer with a CRC over the command and address"
-    );
+    assert_eq!(m.read_bytes(130), memory);
 
-    let data: Vec<u8> = (0..OneWireId::DATA_LEN).map(|_| m.read_byte()).collect();
-    assert_eq!(
-        m.read_byte(),
-        crc8_dallas(&data),
-        "and a CRC over the data it just sent"
-    );
+    // SKIP ROM gets the same memory.
+    let id = MaceId::new(TEST_MAC);
+    let mut m = IdMaster::new(&id);
+    m.reset();
+    m.write_byte(0xcc);
+    m.write_byte(0xf0);
+    m.write_byte(0);
+    m.write_byte(0);
+    assert_eq!(m.read_bytes(130), memory);
 
-    let eaddr: Vec<u8> = data[..6].iter().rev().copied().collect();
-    assert_eq!(eaddr, mac, "the firmware reverses the first six bytes to get the MAC");
+    // The firmware reverses the first six data bytes to get the address.
+    let eaddr: Vec<u8> = memory[1..7].iter().rev().copied().collect();
+    assert_eq!(eaddr, TEST_MAC);
 }
 
+/// The PROM's delay loops run short when the emulator runs fast, so pulses
+/// well under the datasheet's widths must still read as the same classes.
 #[test]
-fn read_rom_streams_the_identity_back() {
-    let mac = [0x08u8, 0x00, 0x69, 0x12, 0x34, 0x56];
-    let ow = OneWireId::from_mac(mac);
-    let mut t = 0u64;
-    // Reset, then wait out the presence pulse.
-    ow.master_drive(t, true);
-    t += OW_RESET_US + 100;
-    ow.master_drive(t, false);
-    t += OW_PRESENCE_DELAY_US + OW_PRESENCE_LEN_US + 10;
-    // Clock in READ ROM, LSB first: a short low is a 1, a long low a 0.
-    for i in 0..8 {
-        let bit = (onewire_cmd::READ_ROM >> i) & 1 != 0;
-        ow.master_drive(t, true);
-        t += if bit { 5 } else { OW_WRITE0_US + 20 };
-        ow.master_drive(t, false);
-        t += 10;
-    }
-    // Read 64 bits back. Each slot is the master pulsing the line low and
-    // then sampling what the device leaves on it.
-    let mut got = [0u8; 8];
-    for i in 0..64 {
-        ow.master_drive(t, true);
-        t += 5;
-        ow.master_drive(t, false);
-        t += 5;
-        if ow.line_level(t) {
-            got[i / 8] |= 1 << (i % 8);
-        }
-        t += 10;
-    }
-    assert_eq!(got, ow.rom(), "the master must read back exactly the ROM");
-    assert_eq!(&got[1..7], &mac, "and the MAC must survive the round trip");
+fn short_pulses_still_read_the_rom() {
+    let id = MaceId::new(TEST_MAC);
+    let mut m = IdMaster::new(&id);
+    m.widths = (320, 35, 3);
+    m.reset();
+    m.write_byte(0x33);
+    assert_eq!(m.read_bytes(8), [0x09, 0x08, 0x00, 0x69, 0x12, 0x34, 0x56, 0x7b]);
+}
+
+/// A low shorter than a reset is a slot, not a reset: no presence pulse.
+#[test]
+fn a_short_low_is_not_a_reset() {
+    let id = MaceId::new(TEST_MAC);
+    let mut m = IdMaster::new(&id);
+    m.reset();
+    m.t += 500;
+    m.pulse(200);
+    assert_ne!(id.read(m.t + 80) & SAMPLE, 0);
+}
+
+/// Writing zero lights both LEDs; the register resets with green dark, and
+/// the status bar's bits follow.
+#[test]
+fn the_front_leds_follow_the_register() {
+    use crate::dev::ng1::rex3::Rex3;
+    use std::sync::atomic::Ordering::Relaxed;
+    let id = MaceId::new(TEST_MAC);
+    let hb = || id.heartbeat.load(Relaxed);
+    assert_eq!(hb(), Rex3::HB_LED_RED);
+    id.write(0, 0);
+    assert_eq!(hb(), Rex3::HB_LED_RED | Rex3::HB_LED_GREEN);
+    id.write(1, 0x30);
+    assert_eq!(hb(), 0);
+    assert_eq!(id.read(2) & 0x30, 0x30);
+}
+
+/// The register survives a save, and a cold reset puts it back.
+#[test]
+fn the_register_survives_save_and_load_and_resets() {
+    use crate::traits::{Resettable, Saveable};
+    let id = MaceId::new(TEST_MAC);
+    id.write(0, FLASH_ENABLE | RELEASE | 0x10);
+    let v = id.save_state();
+    let restored = MaceId::new(TEST_MAC);
+    restored.load_state(&v).expect("load_state");
+    assert_eq!(restored.read(1) & 0x3f, FLASH_ENABLE | RELEASE | 0x10 | SAMPLE);
+    restored.power_on();
+    assert_eq!(restored.read(2), 0x20);
 }
 
 #[test]

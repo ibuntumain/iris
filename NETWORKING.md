@@ -68,6 +68,8 @@ Alternatively specify on the command line (the index form works here too):
 ```
 
 Caveats:
+- Works on every machine with an Ethernet: the Indy and Indigo2 (SEEQ), the
+  O2 (MEC), the Octane (IOC3) and a DaynaPort.
 - Requires elevated privileges to open a raw capture: root or `CAP_NET_RAW`
   on Linux, root on macOS, Administrator + a WinPcap-compatible driver
   (WinPcap or Npcap) on Windows.

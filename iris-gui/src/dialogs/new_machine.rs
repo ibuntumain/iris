@@ -61,7 +61,9 @@ impl Default for NewMachineDialog {
 
 /// Greedy-fill banks 0..3 with the largest valid bank size that fits.
 /// `profile` limits the sizes to what `validate()` accepts there: 256/512 MB
-/// only on the IP28 and Octane, and nothing under 64 MB on the Octane.
+/// only on the IP28 and Octane, nothing under 64 MB on the Octane, and on the
+/// O2 only the DIMM-pair kit sizes — which greedy largest-first filling always
+/// satisfies (no gaps, non-increasing).
 pub fn distribute_ram(total: u32, profile: MachineProfile) -> [u32; iris::config::MAX_BANKS] {
     let mut remaining = total;
     let mut banks = [0u32; iris::config::MAX_BANKS];
@@ -133,6 +135,17 @@ impl NewMachineDialog {
                             self.ram_total_mb = 128;
                             self.ram_banks = [128, 0, 0, 0];
                             self.resolution = NewportResolution::Guest;
+                        } else if self.profile == MachineProfile::O2Ip32 {
+                            // An R5000 machine, also with no built-in PROM. Its
+                            // RAM is DIMM-pair kits of 32 to 256 MB, filled from
+                            // pair A, so a plain total cannot describe it — refit
+                            // whatever the previous profile had.
+                            self.cpu = CpuModel::R5000;
+                            self.use_embedded_prom = false;
+                            self.prom_path = "ip32prom.bin".into();
+                            self.ram_total_mb = 128;
+                            self.ram_banks = iris::config::banks_to4(crate::ram::o2_kits_for(128));
+                            self.resolution = NewportResolution::Guest;
                         } else if profile_before == MachineProfile::Indigo2Ip28 {
                             self.cpu = CpuModel::default();
                             self.ram_total_mb = self.ram_total_mb.min(512);
@@ -140,21 +153,36 @@ impl NewMachineDialog {
                             for bank in &mut self.ram_banks {
                                 if *bank > 128 { *bank = 128; }
                             }
+                        } else if profile_before == MachineProfile::O2Ip32 {
+                            // Leaving the O2: a total in the MC's granule, and
+                            // banks the Indy/Indigo2 can actually express.
+                            self.cpu = CpuModel::default();
+                            self.ram_total_mb = self.ram_total_mb.min(512);
+                            self.ram_banks = iris::config::banks_to4(
+                                distribute_ram(self.ram_total_mb, self.profile));
                         }
                     }
                     ui.end_row();
 
                     let octane = self.profile == MachineProfile::OctaneIp30;
+                    let o2 = self.profile == MachineProfile::O2Ip32;
                     ui.label(t!("dialog-new-machine-cpu"));
-                    ui.add_enabled_ui(!octane, |ui| {
+                    // Only the CPUs this machine can be built with. The Octane
+                    // has one (the 195 MHz R10000), so its row is not a choice
+                    // at all; an O2 refuses an R4400.
+                    let cpus = self.profile.cpus();
+                    ui.add_enabled_ui(cpus.len() > 1, |ui| {
                         ComboBox::from_id_salt("nm_cpu")
                             .selected_text(self.cpu.label())
                             .show_ui(ui, |ui| {
-                                for c in CpuModel::ALL {
+                                for &c in cpus {
                                     ui.selectable_value(&mut self.cpu, c, c.label());
                                 }
                             });
                     });
+                    if octane {
+                        ui.label(RichText::new(cpus[0].label()).weak());
+                    }
                     ui.end_row();
 
                     if !octane {
@@ -186,8 +214,13 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
                     ui.label("");
-                    // The Octane's PROM is not built in.
-                    ui.add_enabled(!octane, egui::Checkbox::new(&mut self.use_embedded_prom, t!("dialog-new-machine-embedded-prom")));
+                    // Neither the Octane nor the O2 has a built-in PROM: the
+                    // Octane needs the IP30 flash image and the O2 an IP32
+                    // one, so there is nothing to fall back to and ticking
+                    // this would only strand the user on a machine that
+                    // cannot boot.
+                    ui.add_enabled(!octane && !o2,
+                        egui::Checkbox::new(&mut self.use_embedded_prom, t!("dialog-new-machine-embedded-prom")));
                     ui.end_row();
 
                     ui.label(t!("dialog-new-machine-nvram"));
@@ -206,23 +239,25 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
 
-                    if !octane {
-                    ui.label(t!("dialog-new-machine-eeprom"))
-                        .tip(t!("dialog-new-machine-eeprom-tip"));
-                    ui.horizontal(|ui| {
-                        ui.add(TextEdit::singleline(&mut self.nveeprom_path).desired_width(260.0));
-                        if ui.button("📁").clicked() {
-                            if let Some(p) = crate::filedialog::dialog_with_base(
-                                &t!("dialog-new-machine-eeprom-picker"), &self.nveeprom_path, &self.machine_dir(prefs),
-                                crate::filedialog::Anchor::Data,
-                                crate::filedialog::Purpose::Save,
-                                &[(t!("dialog-new-machine-eeprom-filter").as_str(), &["bin"])]).save_file()
-                            {
-                                self.nveeprom_path = p.to_string_lossy().into_owned();
+                    // The O2's NVRAM is its own PROM flash, already asked for
+                    // above; it has no separate motherboard EEPROM.
+                    if !octane && !o2 {
+                        ui.label(t!("dialog-new-machine-eeprom"))
+                            .tip(t!("dialog-new-machine-eeprom-tip"));
+                        ui.horizontal(|ui| {
+                            ui.add(TextEdit::singleline(&mut self.nveeprom_path).desired_width(260.0));
+                            if ui.button("📁").clicked() {
+                                if let Some(p) = crate::filedialog::dialog_with_base(
+                                    &t!("dialog-new-machine-eeprom-picker"), &self.nveeprom_path, &self.machine_dir(prefs),
+                                    crate::filedialog::Anchor::Data,
+                                    crate::filedialog::Purpose::Save,
+                                    &[(t!("dialog-new-machine-eeprom-filter").as_str(), &["bin"])]).save_file()
+                                {
+                                    self.nveeprom_path = p.to_string_lossy().into_owned();
+                                }
                             }
-                        }
-                    });
-                    ui.end_row();
+                        });
+                        ui.end_row();
                     }
 
                     if !self.ram_advanced {
@@ -273,6 +308,15 @@ impl NewMachineDialog {
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(t!("dialog-new-machine-octane-note"))
+                        .color(Color32::from_rgb(220, 170, 90))
+                        .small(),
+                    );
+                }
+
+                if self.profile == MachineProfile::O2Ip32 {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(t!("dialog-new-machine-o2-note"))
                         .color(Color32::from_rgb(220, 170, 90))
                         .small(),
                     );
@@ -402,7 +446,8 @@ mod ram_tests {
         let octane = MachineProfile::OctaneIp30;
         assert_eq!(distribute_ram(128, octane), iris::config::banks_from4([128, 0, 0, 0]));
         assert_eq!(distribute_ram(192, octane), iris::config::banks_from4([128, 64, 0, 0]));
-        assert_eq!(distribute_ram(2048, octane), iris::config::banks_from4([512, 512, 512, 512]));
+        assert_eq!(distribute_ram(2048, octane), iris::config::banks_from4([2048, 0, 0, 0]));
+        assert_eq!(distribute_ram(8192, octane), iris::config::banks_from4([2048, 2048, 2048, 2048]));
         for &total in crate::ram::ram_presets(octane) {
             let mut cfg = iris::config::MachineConfig::default();
             cfg.machine.profile = octane;

@@ -10,8 +10,8 @@
 // ── Where this sits in IRIS ──────────────────────────────────────────────────
 //
 // This is the same shape as `seeq8003` with a different front end: the device
-// owns two `rtrb` rings and hands the far ends to a `NatEngine` (or PcapEngine)
-// running on its own `daynaN-nat` thread. Instead of DMA descriptor rings driven
+// owns the near ends of a `Link`'s two `rtrb` rings and the link's backend (a
+// `NatEngine` or a PcapEngine) runs on its own `daynaN-net` thread. Instead of DMA descriptor rings driven
 // by MMIO registers, the front end is five SCSI CDBs:
 //
 //     WRITE(6)  → push a frame to `tx_prod`   (guest → world)
@@ -37,13 +37,9 @@
 use std::io::Error as IoError;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread;
-
-use parking_lot::Mutex;
-use rtrb::RingBuffer;
 
 use crate::devlog::LogModule;
-use crate::net::{eth_summary, mac_str, GatewayConfig, NatControl, NatEngine};
+use crate::net::{eth_summary, mac_str, GatewayConfig, Link, NatControl};
 use crate::scsi::{ScsiRequest, ScsiResponse};
 
 // ── Command set ──────────────────────────────────────────────────────────────
@@ -88,9 +84,6 @@ const STATS_LEN: usize = 18;
 /// Upper bound on a single READ response, so a bogus CDB can't make us
 /// allocate wildly. The IRIX driver asks for 3072.
 const MAX_READ_LEN: usize = 16 * 1024;
-
-/// Frames in flight per direction. Same depth as `seeq8003`.
-const CHAN_CAPACITY: usize = 256;
 
 /// Smallest thing that can plausibly be an Ethernet frame (dst+src+type).
 const MIN_FRAME: usize = 14;
@@ -137,16 +130,16 @@ pub struct DaynaPort {
     heartbeat: Arc<AtomicU64>,
 
     /// guest → world. Filled by WRITE(6), drained by the NAT thread.
-    tx_prod: rtrb::Producer<Vec<u8>>,
+    tx_prod: Option<rtrb::Producer<Vec<u8>>>,
     /// world → guest. Filled by the NAT thread, drained by READ(6).
-    rx_cons: rtrb::Consumer<Vec<u8>>,
-    /// The far ends, held until `start()` moves them into the NAT thread.
-    nat_ends: Option<(rtrb::Consumer<Vec<u8>>, rtrb::Producer<Vec<u8>>)>,
+    rx_cons: Option<rtrb::Consumer<Vec<u8>>>,
     /// Signalled by us when a TX frame is queued (the NAT thread waits on it).
-    tx_wake: Arc<crate::net::Wake>,
-    /// Signalled by the NAT thread when an RX frame is queued. Nothing waits on
-    /// it here — the driver polls READ every 10 ms — but `NatEngine` needs it.
-    rx_wake: Arc<crate::net::Wake>,
+    tx_wake: Option<Arc<crate::net::Wake>>,
+    /// The link the next `start` runs. Each `start` attaches a fresh one for
+    /// the next, so a restarted target gets new rings and a new backend.
+    next: Option<Link>,
+    /// The flag the running backend watches.
+    live: Option<Arc<AtomicBool>>,
 
     stats: DpStats,
     /// Sense data served on REQUEST SENSE, set by the last CHECK CONDITION.
@@ -156,8 +149,6 @@ pub struct DaynaPort {
 impl DaynaPort {
     pub fn new(target_id: usize, mac: [u8; 6], config: GatewayConfig,
                heartbeat: Arc<AtomicU64>) -> Self {
-        let (tx_prod, tx_cons) = RingBuffer::new(CHAN_CAPACITY);
-        let (rx_prod, rx_cons) = RingBuffer::new(CHAN_CAPACITY);
         Self {
             target_id,
             mac,
@@ -167,11 +158,11 @@ impl DaynaPort {
             running: Arc::new(AtomicBool::new(false)),
             nat_ctl: NatControl::new(),
             heartbeat,
-            tx_prod,
-            rx_cons,
-            nat_ends: Some((tx_cons, rx_prod)),
-            tx_wake: crate::net::Wake::new(),
-            rx_wake: crate::net::Wake::new(),
+            tx_prod: None,
+            rx_cons: None,
+            tx_wake: None,
+            next: None,
+            live: None,
             stats: DpStats::default(),
             pending_sense: [0u8; 18],
         }
@@ -190,66 +181,47 @@ impl DaynaPort {
         (self.config.client_ip, self.config.gateway_ip, self.config.netmask)
     }
 
-    /// Spawn the backend thread. Mirrors `seeq8003::Device::start`, including
-    /// the PCAP fallback message, so a DaynaPort can be bridged too.
+    /// Connect to the backend `[network]` selected (for this target's own
+    /// subnet and MAC). It runs from `start` to `stop`; attach before the
+    /// first `start`, which a target with no link ignores.
+    pub fn attach(&mut self, link: Link) {
+        self.nat_ctl = link.nat();
+        self.next = Some(link);
+    }
+
+    /// Spawn the backend thread.
     pub fn start(&mut self) {
         if self.running.swap(true, Ordering::SeqCst) { return; }
-        let Some((tx_cons, rx_prod)) = self.nat_ends.take() else {
+        let Some(mut link) = self.next.take() else {
             self.running.store(false, Ordering::SeqCst);
             return;
         };
-        let config      = self.config.clone();
-        let running_nat = self.running.clone();
-        let tx_wake_nat = self.tx_wake.clone();
-        let rx_wake_nat = self.rx_wake.clone();
-        let nat_ctl     = self.nat_ctl.clone();
-        let id          = self.target_id;
-        let name        = format!("dayna{}-nat", id);
-        thread::Builder::new().name(name).spawn(move || {
-            #[cfg(feature = "pcap")]
-            {
-                use crate::net::NetBackend;
-                if config.mode == crate::config::NetMode::Pcap {
-                    eprintln!("iris: DaynaPort {} backend = PCAP (bridged)", id);
-                    let mut engine = crate::net::net_pcap::PcapEngine::new(
-                        config, tx_cons, rx_prod,
-                        rx_wake_nat, tx_wake_nat,
-                        running_nat, nat_ctl);
-                    engine.run();
-                    return;
-                }
-                eprintln!("iris: DaynaPort {} backend = NAT (software gateway)", id);
-                NatEngine::new(config, tx_cons, rx_prod,
-                               rx_wake_nat, tx_wake_nat,
-                               running_nat, nat_ctl).run();
-            }
-            #[cfg(not(feature = "pcap"))]
-            {
-                if config.mode == crate::config::NetMode::Pcap {
-                    eprintln!("iris: DaynaPort {}: [network] mode = \"pcap\" requested but this \
-                               build lacks --features pcap; falling back to NAT gateway.", id);
-                } else {
-                    eprintln!("iris: DaynaPort {} backend = NAT (software gateway)", id);
-                }
-                NatEngine::new(config, tx_cons, rx_prod,
-                               rx_wake_nat, tx_wake_nat,
-                               running_nat, nat_ctl).run();
-            }
-        }).expect("dayna-nat spawn");
+        match link.renew() {
+            Ok(next) => self.next = Some(next),
+            Err(e) => eprintln!("iris: DaynaPort {}: network: {e}; down after this run", self.target_id),
+        }
+        self.live = Some(link.running());
+        eprintln!("iris: DaynaPort {} backend = {}", self.target_id, link.describe());
+        link.spawn(&format!("dayna{}-net", self.target_id));
+        let rings = link.into_rings();
+        self.tx_prod = Some(rings.to_net);
+        self.rx_cons = Some(rings.from_net);
+        self.tx_wake = Some(rings.tx_wake);
     }
 
     /// Stop the backend thread. The thread owns its ring endpoints and exits on
-    /// its next loop iteration; fresh rings are allocated here so a later
-    /// `start()` works. In-flight frames are discarded — the same answer
-    /// `seeq8003::stop` gives.
+    /// its next loop iteration; the next `start()` runs a fresh link. In-flight
+    /// frames are discarded — the same answer `seeq8003::stop` gives.
     pub fn stop(&mut self) {
         if !self.running.swap(false, Ordering::SeqCst) { return; }
-        self.tx_wake.notify();
-        let (tx_prod, tx_cons) = RingBuffer::new(CHAN_CAPACITY);
-        let (rx_prod, rx_cons) = RingBuffer::new(CHAN_CAPACITY);
-        self.tx_prod  = tx_prod;
-        self.rx_cons  = rx_cons;
-        self.nat_ends = Some((tx_cons, rx_prod));
+        if let Some(live) = self.live.take() {
+            live.store(false, Ordering::SeqCst);
+        }
+        if let Some(w) = self.tx_wake.take() {
+            w.notify();
+        }
+        self.tx_prod = None;
+        self.rx_cons = None;
     }
 
     /// Machine reset: interface off, queued frames dropped, NAT tables flushed
@@ -277,7 +249,7 @@ impl DaynaPort {
             format!("  TX         : {} frames, {} dropped (ring full)",
                     self.stats.tx_frames, self.stats.tx_dropped),
             format!("  RX         : {} frames, {} filtered, {} queued",
-                    self.stats.rx_frames, self.stats.rx_filtered, self.rx_cons.slots()),
+                    self.stats.rx_frames, self.stats.rx_filtered, self.rx_cons.as_ref().map_or(0, |c| c.slots())),
         ]
     }
 
@@ -370,9 +342,9 @@ impl DaynaPort {
         let mut records: Vec<Vec<u8>> = Vec::new();
         let mut used = 0usize;
         while self.enabled {
-            let frame_len = match self.rx_cons.peek() {
-                Ok(f) => f.len(),
-                Err(_) => break,
+            let frame_len = match self.rx_cons.as_mut().map(|c| c.peek().map(|f| f.len())) {
+                Some(Ok(n)) => n,
+                _ => break,
             };
             // Never emit a record that would overrun the requested transfer
             // length — the driver bounds-checks and silently drops the tail.
@@ -381,11 +353,11 @@ impl DaynaPort {
             // leaving it queued would stall the ring forever: drop it.
             if used + RX_HDR_LEN + frame_len + CRC_LEN > want {
                 if used > 0 || RX_HDR_LEN + frame_len + CRC_LEN <= want { break; }
-                let _ = self.rx_cons.pop();
+                self.drain_rx_one();
                 self.stats.rx_filtered += 1;
                 continue;
             }
-            let frame = self.rx_cons.pop().expect("peek succeeded so pop must succeed");
+            let frame = self.rx_cons.as_mut().and_then(|c| c.pop().ok()).expect("peek succeeded so pop must succeed");
             if !self.accepts(&frame) {
                 self.stats.rx_filtered += 1;
                 continue;
@@ -399,7 +371,7 @@ impl DaynaPort {
         // MORE on the last record tells the driver to issue another READ right
         // away instead of waiting for its next 10 ms tick; on any earlier record
         // it is what makes the driver keep parsing this response at all.
-        let more_queued = !self.rx_cons.is_empty();
+        let more_queued = self.rx_cons.as_ref().is_some_and(|c| !c.is_empty());
         let n = records.len();
         let mut data = Vec::with_capacity(used.max(RX_HDR_LEN));
         for (i, frame) in records.iter().enumerate() {
@@ -450,11 +422,11 @@ impl DaynaPort {
         }
         let frame = buf[..n].to_vec();
         dlog_dev!(LogModule::Net, "DaynaPort {} TX {}", self.target_id, eth_summary(&frame));
-        if self.tx_prod.push(frame).is_err() {
+        if !self.tx_prod.as_mut().is_some_and(|p| p.push(frame).is_ok()) {
             self.stats.tx_dropped += 1;
         } else {
             self.stats.tx_frames += 1;
-            self.tx_wake.notify();
+            if let Some(w) = &self.tx_wake { w.notify(); }
             self.heartbeat.fetch_or(crate::dev::ng1::rex3::Rex3::HB_ENET_TX, Ordering::Relaxed);
         }
         good()
@@ -502,7 +474,15 @@ impl DaynaPort {
     }
 
     fn drain_rx(&mut self) {
-        while self.rx_cons.pop().is_ok() {}
+        if let Some(c) = self.rx_cons.as_mut() {
+            while c.pop().is_ok() {}
+        }
+    }
+
+    fn drain_rx_one(&mut self) {
+        if let Some(c) = self.rx_cons.as_mut() {
+            let _ = c.pop();
+        }
     }
 
     fn check_condition(&mut self, key: u8, asc: u8, ascq: u8) -> ScsiResponse {
@@ -513,13 +493,6 @@ impl DaynaPort {
         self.pending_sense[12] = asc;
         self.pending_sense[13] = ascq;
         ScsiResponse { status: 0x02, data: vec![] }
-    }
-
-    /// Test hook: take the backend ends so a test can drive both sides of the
-    /// rings without spawning a `NatEngine`.
-    #[cfg(test)]
-    fn take_nat_ends(&mut self) -> (rtrb::Consumer<Vec<u8>>, rtrb::Producer<Vec<u8>>) {
-        self.nat_ends.take().expect("nat ends already taken")
     }
 }
 
@@ -535,7 +508,9 @@ mod tests {
     fn dp() -> (DaynaPort, rtrb::Consumer<Vec<u8>>, rtrb::Producer<Vec<u8>>) {
         let mut d = DaynaPort::new(3, default_mac(3), GatewayConfig::default(),
                                    Arc::new(AtomicU64::new(0)));
-        let (tx_cons, rx_prod) = d.take_nat_ends();
+        let (link, tx_cons, rx_prod) = Link::loopback();
+        d.attach(link);
+        d.start();
         (d, tx_cons, rx_prod)
     }
 
@@ -767,10 +742,12 @@ mod tests {
     fn scsi_device_routes_read6_to_the_packet_path_not_the_disk_path() {
         let mut d = DaynaPort::new(3, default_mac(3), GatewayConfig::default(),
                                    Arc::new(AtomicU64::new(0)));
-        let (_tx, mut rx) = d.take_nat_ends();
-        let mut dev = crate::scsi::ScsiDevice::new_daynaport(d);
-        assert!(dev.is_daynaport());
-        assert!(!dev.is_cdrom());
+        let (link, _tx, mut rx) = Link::loopback();
+        d.attach(link);
+        d.start();
+        let mut dev: Box<dyn crate::scsi::ScsiTarget> = Box::new(d);
+        assert!(dev.moves_packets());
+        assert!(dev.changer().is_none());
 
         dev.request(&cdb6([dp_cmd::ENABLE, 0, 0, 0, 0, 0x80])).unwrap();
         dev.request(&cdb6([dp_cmd::SET_IFACE_MODE, 0, 0, 0, 0x04, 0x80])).unwrap();

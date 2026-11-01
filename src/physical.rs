@@ -121,6 +121,7 @@ impl BusDevice for AliasBus {
     fn write32(&self, addr: u64, val: u32) -> u32 { unsafe { (*self.target).write32(self.target_addr(addr), val) } }
     fn read64(&self, addr: u64) -> BusRead64  { unsafe { (*self.target).read64(self.target_addr(addr)) } }
     fn write64(&self, addr: u64, val: u64) -> u32 { unsafe { (*self.target).write64(self.target_addr(addr), val) } }
+    fn describe_fault(&self, addr: u64, size: usize) -> Option<String> { unsafe { (*self.target).describe_fault(self.target_addr(addr), size) } }
 
     /// Forward the generation counter lookup too — an alias is the same
     /// physical memory, so it must resolve to the same counter.
@@ -139,6 +140,12 @@ impl BusDevice for AliasBus {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
         unsafe { (*self.target).gen_ptr(self.target_addr(addr)) }
+    }
+    fn cas32(&self, addr: u64, old: u32, new: u32) -> Option<bool> {
+        unsafe { (*self.target).cas32(self.target_addr(addr), old, new) }
+    }
+    fn cas64(&self, addr: u64, old: u64, new: u64) -> Option<bool> {
+        unsafe { (*self.target).cas64(self.target_addr(addr), old, new) }
     }
 }
 
@@ -176,6 +183,8 @@ impl BusDevice for BankView {
     #[inline] fn read64(&self, a: u64) -> BusRead64 { self.bank().read64(self.at(a)) }
     #[inline] fn write64(&self, a: u64, v: u64) -> u32 { self.bank().write64(self.at(a), v) }
     #[inline] fn write64_masked(&self, a: u64, v: u64, m: u64) -> u32 { self.bank().write64_masked(self.at(a), v, m) }
+    fn cas32(&self, a: u64, old: u32, new: u32) -> Option<bool> { self.bank().cas32(self.at(a), old, new) }
+    fn cas64(&self, a: u64, old: u64, new: u64) -> Option<bool> { self.bank().cas64(self.at(a), old, new) }
     #[inline] fn mem_ptr(&self, a: u64) -> Option<*const u64> { self.bank().mem_ptr(self.at(a)) }
     #[inline] fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 { self.bank().read_block(self.at(a), buf) }
     #[inline] fn write_block(&self, a: u64, buf: &[u64]) -> u32 { self.bank().write_block(self.at(a), buf) }
@@ -273,6 +282,8 @@ pub struct Physical {
     /// [`Self::resync_ppmem_bitmap`]), at `PpMemSpace`'s own `u64` before
     /// that; null only without a window.
     ppmem_bitmap: AtomicPtr<u64>,
+    /// The window's `ppmem::window_shift`.
+    ppmem_shift: u32,
 
     /// The decode table: one device per 4 KB slot of a 40-bit physical
     /// space, sparse and host-MMU-backed (`src/ppmem/devmap.rs`). Slots the
@@ -320,6 +331,12 @@ impl Physical {
     /// because aliases re-dispatch into the bus by address, so it must be in
     /// its final place before anything is mapped.
     pub fn new(banks: Vec<RamBank>) -> Arc<Self> {
+        Self::with_window(banks, crate::ppmem::WINDOW_SIZE)
+    }
+
+    /// [`Self::new`] with a ppmem window of `window` bytes, for memory that
+    /// runs past 4GB.
+    pub fn with_window(banks: Vec<RamBank>, window: u64) -> Arc<Self> {
         let host_freq = crate::platform::get_host_tick_frequency();
         let start_tick = crate::platform::get_host_ticks();
 
@@ -328,13 +345,13 @@ impl Physical {
         });
         let map_base = devmap.base();
 
-        // ppmem: reserve the 4GB window over these banks. A failure here is
+        // ppmem: reserve the window over these banks. A failure here is
         // not fatal — the bus path works regardless — so log and carry on
         // rather than refusing to boot.
-        let ppmem_space = match PpMemSpace::over(&banks) {
+        let ppmem_space = match PpMemSpace::over_window(&banks, window) {
             Ok(sp) => Some(sp),
             Err(e) => {
-                dlog_dev!(LogModule::Mc, "ppmem: could not reserve 4GB window ({e}); \
+                dlog_dev!(LogModule::Mc, "ppmem: could not reserve the window ({e}); \
                                           falling back to bus-only access");
                 None
             }
@@ -356,6 +373,7 @@ impl Physical {
             #[cfg(feature = "jitv2")]
             ppmem_gen_base,
             ppmem_bitmap: AtomicPtr::new(ppmem_bitmap),
+            ppmem_shift: crate::ppmem::window_shift(window),
             devmap,
             map_base,
             devices: Mutex::new(Vec::new()),
@@ -588,15 +606,15 @@ impl Physical {
         if p.is_null() { 0 } else { unsafe { *p } }
     }
 
-    /// Is `addr` backed by a whole directly-mapped 64MB region?
+    /// Is `addr` backed by a whole directly-mapped region?
     ///
     /// This is the quick test the design calls for: one load of the bitmap,
     /// one shift of the top bits of the physical address, one AND. A set bit
-    /// means the entire 64MB region is mapped RAM, so a direct host access is
+    /// means the entire region is mapped RAM, so a direct host access is
     /// equivalent to going through the bus.
     #[inline(always)]
     fn ppmem_mapped(&self, addr: u64) -> bool {
-        crate::ppmem::bitmap_maps(self.bitmap(), addr)
+        crate::ppmem::bitmap_maps_at(self.bitmap(), self.ppmem_shift, addr)
     }
 
     /// Host pointer for a directly-mapped physical address, or `None` if the
@@ -775,14 +793,14 @@ impl Device for Physical {
                 }
             }
             "bench" => {
-                // The first 64 MB region the window maps whole: RAM on every
+                // The first region the window maps whole: RAM on every
                 // machine, wherever its memory controller put it. Overwrites it.
                 let bm = self.bitmap();
                 if bm == 0 {
                     return Err("bench: no RAM region is mapped yet".to_string());
                 }
-                let size = 1u64 << crate::ppmem::BITMAP_SHIFT;
-                let base = (bm.trailing_zeros() as u64) << crate::ppmem::BITMAP_SHIFT;
+                let size = 1u64 << self.ppmem_shift;
+                let base = (bm.trailing_zeros() as u64) << self.ppmem_shift;
                 writeln!(writer, "Benchmarking Physical Bus write32 performance at {base:#x}...").unwrap();
                 let bench_start = crate::platform::get_host_ticks();
                 let mut error_count = 0;
@@ -811,6 +829,15 @@ impl Device for Physical {
 }
 
 impl BusDevice for Physical {
+    /// Ask the device the decode table names for `addr`, as an access to it
+    /// would have been routed, and name that device in the answer.
+    fn describe_fault(&self, addr: u64, size: usize) -> Option<String> {
+        let addr = addr & PHYS_MASK;
+        let dev = self.dev_at(addr);
+        let why = unsafe { (*dev).describe_fault(addr, size) }?;
+        Some(format!("{}: {why}", self.device_name(dev)))
+    }
+
     #[inline(always)]
     fn read8(&self, addr: u64) -> BusRead8 {
         let addr = addr & PHYS_MASK;
@@ -908,6 +935,16 @@ impl BusDevice for Physical {
         let addr = addr & PHYS_MASK;
         let device_ptr = self.dev_at(addr);
         unsafe { (*device_ptr).write64_masked(addr, val, mask) }
+    }
+
+    fn cas32(&self, addr: u64, old: u32, new: u32) -> Option<bool> {
+        let addr = addr & PHYS_MASK;
+        unsafe { (*self.dev_at(addr)).cas32(addr, old, new) }
+    }
+
+    fn cas64(&self, addr: u64, old: u64, new: u64) -> Option<bool> {
+        let addr = addr & PHYS_MASK;
+        unsafe { (*self.dev_at(addr)).cas64(addr, old, new) }
     }
 
     // Route to the target device's dma_read64/dma_write64, not its read64/write64.

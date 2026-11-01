@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, FifoDevice, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::devlog::{LogModule, devlog};
 use crate::snapshot::{get_field, toml_u8, toml_bool, u8_slice_to_toml, load_u8_slice, hex_u8};
-use crate::scsi::{self, ScsiDevice, scsi_cmd, ScsiRequest, ScsiDataLength};
+use crate::scsi::{self, ScsiBus, ScsiIdentities, scsi_cmd, ScsiRequest, ScsiDataLength};
 use std::io::Write;
 
 // Ring-buffer trace of WD33C93 register accesses with consecutive-dedup, so
@@ -237,8 +237,8 @@ struct Wd33c93aState {
     ar: u8,
     // Auxiliary Status Register (read-only)
     asr: u8,
-    // SCSI Devices (IDs 0-7)
-    devices: [Option<ScsiDevice>; 8],
+    // The SCSI bus (IDs 0-7), shared with the chip's owner
+    bus: Arc<ScsiBus>,
     fifo: VecDeque<u8>,
     // Data direction flag for computing DBR (true = data in from target to host)
     data_direction_in: bool,
@@ -302,9 +302,10 @@ unsafe impl Sync for Wd33c93a {}
 /// CDU-76S the Indy shipped with: IRIX's mediad uses the vendor and product
 /// strings for feature detection (volume control, eject).
 pub const INDY_CDROM: crate::scsi::ScsiIdentity = crate::scsi::ScsiIdentity::new(b"Sony    ", b"CDU-76S         ", b"1.0 ");
-pub const INDY_DISK: crate::scsi::ScsiIdentity = crate::scsi::ScsiIdentity::new(b"SGI     ", b"IRIS EMUL DISK  ", b"1.0 ");
 
 pub struct Wd33c93a {
+    /// The targets, also held by the state the worker thread runs on.
+    bus: Arc<ScsiBus>,
     state: Arc<Mutex<Wd33c93aState>>,
     cond: Arc<Condvar>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -327,25 +328,32 @@ pub struct Wd33c93a {
 }
 
 impl Wd33c93a {
+    /// An empty bus of the kind this chip drives: ids 0-7, and the Indy's
+    /// Sony CD-ROM. The machine fills it from `[scsi.N]` and hands it to
+    /// [`Self::new_with_id`].
+    pub fn new_bus() -> ScsiBus {
+        ScsiBus::new(8, ScsiIdentities { disk: scsi::DISK_IDENTITY, cdrom: INDY_CDROM })
+    }
+
+    /// A chip on an empty bus, for the tests.
+    #[cfg(test)]
     pub fn new(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::new_with_config(dma, irq, heartbeat, true)
+        Self::new_with_id(dma, irq, heartbeat, true, 0, Self::new_bus())
     }
 
-    pub fn new_with_config(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>, deferred_int: bool) -> Self {
-        Self::new_with_id(dma, irq, heartbeat, deferred_int, 0)
-    }
-
-    /// Same as `new_with_config`, but tags every log line with `id` (the
-    /// HPC3 SCSI controller number) — see `Wd33c93aState.id`'s doc comment.
-    pub fn new_with_id(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>, deferred_int: bool, id: u8) -> Self {
+    /// The chip on `bus`, tagging every log line with `id` (the HPC3 SCSI
+    /// controller number) — see `Wd33c93aState.id`'s doc comment.
+    pub fn new_with_id(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>, deferred_int: bool, id: u8, bus: ScsiBus) -> Self {
         let deferred_int_arc = Arc::new(AtomicBool::new(deferred_int));
+        let bus = Arc::new(bus);
         Self {
+            bus: bus.clone(),
             state: Arc::new(Mutex::new(Wd33c93aState {
                 id,
                 regs: [0; 32],
                 ar: 0,
                 asr: 0, // Initially not busy, no interrupt
-                devices: Default::default(),
+                bus: bus.clone(),
                 fifo: VecDeque::new(),
                 data_direction_in: false,
                 target_id: 0,
@@ -384,30 +392,9 @@ impl Wd33c93a {
         self.cpu_cycles.set(ptr);
     }
 
-    /// Attach a SCSI device.
-    /// For CD-ROMs, `discs` is the full ordered list of ISO paths; the first
-    /// entry is mounted immediately.  For HDDs `discs` is ignored — only
-    /// `path` is used.
-    ///
-    /// If `overlay_path_override` is `Some`, it specifies where the COW
-    /// overlay file lives. This lets CI mode isolate its overlay from an
-    /// interactive session sharing the same base image. Ignored when
-    /// `overlay` is false.
-    pub fn add_device(
-        &self,
-        id: usize,
-        path: &str,
-        is_cdrom: bool,
-        discs: Vec<String>,
-        overlay: bool,
-        overlay_path_override: Option<&str>,
-    ) -> std::io::Result<()> {
-        let dev = ScsiDevice::open(path, is_cdrom, discs, overlay, overlay_path_override, if is_cdrom { INDY_CDROM } else { INDY_DISK })?;
-        let mut state = self.state.lock();
-        if id < 8 {
-            state.devices[id] = Some(dev);
-        }
-        Ok(())
+    /// The SCSI bus: attach targets to it and ask what is on it.
+    pub fn bus(&self) -> &Arc<ScsiBus> {
+        &self.bus
     }
 
     /// Attach a DaynaPort SCSI/Link target — a SCSI-attached Ethernet adapter.
@@ -421,98 +408,37 @@ impl Wd33c93a {
         mac: [u8; 6],
         gateway: crate::net::GatewayConfig,
     ) -> std::io::Result<()> {
+        let link = crate::net::Link::with_gateway(gateway.clone())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         if id >= 8 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput, "SCSI ID out of range"));
         }
         let mut dp = crate::dev::daynaport::DaynaPort::new(id, mac, gateway, self.heartbeat.clone());
+        if let Some(link) = link {
+            dp.attach(link);
+        }
         dp.start();
-        let mut state = self.state.lock();
-        state.devices[id] = Some(ScsiDevice::new_daynaport(dp));
-        Ok(())
+        self.bus.attach(id as u8, Box::new(dp))
     }
 
     /// Reset the COW overlay on every attached device that's using COW.
     /// Direct-mode devices are left alone. Used by `Machine::ci_restore`.
     pub fn reset_all_overlays(&self) -> Vec<(usize, std::io::Result<()>)> {
-        let mut state = self.state.lock();
         let mut results = Vec::new();
-        for id in 0..8 {
-            if let Some(dev) = &mut state.devices[id] {
-                if dev.is_cow() {
-                    results.push((id, dev.cow_reset()));
-                }
+        self.bus.for_each(|id, dev| {
+            if dev.cow_dirty().is_some() {
+                results.push((id, dev.cow_reset()));
             }
-        }
+        });
         results
-    }
-
-    /// Number of attached CHD devices whose `.diff.chd` holds changes pending a
-    /// fold-back into the base on a clean shutdown.
-    pub fn pending_chd_sync_count(&self) -> usize {
-        let state = self.state.lock();
-        state.devices.iter().flatten().filter(|d| d.pending_chd_sync().is_some()).count()
-    }
-
-    /// Fold pending CHD diffs back into their bases ("sync"), preserving the
-    /// base's compression. `only` limits it to one SCSI id; `None` means all.
-    /// Releases each disk backend first (closing the CHD), then rebuilds
-    /// outside the device lock since recompression is slow.
-    /// `progress(done, total, fraction)` reports per-disk progress; `cancel()`
-    /// stops before the next disk (the in-flight rebuild also honours it),
-    /// leaving every un-synced base+diff intact. Returns the count synced.
-    pub fn sync_chd_disks(
-        &self,
-        only: Option<usize>,
-        progress: &mut dyn FnMut(usize, usize, f32),
-        cancel: &dyn Fn() -> bool,
-    ) -> std::io::Result<usize> {
-        // Collect pending (base, diff) pairs, releasing CHD handles under the
-        // lock so the files can be atomically rebuilt. The rebuild itself runs
-        // unlocked.
-        let pending: Vec<(std::path::PathBuf, std::path::PathBuf)> = {
-            let mut state = self.state.lock();
-            let mut v = Vec::new();
-            for id in 0..8 {
-                if only.is_some_and(|o| o != id) { continue; }
-                if let Some(dev) = &mut state.devices[id] {
-                    if let Some(pair) = dev.take_pending_chd_sync() {
-                        v.push(pair);
-                    }
-                }
-            }
-            v
-        };
-        let total = pending.len();
-        let mut done = 0usize;
-        for (base, diff) in pending {
-            if cancel() {
-                break;
-            }
-            progress(done, total, 0.0);
-            crate::chd_disk::flatten_diff(&base, &diff, &mut |f| progress(done, total, f), cancel)?;
-            done += 1;
-            progress(done, total, 1.0);
-        }
-        Ok(done)
     }
 
     /// Copy every COW overlay into `dir` as `scsi<id>.overlay`. Returns a
     /// list of `(id, dirty_sector_list)` entries so snapshot save can
     /// persist the dirty set alongside the raw overlay bytes.
     pub fn export_overlays(&self, dir: &std::path::Path) -> std::io::Result<Vec<(usize, Vec<u64>)>> {
-        let mut state = self.state.lock();
-        let mut out = Vec::new();
-        for id in 0..8 {
-            if let Some(dev) = &mut state.devices[id] {
-                if dev.is_cow() {
-                    let dest = dir.join(format!("scsi{}.overlay", id));
-                    let dirty = dev.cow_export(&dest)?;
-                    out.push((id, dirty));
-                }
-            }
-        }
-        Ok(out)
+        self.bus.export_overlays(dir)
     }
 
     /// Replace each COW overlay with its saved counterpart in `dir` and
@@ -523,16 +449,7 @@ impl Wd33c93a {
         dir: &std::path::Path,
         dirty_sets: &[(usize, Vec<u64>)],
     ) -> std::io::Result<()> {
-        let mut state = self.state.lock();
-        for (id, dirty) in dirty_sets {
-            if let Some(dev) = &mut state.devices[*id] {
-                if dev.is_cow() {
-                    let src = dir.join(format!("scsi{}.overlay", id));
-                    dev.cow_import(&src, dirty.clone())?;
-                }
-            }
-        }
-        Ok(())
+        self.bus.import_overlays(dir, dirty_sets)
     }
 
     pub fn read_fifo(&self) -> u8 {
@@ -911,23 +828,13 @@ impl Device for Wd33c93a {
         }
         // Any DaynaPort target owns a backend thread of its own; stop it too
         // (after the worker is joined, so nothing is mid-command).
-        {
-            let mut state = self.state.lock();
-            for dev in state.devices.iter_mut().flatten() {
-                if let Some(dp) = dev.daynaport_mut() { dp.stop(); }
-            }
-        }
+        self.bus.for_each(|_, dev| dev.stop());
     }
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) { return; }
         // Re-arm any DaynaPort backend a previous stop() shut down. No-op on
         // first boot — add_daynaport() already started them.
-        {
-            let mut st = self.state.lock();
-            for dev in st.devices.iter_mut().flatten() {
-                if let Some(dp) = dev.daynaport_mut() { dp.start(); }
-            }
-        }
+        self.bus.for_each(|_, dev| dev.start());
         let state = self.state.clone();
         let cond = self.cond.clone();
         let running = self.running.clone();
@@ -1125,17 +1032,11 @@ impl Device for Wd33c93a {
 /// The monitor's `scsi`/`cow` subcommands and the run-time disc changes
 /// come from `scsi_monitor` through this.
 impl crate::scsi_monitor::ScsiTargets for Wd33c93a {
-    fn with_targets<R>(&self, f: impl FnOnce(&mut [Option<ScsiDevice>]) -> R) -> R {
-        let mut state = self.state.lock();
-        f(&mut state.devices[..])
+    fn scsi_bus(&self) -> &ScsiBus {
+        &self.bus
     }
 }
 
-impl Default for Wd33c93a {
-    fn default() -> Self {
-        Self::new(None, None, Arc::new(AtomicU64::new(0)))
-    }
-}
 
 // ============================================================================
 // Resettable + Saveable for Wd33c93a
@@ -1172,9 +1073,7 @@ impl Resettable for Wd33c93a {
         // A DaynaPort comes up disabled with empty queues, and its NAT tables
         // are flushed on the backend thread's next loop — the same answer
         // Seeq8003::power_on gives for the onboard Ethernet.
-        for dev in state.devices.iter_mut().flatten() {
-            if let Some(dp) = dev.daynaport_mut() { dp.power_on(); }
-        }
+        state.bus.for_each(|_, dev| dev.power_on());
     }
 }
 
@@ -1222,6 +1121,14 @@ impl Wd33c93aState {
     /// independently. See `id`'s doc comment.
     fn log_module(&self) -> LogModule {
         if self.id == 0 { LogModule::Scsi } else { LogModule::Scsi1 }
+    }
+
+    /// Whether the selected target is a DaynaPort, whose READ(6) and
+    /// WRITE(6) move packets, not blocks.
+    fn target_is_daynaport(&self) -> bool {
+        self.bus.with_targets(|t| {
+            t.get(self.target_id).and_then(|t| t.as_ref()).is_some_and(|t| t.moves_packets())
+        })
     }
 
     fn use_dma(&self) -> bool {
@@ -1429,7 +1336,7 @@ impl Wd33c93aState {
                             data_in: Some(full_data),
                         };
                         let tid = self.target_id;
-                        match self.devices[tid].as_mut().map(|d| d.request(&request)) {
+                        match self.bus.request(tid as u8, &request) {
                             Some(Ok(response)) => self.finish_command(response.status),
                             _ => self.finish_command(0x02),
                         }
@@ -1443,7 +1350,7 @@ impl Wd33c93aState {
             return;
         }
 
-        if self.devices[self.target_id].is_none() {
+        if !self.bus.has_target(self.target_id as u8) {
             dlog!(self.log_module(), "WD33C93A({}): No device at target {}, timing out", self.id, self.target_id);
             wdt!("SEL_TIMEO tgt={} cmd={:02x} asr={:02x}", self.target_id, cmd, self.asr);
             // First interrupt (0x42): consumed by selectbus's SBIC_WAIT(INT) poll.
@@ -1696,8 +1603,7 @@ impl Wd33c93aState {
                 _ => "UNKNOWN",
             };
 
-            let is_dayna = self.devices[self.target_id].as_ref()
-                .map(|d| d.is_daynaport()).unwrap_or(false);
+            let is_dayna = self.target_is_daynaport();
             let mut extra = String::new();
             match cdb[0] {
                 // On a DaynaPort these two are packet RX/TX, not block I/O.
@@ -1749,8 +1655,7 @@ impl Wd33c93aState {
 
         // A DaynaPort reuses WRITE(6) to transmit one Ethernet frame, so its
         // data-out length is a plain byte count in CDB 3..4 — not `blocks × 512`.
-        let dayna = self.devices[self.target_id].as_ref()
-            .map(|d| d.is_daynaport()).unwrap_or(false);
+        let dayna = self.target_is_daynaport();
 
         // For WRITE commands, receive data first (data out from host to target)
         let data_in = match cdb[0] {
@@ -1825,8 +1730,7 @@ impl Wd33c93aState {
         };
 
         // Make SCSI request
-        let device = &mut self.devices[self.target_id];
-        if device.is_none() {
+        if !self.bus.has_target(self.target_id as u8) {
             self.finish_command(0x02);
             return;
         }
@@ -1837,7 +1741,7 @@ impl Wd33c93aState {
             data_in,
         };
 
-        match device.as_mut().unwrap().request(&request) {
+        match self.bus.request(self.target_id as u8, &request).expect("target checked above") {
             Ok(response) => {
                 if !response.data.is_empty() {
                     if auto_mode {
@@ -1913,7 +1817,7 @@ impl Wd33c93aState {
             let mut i = offset;
             while i < total {
                 let is_last = i == last_idx;
-                let (mut st, _) = dma_dev.write(data[i] as u32, is_last);
+                let mut st = dma_dev.write(data[i] as u32, is_last);
                 if i == 0 && st.not_active() {
                     // Driver calls wdsc_dmago *after* writing TRANSFER_INFO, so the channel
                     // may not be active yet. Wait up to 100ms for the CPU thread to arm it.
@@ -1924,7 +1828,7 @@ impl Wd33c93aState {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
                     while st.not_active() && std::time::Instant::now() < deadline {
                         std::thread::sleep(std::time::Duration::from_micros(100));
-                        (st, _) = dma_dev.write(data[i] as u32, is_last);
+                        st = dma_dev.write(data[i] as u32, is_last);
                     }
                     if st.not_active() {
                         dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 100ms — pausing", self.id);
@@ -1972,7 +1876,7 @@ impl Wd33c93aState {
         if let Some(dma_dev) = dma {
             while data.len() < total {
                 match dma_dev.read() {
-                    Some((val, st, _)) => {
+                    Some((val, st)) => {
                         // Byte accepted — decrement transfer count register to mirror real HW.
                         data.push(val as u8);
                         self.decrement_transfer_count();
@@ -2003,7 +1907,7 @@ impl Wd33c93aState {
                                 let mut got = false;
                                 while std::time::Instant::now() < deadline {
                                     std::thread::sleep(std::time::Duration::from_micros(100));
-                                    if let Some((val, st, _)) = dma_dev.read() {
+                                    if let Some((val, st)) = dma_dev.read() {
                                         data.push(val as u8);
                                         self.decrement_transfer_count();
                                         let pause = st.eox() && data.len() < total;
@@ -2080,7 +1984,7 @@ impl Wd33c93aState {
         if self.use_dma() {
             if let Some(dma_dev) = dma {
                 for i in 0..len {
-                    if let Some((val, _, _)) = dma_dev.read() {
+                    if let Some((val, _)) = dma_dev.read() {
                         data[i] = val as u8;
                     }
                 }
@@ -2216,11 +2120,11 @@ mod data_out_phase_tests {
         }
     }
     impl DmaClient for FedDma {
-        fn read(&self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> {
-            self.0.lock().pop_front().map(|b| (b as u32, DmaStatus::ok(), None))
+        fn read(&self) -> Option<(u32, DmaStatus)> {
+            self.0.lock().pop_front().map(|b| (b as u32, DmaStatus::ok()))
         }
-        fn write(&self, _val: u32, _eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
-            (DmaStatus::ok(), None)
+        fn write(&self, _val: u32, _eop: bool) -> DmaStatus {
+            DmaStatus::ok()
         }
     }
 
@@ -2234,9 +2138,9 @@ mod data_out_phase_tests {
         let dev = Wd33c93a::new(None, None, Arc::new(AtomicU64::new(0)));
         {
             let mut s = dev.state.lock();
-            s.devices[2] = Some(ScsiDevice::new(
+            s.bus.attach(2, Box::new(scsi::ScsiDevice::new(
                 Box::new(crate::block_node::RawNode::from_file(file, 1 << 20)),
-                1 << 20, false, path.display().to_string(), Vec::new(), INDY_DISK));
+                false, path.display().to_string(), Vec::new(), scsi::DISK_IDENTITY))).unwrap();
             s.advanced_mode = true;
             s.target_id = 2;
             s.regs[regs::DESTINATION_ID as usize] = 2;
@@ -2293,5 +2197,30 @@ mod data_out_phase_tests {
         f.read_exact(&mut written).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(written, sector, "the sector never reached the disk");
+    }
+
+    /// The machine fills the bus from `[scsi.N]` and gives it to the chip,
+    /// which answers for what is on it, with the Indy's Sony CD-ROM, and still
+    /// takes a target attached later through the same bus.
+    #[test]
+    fn a_chip_built_on_a_filled_bus_answers_for_its_target() {
+        let img = std::env::temp_dir().join(format!("iris-wd33c93a-filled-{}.img", std::process::id()));
+        std::fs::write(&img, vec![0u8; 64 * 512]).unwrap();
+        let bus = Wd33c93a::new_bus();
+        bus.attach_image(3, &img, true).unwrap();
+        let dev = Wd33c93a::new_with_id(None, None, Arc::new(AtomicU64::new(0)), true, 0, bus);
+        assert!(dev.bus().has_target(3));
+        assert!(!dev.bus().has_target(4));
+        let inquiry = ScsiRequest {
+            cdb: vec![scsi_cmd::INQUIRY, 0, 0, 0, 36, 0],
+            data_len: ScsiDataLength::Unlimited,
+            data_in: None,
+        };
+        let r = dev.bus().request(3, &inquiry).expect("target answers").unwrap();
+        assert_eq!(&r.data[8..16], b"Sony    ");
+        assert_eq!(&r.data[16..32], b"CDU-76S         ");
+        dev.bus().attach_image(4, &img, false).unwrap();
+        assert!(dev.bus().has_target(4), "a target attached after boot goes on the same bus");
+        let _ = std::fs::remove_file(img);
     }
 }

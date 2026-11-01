@@ -104,6 +104,19 @@ fn picked_path(path: &std::path::Path) -> String {
 /// of a percent — which NEAREST can only do by dropping whole rows.
 const FB_INTEGER_SNAP: f32 = 0.02;
 
+/// Repaint follow-up (ms) while frames are arriving. The frame sinks wake the
+/// GUI the instant a frame is published, so this is only insurance against a
+/// lost wake: it has to be short enough to keep a 60 Hz stream smooth, and it
+/// is never reached when the wake does its job.
+const REPAINT_FRAME_MS: u64 = 8;
+
+/// Repaint fallback (ms) when no frame was taken on the previous pass — a
+/// settled screen, a stopped machine, or the config editor being open. egui
+/// still needs to run often enough that the status footer, toasts, menus and
+/// text entry feel live; 4 Hz is plenty for all of those, and it is what the
+/// GUI used to spend on a static desktop 60 times a second.
+const REPAINT_IDLE_MS: u64 = 250;
+
 /// Size (egui points) to draw a framebuffer of `px` native pixels in `avail`
 /// points at `ppp` device pixels per point, and whether that size is a whole
 /// number of device pixels per emulated pixel (so NEAREST is pixel-exact).
@@ -145,6 +158,9 @@ fn fb_draw_rect(outer: egui::Rect, px: egui::Vec2, ppp: f32, max_scale: f32) -> 
     let min = egui::pos2(snap(rect.min.x), snap(rect.min.y));
     (egui::Rect::from_min_size(min, egui::vec2(snap(size.x), snap(size.y))), nearest)
 }
+
+/// Set when a signal asked the window to close: see `main`.
+static CLOSE_ON_SIGNAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() -> eframe::Result<()> {
     env_logger::init();
@@ -198,6 +214,21 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(|cc| {
             cc.egui_ctx.set_zoom_factor(prefs.ui_scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX));
+            // A newer iris-gui sends SIGTERM to reclaim its ports (see
+            // single_instance), and Ctrl-C or a closed terminal sends the
+            // others. Close the window as File > Quit does, so `on_exit` stops
+            // the machine and its disks are flushed, instead of dying at once.
+            // The close skips the CHD fold, which can outlast the newer
+            // instance's patience; the diff is folded on a later quit.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let ctx = cc.egui_ctx.clone();
+                iris::workstation::on_exit_signal(move |_| {
+                    CLOSE_ON_SIGNAL.store(true, std::sync::atomic::Ordering::SeqCst);
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    ctx.request_repaint();
+                });
+            }
             Ok(Box::new(App::new(prefs)))
         }),
     )
@@ -267,6 +298,12 @@ struct App {
     /// upload when the renderer hasn't produced a new frame.
     last_fb_seq: u64,
     last_fb_seq_head1: u64,
+    /// Set by the framebuffer panels when they take a frame off a sink this
+    /// pass; read by `handle_events` on the next one to pick the repaint
+    /// cadence. A live frame stream means the guest is drawing, so follow it
+    /// up promptly; nothing taken means the screen is settled and the GUI can
+    /// sleep until the next wake (see `framebuffer::FrameSink::set_wake`).
+    fb_took_frame: bool,
     /// Filter the framebuffer texture is currently uploaded with: `true` =
     /// NEAREST (crisp; used at integer device-pixel scales), `false` = LINEAR
     /// (smooths the uneven pixel doubling at fractional scales). Tracked so we
@@ -523,6 +560,7 @@ impl App {
             fb_tex_head1: None,
             last_fb_seq: 0,
             last_fb_seq_head1: 0,
+            fb_took_frame: false,
             fb_nearest: true,
             fb_scale: 0.0,
             pending_fb_snap: false,
@@ -796,11 +834,14 @@ impl App {
         // app load (the saved window size, or the first-launch fit to vm_scale)
         // and the guest display is letterboxed into it. Only the VM-scale slider
         // and UI zoom re-snap the window after that.
-        // Drop the previous run's cached texture so we never flash its last
-        // frame before the new run renders (the shared FrameSink is reset
-        // worker-side on Start; this clears the GUI's mirror of it).
+        // Drop the previous run's cached textures so we never flash their last
+        // frame before the new run renders (the shared FrameSinks are reset
+        // worker-side on Start; this clears the GUI's mirror of them).
         self.fb_tex = None;
+        self.fb_tex_head1 = None;
         self.last_fb_seq = 0;
+        self.last_fb_seq_head1 = 0;
+        self.fb_took_frame = false;
         // Assume halted at boot (idle at the PROM) so the auto-release only
         // fires on a later running→halted transition, not at startup.
         self.prev_cpu_halted = true;
@@ -1043,6 +1084,16 @@ impl App {
         }
     }
 
+    /// Point the frame sinks at this context so the REX3 refresh thread wakes
+    /// the GUI the moment it has a frame, instead of the GUI polling for one.
+    /// Called every pass (it is a cheap clone behind a mutex) because the
+    /// `App` outlives the sinks only in the other direction: the sinks are built
+    /// with the worker thread, before any context exists to give them.
+    fn install_frame_wake(&self, ctx: &egui::Context) {
+        self.emu.frame_sink.set_wake(ctx);
+        self.emu.frame_sink_head1.set_wake(ctx);
+    }
+
     fn handle_events(&mut self, ctx: &egui::Context) {
         for evt in self.emu.drain_events() {
             match evt {
@@ -1097,9 +1148,24 @@ impl App {
             self.pcap_perm_modal = true;
         }
 
-        // Repaint cadence: ~60 fps while the emulator is running so we
-        // can pull the latest framebuffer; lazy otherwise to save CPU.
-        let next = if self.emu.is_running() { 16 } else { 250 };
+        // Repaint cadence. The frame sinks wake us the moment a frame lands
+        // (`framebuffer::FrameSink::set_wake`), so the poll below is only a
+        // fallback for a wake that never arrives — it is not what drives a
+        // running guest's display.
+        //
+        // `fb_took_frame` was set by the framebuffer panel during the *previous*
+        // pass, so it reports whether the guest is actively drawing. While it
+        // is, follow up after a few milliseconds: enough to catch the next
+        // frame of a 60 Hz stream if its wake is lost, and far too slow to
+        // mask the wake itself. When nothing was taken the screen is settled,
+        // so fall back to a lazy tick — the status footer, config edits and
+        // menus still update, but a static desktop no longer costs 60
+        // layout+paint passes a second (most of a core on a two-core host).
+        let next = if std::mem::take(&mut self.fb_took_frame) {
+            REPAINT_FRAME_MS
+        } else {
+            REPAINT_IDLE_MS
+        };
         ctx.request_repaint_after(std::time::Duration::from_millis(next));
     }
 
@@ -1984,7 +2050,9 @@ impl App {
             cols[0].vertical(|ui| {
                 ui.label(RichText::new(t!("fb-head", head = 0)).small().weak());
                 if seq0 > 0 {
-                    Self::upload_fb_texture(ui, &self.emu.frame_sink, &mut self.fb_tex, &mut self.last_fb_seq, "rex3_fb", max_scale);
+                    if Self::upload_fb_texture(ui, &self.emu.frame_sink, &mut self.fb_tex, &mut self.last_fb_seq, "rex3_fb", max_scale) {
+                        self.fb_took_frame = true;
+                    }
                     if let Some(tex) = &self.fb_tex {
                         let (response, _) = Self::paint_fb(ui, tex, max_scale);
                         if response.clicked() {
@@ -1999,14 +2067,16 @@ impl App {
             cols[1].vertical(|ui| {
                 ui.label(RichText::new(t!("fb-head", head = 1)).small().weak());
                 if seq1 > 0 {
-                    Self::upload_fb_texture(
+                    if Self::upload_fb_texture(
                         ui,
                         &self.emu.frame_sink_head1,
                         &mut self.fb_tex_head1,
                         &mut self.last_fb_seq_head1,
                         "rex3_fb_h1",
                         max_scale,
-                    );
+                    ) {
+                        self.fb_took_frame = true;
+                    }
                     if let Some(tex) = &self.fb_tex_head1 {
                         Self::paint_fb(ui, tex, max_scale);
                     }
@@ -2037,6 +2107,15 @@ impl App {
         self.prefs.vm_scale / ctx.zoom_factor().max(0.1)
     }
 
+    /// Upload the newest frame from `sink` into `tex_slot`, allocating the
+    /// texture on first use. Returns whether anything was uploaded.
+    ///
+    /// Takes the frame (a move, not a copy — the sink's buffers are pooled) and
+    /// hands the buffer straight back afterwards, so a frame is never cloned on
+    /// its way to the screen. Only the band of scanlines the renderer reports as
+    /// changed is uploaded: `set_partial` becomes a `tex_sub_image_2d` of just
+    /// those rows, so a settled guest screen costs nothing at all. See
+    /// `framebuffer::FrameSink` for the hand-off and the damage rules.
     fn upload_fb_texture(
         ui: &egui::Ui,
         sink: &crate::framebuffer::FrameSink,
@@ -2044,38 +2123,65 @@ impl App {
         last_seq: &mut u64,
         tex_id: &str,
         max_scale: f32,
-    ) {
+    ) -> bool {
         let seq = sink.seq();
-        if seq == 0 { return; }
+        if seq == 0 || seq == *last_seq { return false; }
+        // The frame is ours now; recycle the buffer whatever happens below so
+        // the renderer's pool does not starve.
+        let Some(frame) = sink.take() else { return false };
+        if frame.width == 0 || frame.height == 0 { sink.recycle(frame); return false; }
+
         let want_nearest = match tex_slot.as_ref().map(|t| t.size_vec2()) {
             Some(px) => fb_draw_size(ui.available_size(), px, ui.ctx().pixels_per_point(), max_scale).1,
             None => true,
         };
-        if tex_slot.is_none() || seq != *last_seq {
-            let frame = sink.snapshot();
-            if frame.width == 0 || frame.height == 0 { return; }
-            let opts = if want_nearest {
-                egui::TextureOptions::NEAREST
-            } else {
-                egui::TextureOptions::LINEAR
-            };
-            let img = egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width, frame.height],
-                &frame.rgba,
-            );
-            match tex_slot {
-                Some(t) => t.set(img, opts),
-                None => *tex_slot = Some(ui.ctx().load_texture(tex_id, img, opts)),
+        let opts = if want_nearest {
+            egui::TextureOptions::NEAREST
+        } else {
+            egui::TextureOptions::LINEAR
+        };
+
+        // A band that stops short of the bottom of the picture is a patch into
+        // the texture we already have; a band covering every row is a whole
+        // frame and goes through `set`, which also handles a resolution change.
+        let partial = frame.dirty_h > 0
+            && (frame.dirty_h as usize) < frame.height
+            && tex_slot.is_some();
+        if partial {
+            let y = frame.dirty_y as usize;
+            let h = frame.dirty_h as usize;
+            let w = frame.width;
+            let start = y * w * 4;
+            let end = (y + h) * w * 4;
+            if end <= frame.rgba.len() {
+                let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &frame.rgba[start..end]);
+                if let Some(tex) = tex_slot {
+                    tex.set_partial([0, y], img, opts);
+                    *last_seq = frame.seq;
+                    sink.recycle(frame);
+                    return true;
+                }
             }
-            *last_seq = frame.seq;
         }
+        let img = egui::ColorImage::from_rgba_unmultiplied(
+            [frame.width, frame.height],
+            &frame.rgba,
+        );
+        match tex_slot {
+            Some(t) => t.set(img, opts),
+            None => *tex_slot = Some(ui.ctx().load_texture(tex_id, img, opts)),
+        }
+        *last_seq = frame.seq;
+        sink.recycle(frame);
+        true
     }
 
     fn framebuffer_panel_single(&mut self, ui: &mut egui::Ui) {
-        // Lock-free check first: only clone + re-upload the (multi-MB)
-        // framebuffer when REX3 has actually produced a new frame. Cloning on
-        // every 60 fps repaint regardless was ~300 MB/s of pointless copying
-        // and needless lock contention with the REX3 refresh thread.
+        // Lock-free check first: only take a frame (and re-upload the texture)
+        // when REX3 has actually produced one. Touching the sink on every 60 fps
+        // repaint regardless was ~300 MB/s of pointless copying and needless lock
+        // contention with the REX3 refresh thread; now the renderer also wakes us
+        // when a frame lands, so an unchanging screen costs nothing at all.
         let seq = self.emu.frame_sink.seq();
         if seq == 0 {
             ui.centered_and_justified(|ui| {
@@ -2106,48 +2212,24 @@ impl App {
             None => true,
         };
 
-        if self.fb_tex.is_none() || seq != self.last_fb_seq || want_nearest != self.fb_nearest {
-            let frame = self.emu.frame_sink.snapshot();
-            if frame.width == 0 || frame.height == 0 { return; }
-
-            let opts = if want_nearest {
-                egui::TextureOptions::NEAREST
-            } else {
-                egui::TextureOptions::LINEAR
-            };
-
-            let partial = frame.dirty_h > 0
-                && frame.dirty_h < frame.height as u32
-                && self.fb_tex.is_some();
-
-            if partial {
-                let y = frame.dirty_y as usize;
-                let h = frame.dirty_h as usize;
-                let w = frame.width;
-                let start = y * w * 4;
-                let end = (y + h) * w * 4;
-                if end <= frame.rgba.len() {
-                    let partial_img = egui::ColorImage::from_rgba_unmultiplied(
-                        [w, h],
-                        &frame.rgba[start..end],
-                    );
-                    if let Some(tex) = &mut self.fb_tex {
-                        tex.set_partial([0, y], partial_img, opts);
-                    }
-                    self.last_fb_seq = frame.seq;
-                    self.fb_nearest = want_nearest;
-                }
-            } else {
-                let img = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width, frame.height], &frame.rgba);
-                match &mut self.fb_tex {
-                    Some(t) => t.set(img, opts),
-                    None => {
-                        self.fb_tex = Some(ui.ctx().load_texture("rex3_fb", img, opts));
-                    }
-                }
-                self.last_fb_seq = frame.seq;
+        // Re-upload when the filter choice flips even if no new frame arrived
+        // (a window resize can change the device-pixel scale without the guest
+        // drawing anything), and when a new frame is waiting. The upload moves
+        // the frame off the sink and recycles its buffer, so nothing is cloned
+        // and only the damaged rows reach the GPU.
+        if want_nearest != self.fb_nearest || (seq != 0 && seq != self.last_fb_seq) {
+            let uploaded = Self::upload_fb_texture(
+                ui,
+                &self.emu.frame_sink,
+                &mut self.fb_tex,
+                &mut self.last_fb_seq,
+                "rex3_fb",
+                max_scale,
+            );
+            // Only claim the new filter once the texture actually carries it.
+            if uploaded {
                 self.fb_nearest = want_nearest;
+                self.fb_took_frame = true;
             }
         }
 
@@ -3144,6 +3226,7 @@ impl eframe::App for App {
     // egui 0.35 replaced `App::update(ctx)` with `App::ui(ui)`; panels now attach to a `Ui`.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
+        self.install_frame_wake(ctx);
         self.handle_events(ctx);
         self.maybe_autosave();
 
@@ -3154,7 +3237,8 @@ impl eframe::App for App {
         // Evt::SyncDone. `sync_then_close` latches so we don't re-intercept the
         // final close (by then the machine is gone and chd_sync_pending is stale).
         if ctx.input(|i| i.viewport().close_requested()) {
-            if !self.sync_then_close && self.emu.has_pending_chd_sync() {
+            let on_signal = CLOSE_ON_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+            if !on_signal && !self.sync_then_close && self.emu.has_pending_chd_sync() {
                 self.sync_then_close = true;
                 self.syncing = Some(SyncJob { disk: 0, total: 0, fraction: 0.0 });
                 self.emu.send(Cmd::SyncDisks);

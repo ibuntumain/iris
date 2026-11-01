@@ -122,6 +122,11 @@ fn main() {
 
     machine.start();
 
+    // Ctrl-C, a kill or a closed terminal ends the process; flush the disks
+    // first, as `quit` does.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    iris::workstation::exit_on_signal(machine.machine_slot());
+
     // CI control socket: started after the machine so a successful connection
     // means the monitor has already bound its port. That makes "the CI socket
     // answers" a reliable readiness signal for a harness — no fixed sleep —
@@ -155,8 +160,9 @@ fn main() {
     // the other iris's monitor, it would exit along with that iris.
     if !ci_enabled {
         if let Some(addr) = machine.monitor_addr() {
+            let slot = machine.machine_slot();
             std::thread::spawn(move || {
-                Machine::run_console_client(addr);
+                Machine::run_console_client(addr, iris::workstation::console_quit(slot));
             });
         }
     }
@@ -186,7 +192,7 @@ fn main() {
         ui.run(event_loop);
     }
 
-    machine.stop();
+    let _ = iris::workstation::stop_and_flush(&mut *machine, "exit");
     #[cfg(feature = "perfetto")]
     iris::perfetto::shutdown();
 }
