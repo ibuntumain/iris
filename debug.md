@@ -103,7 +103,7 @@ instead. Either retry the monitor TCP connect until it answers, or use the CI
 socket, which iris creates only after the monitor has bound:
 
 ```sh
-iris-ci --socket /tmp/iris.sock status --wait-ready 60
+iris-ci status --wait-ready 60
 tools/mon.py "machine-start"
 ```
 
@@ -258,7 +258,7 @@ exception of that class is taken. `ex tlb on` stops on every TLB exception.
 
 | Command | Description |
 |---|---|
-| `dt [n]` / `dt file <path> [n]` | Disassemble the traceback: the last `n` instructions executed (the history holds 1,048,576) |
+| `dt [n]` / `dt file [<path> [n]]` | Disassemble the traceback: the last `n` instructions executed (the history holds 1,048,576); `dt file` with no path writes `iris_trace.txt` in `$TMPDIR` (else `/tmp`), and a count needs a path before it |
 | `undo on` / `undo off` | Enable / disable the undo buffer, which records stores to the machine's RAM **[DEV]** |
 | `undo [n]` / `u` | Step back `n` instructions, reversing register and memory changes **[DEV]** |
 | `undo clear` / `undo resize <n>` | Clear / resize the undo history **[DEV]** |
@@ -574,6 +574,9 @@ its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described unde
 |---|---|
 | `crime status` / `crime regs` / `crime irqlog [on\|off\|n]` / `crime touched` | CRIME interrupts, mask and memory banks / registers / the last *n* interrupt-register accesses (recorded only after `crime irqlog on`, which clears the old log; never in a `lightning` build) / registers the guest used (not kept in a `lightning` build) |
 | `re status` / `re notes` | CRIME rendering engine state / notes on unusual commands |
+| `re trace <file> [re,cpu,gbe,crime,irq\|all]` / `re trace off\|flush` | Annotated trace (`gputrace` builds). One trace shared by the O2's graphics blocks, also as `gbe trace` and `crime trace`: interface buffer entries with each primitive decoded (`re`), RE register reads (`cpu`), GBE accesses, shadow latches and timing interrupts (`gbe`), CRIME registers (`crime`). `irq` adds CRIME's interrupt registers, which `all` leaves out because IRIX writes the mask on every spl change |
+| `re rec <file>` / `re rec off` | Record the engine's writes, after every register as it stands, in the form the offline replay reads (`gputrace` builds). Memory the CPU wrote is not in it |
+| `re dither [on\|off]` | Show or set whether the engine dithers, to compare renderings; on by default |
 | `gbe status` | GBE display engine: timing, frame buffer, tiles |
 | `isa status` | MACE ISA interrupts |
 | `pci status` / `pci config <slot>` | MACE PCI bridge / a function's configuration space |

@@ -46,7 +46,7 @@ cpu = "r10000"
 flash = "flash-ip30.bin"      # keep the PROM's flash records between runs
 
 [graphics]
-# board = "maximpact"         # "solidimpact" (default), "highimpact", "maximpact" or "none"
+# board = "maximpact"         # "solidimpact" (default), "highimpact", "maximpact", "v6", "v8", "v10", "v12" or "none"
 
 [[port_forward]]
 proto = "tcp"
@@ -130,11 +130,30 @@ the board, as on the other machines:
 | `solidimpact` (default) | SI | 1 / 1 | none |
 | `highimpact` | SI with texture option | 1 / 1 | 4 TRAMs |
 | `maximpact` | MXI | 2 / 2 | 4 TRAMs per RE |
+| `v6` (also `vpro:v6`) | V6 | (VPro, BUZZ A) | in its 32 MB board memory |
+| `v8` (also `vpro:v8`) | V8 | (VPro, BUZZ A) | in its 128 MB board memory |
+| `v10` (also `vpro:v10`) | V10 | (VPro, BUZZ B) | in its 32 MB board memory |
+| `v12` (also `vpro:v12`) | V12 | (VPro, BUZZ B) | in its 128 MB board memory |
 
 The two textured boards are new and less tested than the SI. Its screen is the iris window
 and what iris-ci screenshots show; the keyboard and mouse are IOC3's PS/2
 ports. `board = "none"` leaves the port empty, and the machine
 then runs on its serial console with no window.
+
+`v6`, `v8`, `v10` and `v12` are the four Octane VPro boards on the same
+port: a port of the VPro (Odyssey) model in jamesbraid/qemu-sgi-origami
+(`src/dev/odyssey`), with the X server and OpenGL drawn by the model's
+scalar rasteriser on the board's own thread. Each answers its board's
+widget revision, memory size and banks and the identity record on its
+NIC (`ODY32`, `ODY128`, `ODY32VERSIONB`, `ODY128VERSIONB`). The PROM draws
+its startup screen on any of them, but IRIX needs an install with the
+VPro kernel driver and X server module: a disk installed with an IMPACT
+board finds no screen on a VPro. SGI's upgrade kit (007-4210-003) asks
+for PROM 4.0 and IRIX 6.5.10 for the V6 and V8, and PROM 4.5, IRIX 6.5.10
+and Crossbow 1.4 for the V10 and V12. The V10 and V12 shipped only in the
+Octane2, so choosing one makes the machine an Octane2: it presents the
+Octane2's Crossbow (revision code 5, 1.4 in hinv) and Bridge (revision 4).
+iris warns at start-up when the PROM image is older than the board needs.
 
 ## Networking
 
@@ -146,8 +165,10 @@ gateway, with the usual settings: `nat_subnet`, `[nfs]`, `[[port_forward]]`,
 route of 192.0.2.3 works with `nat_subnet = "192.0.2.0/24"` unchanged. When
 `[network] mac` is unset the station address is 08:00:69:12:34:56; set your
 own if more than one Octane shares a network. `[network] mode = "off"`
-unplugs the Ethernet; `pcap` bridges it onto a host interface instead (see
-[NETWORKING.md](../NETWORKING.md)), with no NAT services.
+unplugs the Ethernet; `pcap` bridges it onto a host interface instead, with
+no NAT services. `mode = "stream"` with `stream = "tcp:IP:PORT"` or
+`"unix:PATH"` puts it on a private segment served by another program. Both
+are described in [NETWORKING.md](../NETWORKING.md).
 
 ## Inspecting the machine
 
@@ -206,7 +227,12 @@ through its event channel. `HACKING.md` lists the thread names.
   without effect and noted.
 - RAD audio input records silence; only the analog output reaches the host.
 - Board identity records carry made-up barcodes and serial numbers.
-- No snapshots.
+- Snapshots (the monitor's `save` and `load`, iris-ci's `save`, `restore` and
+  `rollback`) cover a one-processor Octane without a graphics board; a
+  two-processor Octane and an IMPACT or VPro board are refused with the
+  reason.
+  Restoring also rewrites the configured flash and NVRAM files, and the
+  guest's clocks resume from the time they showed at the save.
 
 ## Sources
 

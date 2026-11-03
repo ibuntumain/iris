@@ -11,7 +11,108 @@ history; author dates can differ after rebases or cherry-picks. Historical
 feature names describe the build at the time, not flags to use today. Commit
 hashes are given where a change is easiest to understand by reading the commit.
 
+## November 2026
+
+### O2 graphics tracing
+
+- `re trace FILE [re,cpu,gbe,crime,irq|all]` (also `gbe trace`, `crime trace`,
+  or `IRIS_O2_TRACE` from power-on; `gputrace` builds) writes one annotated
+  trace for the rendering engine, GBE and CRIME, in the format of the other
+  boards, each primitive decoded with the registers it runs with.
+- `re rec FILE` records the engine's writes for the offline replay test.
+- Perfetto shows engine busy, interface buffer level and stalls, primitives,
+  GBE timing interrupts and shadow latches.
+
+### O2 dithering
+
+- GL lines, points and rectangles into 16-bit double-buffered windows now
+  dither as triangles do. `re dither on|off` compares renderings.
+
+### A dropped Octane frees its device table
+
+- A GUI Stop then Start on an Octane leaked the machine's physical bus and its
+  decode table, and a process may have 64 tables: a test binary building
+  Octanes one after another aborted at the 65th with "devmap: more than 64
+  tables alive". Three things held the bus: the lock registry, the Bridge and
+  IMPACT through HEART's DMA view, and, under `jitv2`, the compile workers.
+  The registry now holds a lock's owner weakly, so the `locks` monitor command
+  lists a dropped machine's entries as free; the machine's drop lets go of the
+  bus's devices; and a `Jitv2` joins its workers before it frees the pages
+  they read. The Indy, Indigo2 and O2 still leak their tables.
+
+### Disk write cache
+
+- A disk now has a `write_cache` setting in its `[scsi.N]` table (and a
+  `--no-write-cache` flag for every disk), the caching mode page's WCE bit.
+  `true`, the default, reports a write cache: a write completes once the host
+  has it, SYNCHRONIZE CACHE or FUA stores what came before, and a background
+  sync follows about every 5 s. Speed is as before and the disk is no less
+  safe, since nothing synced before. A host crash or power loss can lose up
+  to about 5 s of writes, which IRIX cannot prevent because it never asks for
+  a cache sync. `false` reports the cache off and stores every write on the
+  host's disk before it completes, as the drives SGI shipped do; it is
+  slower, as each write waits for the host's disk. STORAGE.md has the table
+  of what survives a crash.
+- MODE SELECT takes the caching page's WCE bit in either mode (with PF set),
+  and MODE SENSE returns it. A caching page that is malformed is refused with
+  CHECK CONDITION; nothing else about a MODE SELECT is. A guest that clears
+  WCE has what it wrote stored at once. A bus reset (the AIC-7880 and the
+  ISP1040) or a reset of the WD33C93A puts the bit back to the configured
+  value.
+- SYNCHRONIZE CACHE(16) is implemented, WRITE(10) honours FUA, and
+  `log scsi on` logs each command a disk receives.
+- A CHD disk writes its file directly and a sync of the file stores its
+  writes, where it used to close and reopen the image (and never synced it).
+  A write the guest needs stored now costs what it does on a raw image; on a
+  2 GiB compressed CHD it took 27 ms and now takes 1 to 4 ms. A CHD disk gets
+  the background sync, and a hunk's map entry reaches the file only after
+  its data, so a host crash cannot leave the map pointing at data that is
+  not there. A write that gives a hunk its first data syncs before it
+  completes, also with `write_cache = true`, so killing iris loses nothing
+  on a CHD either.
+
+### virtio-serial guest device
+
+- New `[virtio_serial]` section: a virtio 1.x console / virtio-serial device
+  with named multiport channels, host ends on raw TCP or Unix sockets. It is a
+  transport-neutral core (`src/dev/virtio/`) with two transports: virtio-mmio
+  in a GIO expansion slot for the Indy, Indigo2 (IP22) and Indigo2 IMPACT
+  (IP28), which have no PCI bus, and virtio-pci for the Octane's Bridge. The
+  O2 has the transport but no interrupt route yet, and refuses the section.
+  It needs a guest driver and is off by default. See
+  [docs/virtio-serial.md](docs/virtio-serial.md).
+- `PciConfig` can carry a read-only capability list (`with_capabilities`).
+
+### CHD disks
+
+- Zeroes written to a CHD's `.diff.chd` now read back as zeroes. MAME skips
+  storing a hunk that is all zero and not yet in the diff, so such a hunk
+  went on reading the base CHD's old data: a guest that zeroed fresh blocks
+  (`mkfs`, `dd if=/dev/zero`) got the old contents back. A discard on a CHD,
+  which writes zeroes, had the same fault.
+
 ## October 2026
+
+### Octane snapshots
+
+- **The Octane saves and restores snapshots**: the monitor's `save` and `load`,
+  and iris-ci's `save`, `restore` and `rollback`. A snapshot holds the CPU, every
+  device, all RAM, the boot flash and each SCSI controller's copy-on-write
+  overlays, in the O2's format. Restoring also rewrites the configured flash and
+  NVRAM files, and the guest's clocks resume from the time they showed at the save.
+- A two-processor Octane, or one with an IMPACT or VPro board, refuses a save or
+  load and says why.
+
+### Snapshots of a disk overlay stay small without reflinks
+
+- Saving or restoring a snapshot copies each copy-on-write overlay. Where the
+  filesystem cannot reflink it (NFS, ext4, NTFS, or a copy between two
+  filesystems), the fallback used `std::fs::copy`, which writes the overlay's holes
+  out as zeros: an 8 GB overlay holding 100 MB of guest writes took 29 s to save and
+  82 s to restore, and each copy occupied 7.6 GB. The fallback now copies only the
+  sectors in the overlay's dirty record and leaves the rest sparse, on every OS, so
+  the cost follows what the guest wrote. Reflinking is unchanged. On Windows the
+  copy is marked sparse first.
 
 ### `IRIS_GUI_GL` works in iris-gui
 
@@ -41,6 +142,21 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **HEART's software reset** (`MODE` bit 22) now resets the machine.
 - **Masked stores to RAM** (`SWL`, `SWR`, `SDL`, `SDR`) use a compare-exchange, so a
   DMA engine or another CPU storing beside them is not lost.
+
+### Choosing the machine on the command line
+
+- **`iris --machine NAME`** picks the machine to emulate by its `[machine] profile`
+  name and overrides the config file; `--machine help` lists the names and what
+  each is. `--ip22` is now another way to write `--machine indigo2_ip22`.
+  `--validate` judges the machine chosen.
+
+### Checking a configuration
+
+- **`iris --validate --config FILE`** parses and validates a configuration and
+  checks that its PROM, disk and CD images, directories and serial socket and log
+  directories exist and that its TCP ports differ, then exits 0 or 1 without
+  starting the machine or opening graphics or audio. See
+  [HELP.md](HELP.md#checking-a-configuration).
 
 ### Serial consoles on Unix sockets
 
@@ -256,6 +372,17 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### CI and automation
 
+- **A `--ci` run's disk overlays go to the host's temporary directory**,
+  `$TMPDIR` when it is set and `/tmp` otherwise, instead of always `/tmp`. With
+  `TMPDIR` unset nothing moves; macOS always sets it, so there the overlays
+  move under `/var/folders`. Pointing `TMPDIR` at the filesystem that holds
+  `saves/` lets a snapshot reflink an overlay instead of copying it. An attach
+  that cannot create its overlay now names the file.
+- **Each `--ci` run's overlays are named for the run**, as
+  `iris-ci-<pid>-<start>-scsi<id>.overlay`, where `<start>` is when the run
+  began. A run that got an earlier run's process ID used to open that run's
+  overlay and its dirty-sector record and boot on its writes; every run in a
+  container has the same process ID.
 - **`iris-ci screenshot` produces the guest screen in `--ci`.** A `--ci`
   instance installs no front-end renderer, so nothing filled the readback
   buffer and every screenshot came out black. The command now waits for the
@@ -263,6 +390,18 @@ hashes are given where a change is easiest to understand by reading the commit.
   the guest screen from the display caches when no renderer is present. With
   a GUI renderer attached it still returns the readback that renderer
   produced. (`src/ci.rs`, `src/gfx_display.rs`)
+- **The default CI socket is `iris.sock` in the host's temporary directory**,
+  `$TMPDIR` when it is set and `/tmp` otherwise, for both `iris` and `iris-ci`.
+  With `TMPDIR` unset nothing moves. macOS sets `TMPDIR` for every login, so
+  there the default is now under `/var/folders/.../T/`. The two meet through
+  the default only when both run with the same `TMPDIR` (the old literal met
+  whatever the environment); otherwise pass the path to both, `--ci-socket`
+  and `--socket`. A failed connect to the default now says so. A script that
+  names `/tmp/iris.sock` itself should pass `--ci-socket` to iris as well.
+  `tools/iris-test` takes the same default, and puts its default screenshot in
+  the same directory. Windows keeps `127.0.0.1:19851`.
+- **The monitor's `dt file` without a path** writes `iris_trace.txt` in the
+  same temporary directory, instead of always `/tmp/iris_trace.txt`.
 ### SGI Octane (IP30)
 
 - **Octane compile workers start after the memory windows are published.** A
@@ -304,6 +443,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   flags, window-ID modes and VC3 tables, the draw bank, the interrupt lines
   and, on the Octane, the HEART packets and acknowledgements
   (docs/perfetto.md).
+- **The Octane takes the VPro boards**: `[graphics] board = "v6"`,
+  `"v8"`, `"v10"` or `"v12"` puts a port of QEMU's VPro (Odyssey) model
+  on the graphics port; IRIX needs an install with the VPro driver, and
+  the V10 and V12 bring the Octane2's Crossbow 1.4 with them. The board's front end and raster unit each
+  run on a thread of their own and the display on a third, so long GL
+  streams no longer hold up the processor.
+  (`src/dev/odyssey`)
 - **The Octane takes the textured IMPACT boards.** `[graphics] board =
   "highimpact"` is the SI with texture option and `"maximpact"` the MXI
   (two GEs, two REs), with the board version bytes the IP30 kernel decodes;
@@ -773,6 +919,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   named `seeq-net`, `daynaN-net`, `ip32-mec-net` and `ip30-eth-net`.
 - `mode = "pcap"` is allowed on the O2 and the Octane, untested on a real
   interface.
+- `[network] mode = "stream"` connects an Ethernet to a program speaking
+  QEMU's `-netdev stream` framing (not a DaynaPort).
 
 ### UI / input
 

@@ -85,7 +85,10 @@ a tape, can use it too. The WD33C93A (Indy, Indigo2), the Adaptec
 7880 (O2) and the ISP1040 (Octane) each make an empty bus of their own kind
 (`new_bus`); the machine fills it from config and gives it to the controller's
 constructor, so a controller exists with its targets and keeps only its
-registers and DMA. `src/scsi_monitor.rs` implements the monitor's `scsi` and `cow`
+registers and DMA. What a `BlockNode` must guarantee about durable writes,
+and why a disk's `write_cache` setting matters, is in the "Disk write cache"
+section of [STORAGE.md](STORAGE.md) and the `block_node.rs` module docs: read
+them before writing a backend or changing a flush. `src/scsi_monitor.rs` implements the monitor's `scsi` and `cow`
 subcommands and the run-time disc changes once, over the bus a controller hands
 out through `ScsiTargets::scsi_bus`; chip-specific subcommands (`regs`; the
 WD's `wdt`, `defer`, `debug`) stay with the chip, and `DiscChanger` is
@@ -299,6 +302,7 @@ Every device that has real work to do runs on its own thread:
 | `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
 | `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
 | `ip30-eth-rx`, `ip30-eth-net` | Octane ethernet receive pump; the network backend |
+| `odyssey-work`, `odyssey-raster`, `odyssey-display` | VPro: the front end decodes the queued command-FIFO stores (the processor's stores only queue), the raster unit draws what the front end sets up, and the display copies the planes out, counts the retrace and presents the window at 60 Hz. No board-wide lock: the front end owns its state, an access that needs the drawing is answered busy until it is done, and the display reads the planes while they are drawn |
 
 Threads that have nothing to do park instead of spinning: the graphics
 consumers when their FIFO is empty, and the CPU thread in `idle-pause` builds

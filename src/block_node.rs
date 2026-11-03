@@ -41,11 +41,43 @@
 //! [`BlockNode::rollback`] discards the layer, reverting reads to the base. A
 //! node with no divergence layer has nothing to fold or discard, so the trait
 //! defaults are no-ops.
+//!
+//! # Durability
+//!
+//! A disk with `write_cache = true` (the default) tells the guest GOOD once
+//! the node has accepted the write, and a host crash can lose up to
+//! [`BACKGROUND_FLUSH_INTERVAL`] of them while the guest believes they are
+//! stored. IRIX cannot prevent that: it never sends SYNCHRONIZE CACHE or FUA.
+//! A disk with `write_cache = false`, as SGI shipped its drives, tells the
+//! guest GOOD only after the write is on the host's disk. A backend keeps the
+//! contract so:
+//!
+//! - [`BlockNode::write`] has put the data where a killed iris leaves it
+//!   (the host's file) before it returns, so that `kill -9` loses nothing.
+//!   A backend that must hold part of a write back, as the CHD holds a new
+//!   hunk's map entry until its data is synced, syncs before returning.
+//! - [`BlockNode::flush_data`] returns only once every write accepted so far
+//!   is on the host's disk and the file would open and read back as the guest
+//!   wrote it after a crash. The SCSI layer calls it before GOOD for a write
+//!   with FUA and for every write when the disk has no write cache.
+//! - [`BlockNode::flush`] does that and also the housekeeping a clean stop
+//!   and SYNCHRONIZE CACHE need.
+//! - [`BlockNode::background`] returns a [`Background`] the node
+//!   [`mark`](Background::mark)s after each write. Its thread makes the writes
+//!   durable without the node or its lock, so what a sync must do in a set
+//!   order (data before the map that points at it) goes behind [`Durable`].
+//!
+//! STORAGE.md has the table of what each setting loses and what a new backend
+//! such as qcow2 has to provide.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::Thread;
+use std::time::{Duration, Instant};
 
 use crate::chd_disk::{ChdCd, ChdHd};
 
@@ -104,6 +136,205 @@ impl BlockStatus {
     }
 }
 
+/// How long writes may wait on the host before the background flush makes
+/// them durable (see [`BlockNode::background`]).
+pub const BACKGROUND_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// What a node shares with the thread that makes its writes durable in the
+/// background, so that thread never takes the lock a command runs under.
+///
+/// A write calls [`Background::mark`] once its data has reached the host's
+/// file; that costs one relaxed load while the flag is already set and wakes
+/// the thread only on the change from idle. The thread waits for
+/// [`BACKGROUND_FLUSH_INTERVAL`] after it is woken, so a burst of writes costs
+/// one sync. The sync is of duplicated handles of the node's files, which
+/// is all the node's own `flush` does for a raw image; a copy-on-write
+/// overlay's record is made durable but not compacted (that stays with an
+/// explicit flush). A backend whose writes must reach the disk in a set
+/// order hands over a [`Durable`] instead.
+pub struct Background {
+    interval: Duration,
+    pending: AtomicBool,
+    stop: AtomicBool,
+    syncs: AtomicU64,
+    waker: OnceLock<Thread>,
+    files: Mutex<BackgroundFiles>,
+}
+
+#[derive(Default)]
+struct BackgroundFiles {
+    data: Option<File>,
+    record: Option<File>,
+    durable: Option<Arc<dyn Durable>>,
+}
+
+/// What a backend writes to when a plain sync of its files is not enough,
+/// because its writes must reach the disk in order (a CHD's map entries
+/// after the data they point at). The background thread syncs it in that
+/// order, without the node.
+pub trait Durable: Send + Sync {
+    /// Make every write so far durable, as [`BlockNode::flush_data`] does.
+    fn sync_data(&self) -> io::Result<()>;
+}
+
+impl Durable for crate::chd_disk::ChdFile {
+    fn sync_data(&self) -> io::Result<()> {
+        self.sync(false)
+    }
+}
+
+impl Background {
+    /// A background flush of `data`, `interval` after the first write.
+    fn with_interval(data: &File, interval: Duration) -> Arc<Self> {
+        let bg = Self::idle(interval);
+        bg.set_data(Some(data));
+        bg
+    }
+
+    /// A background flush with nothing to sync yet.
+    fn idle(interval: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            interval,
+            pending: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            syncs: AtomicU64::new(0),
+            waker: OnceLock::new(),
+            files: Mutex::new(BackgroundFiles::default()),
+        })
+    }
+
+    fn for_file(data: &File) -> Arc<Self> {
+        Self::with_interval(data, BACKGROUND_FLUSH_INTERVAL)
+    }
+
+    /// A background flush of `durable`.
+    fn for_durable(durable: Arc<dyn Durable>) -> Arc<Self> {
+        let bg = Self::idle(BACKGROUND_FLUSH_INTERVAL);
+        bg.set_durable(Some(durable));
+        bg
+    }
+
+    /// Run `sync`, which makes everything the node has written durable, and
+    /// leave nothing for the thread: the flag is cleared before, so a write
+    /// that lands during the sync marks itself again. A sync that fails
+    /// leaves the writes waiting, so the thread retries them.
+    fn syncing<T>(&self, sync: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        self.pending.store(false, Ordering::Relaxed);
+        let result = sync();
+        if result.is_err() {
+            self.mark();
+        }
+        result
+    }
+
+    /// Follow the node to another data file, or to none.
+    fn set_data(&self, file: Option<&File>) {
+        self.files.lock().unwrap().data = file.and_then(|f| f.try_clone().ok());
+    }
+
+    /// Follow the node to another record file, or to none.
+    fn set_record(&self, file: Option<&File>) {
+        self.files.lock().unwrap().record = file.and_then(|f| f.try_clone().ok());
+    }
+
+    /// Follow the node to another ordered file, or to none.
+    fn set_durable(&self, durable: Option<Arc<dyn Durable>>) {
+        self.files.lock().unwrap().durable = durable;
+    }
+
+    /// Writes have reached the host's files and are not yet synced.
+    pub fn mark(&self) {
+        if !self.pending.load(Ordering::Relaxed) && !self.pending.swap(true, Ordering::Relaxed) {
+            // Pairs with the fence in `spawn`: either the waker is seen here or
+            // the flag is seen there.
+            fence(Ordering::SeqCst);
+            if let Some(t) = self.waker.get() {
+                t.unpark();
+            }
+        }
+    }
+
+    /// Whether writes wait for a sync.
+    pub fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Sync the files if writes are waiting. Returns whether it synced.
+    pub fn sync_pending(&self) -> io::Result<bool> {
+        if !self.pending.swap(false, Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let (data, record, durable) = {
+            let f = self.files.lock().unwrap();
+            (
+                f.data.as_ref().and_then(|f| f.try_clone().ok()),
+                f.record.as_ref().and_then(|f| f.try_clone().ok()),
+                f.durable.clone(),
+            )
+        };
+        let synced = data
+            .map_or(Ok(()), |f| f.sync_all())
+            .and(record.map_or(Ok(()), |f| f.sync_all()))
+            .and(durable.map_or(Ok(()), |d| d.sync_data()));
+        if synced.is_err() {
+            self.pending.store(true, Ordering::Relaxed);
+        }
+        if synced.is_ok() {
+            self.syncs.fetch_add(1, Ordering::Relaxed);
+        }
+        synced.map(|()| true)
+    }
+
+    /// How many times the pending writes have been synced.
+    pub fn syncs(&self) -> u64 {
+        self.syncs.load(Ordering::Relaxed)
+    }
+
+    /// Run the flush thread: sleep while idle, and once woken by a write wait
+    /// out the interval and sync. Ends after [`Background::finish`].
+    pub fn spawn(self: &Arc<Self>) -> io::Result<()> {
+        let bg = self.clone();
+        let thread = std::thread::Builder::new().name("scsi-flush".into()).spawn(move || {
+            while !bg.stop.load(Ordering::Acquire) {
+                if !bg.is_pending() {
+                    std::thread::park();
+                    continue;
+                }
+                let due = Instant::now() + bg.interval;
+                while !bg.stop.load(Ordering::Acquire) {
+                    let now = Instant::now();
+                    if now >= due {
+                        break;
+                    }
+                    std::thread::park_timeout(due - now);
+                }
+                if let Err(e) = bg.sync_pending() {
+                    eprintln!("iris: background disk sync failed: {e}");
+                    // Do not spin on a disk that keeps failing.
+                    std::thread::sleep(bg.interval);
+                }
+            }
+        })?;
+        let _ = self.waker.set(thread.thread().clone());
+        // A write that landed before the waker was set found nobody to wake,
+        // and the flag it set keeps later writes from trying.
+        fence(Ordering::SeqCst);
+        if self.is_pending() {
+            thread.thread().unpark();
+        }
+        Ok(())
+    }
+
+    /// Stop the flush thread. It ends at once, with one last sync if writes
+    /// are waiting.
+    pub fn finish(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(t) = self.waker.get() {
+            t.unpark();
+        }
+    }
+}
+
 /// A byte-addressed node in a layered block graph.
 ///
 /// Implementations are the raw image, the copy-on-write overlay, the hard-disk
@@ -124,6 +355,20 @@ pub trait BlockNode: Send {
 
     /// Push buffered writes out to durable storage.
     fn flush(&mut self) -> io::Result<()>;
+
+    /// Make the writes this node has accepted durable on the host, as a
+    /// write with FUA needs before it is acknowledged. It may leave undone
+    /// what only a later [`BlockNode::flush`] needs, such as compacting a
+    /// copy-on-write record, so it is cheaper. The default is a full flush.
+    fn flush_data(&mut self) -> io::Result<()> {
+        self.flush()
+    }
+
+    /// What a thread needs to make this node's writes durable without
+    /// running a command: `None` for a node that has none (read-only media).
+    fn background(&self) -> Option<Arc<Background>> {
+        None
+    }
 
     /// Discard `len` bytes at `offset`, releasing the layer's claim on them.
     /// A later read falls through to the backing node (or zeroes, if none).
@@ -215,33 +460,48 @@ fn sectors_for(offset: u64, len: u64) -> (u64, u64) {
     (first, last)
 }
 
+/// Capacity of an open file or block device. A regular file reports it through
+/// its metadata; a Linux block device reports 0 there, so seek to the end.
+pub fn file_capacity(file: &mut File) -> io::Result<u64> {
+    let len = file.metadata()?.len();
+    if len != 0 {
+        return Ok(len);
+    }
+    let end = file.seek(SeekFrom::End(0))?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(end)
+}
+
 /// A plain raw image file: every byte is real data held by this layer.
 pub struct RawNode {
     file: File,
     size: u64,
+    /// `None` for read-only media.
+    bg: Option<Arc<Background>>,
 }
 
 impl RawNode {
     /// Open `path` read-write and use its current length as the capacity.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let size = file.metadata()?.len();
-        Ok(Self { file, size })
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let size = file_capacity(&mut file)?;
+        Ok(Self::from_file(file, size))
     }
 
     /// Open `path` read-only. Used for removable read-only media (CD-ROM ISOs)
     /// and for a copy-on-write base, whose contents the overlay never mutates
     /// through this node.
     pub fn open_readonly(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).open(path)?;
-        let size = file.metadata()?.len();
-        Ok(Self { file, size })
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let size = file_capacity(&mut file)?;
+        Ok(Self { file, size, bg: None })
     }
 
     /// Wrap an already-open file handle. `size` is the node's capacity; the
     /// caller has the file positioned/opened as it wants.
     pub fn from_file(file: File, size: u64) -> Self {
-        Self { file, size }
+        let bg = Some(Background::for_file(&file));
+        Self { file, size, bg }
     }
 }
 
@@ -259,11 +519,30 @@ impl BlockNode for RawNode {
     fn write(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
         check_range(self.size, offset, buf.len() as u64)?;
         self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(buf)
+        self.file.write_all(buf)?;
+        if let Some(bg) = &self.bg {
+            bg.mark();
+        }
+        Ok(())
+    }
+
+    fn background(&self) -> Option<Arc<Background>> {
+        self.bg.clone()
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.sync_all()
+        match &self.bg {
+            Some(bg) => bg.syncing(|| self.file.sync_all()),
+            None => self.file.sync_all(),
+        }
+    }
+
+    fn flush_data(&mut self) -> io::Result<()> {
+        match &self.bg {
+            // The write's data is all the thread would sync for a raw image.
+            Some(bg) => bg.syncing(|| self.file.sync_data()),
+            None => self.file.sync_data(),
+        }
     }
 
     fn discard(&mut self, offset: u64, len: u64) -> io::Result<()> {
@@ -300,14 +579,15 @@ impl BlockNode for RawNode {
 /// compacting it would erase it.
 ///
 /// That makes ending the process at any point safe: what the kernel has
-/// accepted outlives it. A host crash or power loss is another matter. The
-/// disk tells the guest it has a write-back cache, and only a flush (the
-/// guest's SYNCHRONIZE CACHE, or iris stopping) promises that what came
-/// before it is on the host's disk. Writes since then may be lost, in any
-/// order, and a listed sector whose data had not reached the disk reads as
-/// zeroes. Syncing the overlay before each append would close only that last
-/// gap, at about a millisecond per write that takes a new sector against
-/// 20 us without it, and overwrites would still reach the disk out of order.
+/// accepted outlives it. A host crash or power loss is another matter. A
+/// thread syncs the overlay and the record about 5 s after the first write that follows a sync
+/// ([`Background`]), and a flush (the guest's SYNCHRONIZE CACHE, or iris
+/// stopping) compacts the record and syncs both at once. So a host crash
+/// loses up to about 5 s of writes, in any order, and a listed sector whose
+/// data had not reached the disk reads as zeroes. Syncing the overlay before
+/// each append would close only that last gap, at about a millisecond per
+/// write that takes a new sector against 20 us without it, and overwrites
+/// would still reach the disk out of order.
 pub struct CowNode {
     backing: Option<Box<dyn BlockNode>>,
     /// Base image path, so [`CowNode::commit`] can merge the overlay back into
@@ -321,6 +601,8 @@ pub struct CowNode {
     /// Set by anything that changes the overlay or its sector set, cleared by
     /// a flush, so a flush with nothing new to write costs nothing.
     unflushed: bool,
+    /// Shared with the thread that syncs the overlay in the background.
+    bg: Arc<Background>,
     size: u64,
 }
 
@@ -373,7 +655,8 @@ impl CowNode {
             overlay_path.display(),
             sidecar.display()
         );
-        let mut node = Self { backing, base_path, overlay, overlay_path, dirty, record: None, unflushed: false, size };
+        let bg = Background::for_file(&overlay);
+        let mut node = Self { backing, base_path, overlay, overlay_path, dirty, record: None, unflushed: false, bg, size };
         // Compact what a killed run appended, and drop an append it cut short,
         // so new entries start on an entry boundary.
         if sidecar.exists() {
@@ -407,7 +690,9 @@ impl CowNode {
         self.record = None;
         let path = self.sidecar_path();
         crate::cow_disk::save_dirty_sidecar(&path, &self.dirty)?;
-        self.record = Some(OpenOptions::new().append(true).open(&path)?);
+        let record = OpenOptions::new().append(true).open(&path)?;
+        self.bg.set_record(Some(&record));
+        self.record = Some(record);
         Ok(())
     }
 
@@ -534,19 +819,41 @@ impl BlockNode for CowNode {
         // overlay. Also when a later sector failed: the earlier ones are held
         // and must not be left out of the record.
         let recorded = if new.is_empty() { Ok(()) } else { self.record_new(&new) };
+        self.bg.mark();
         written.and(recorded)
+    }
+
+    fn background(&self) -> Option<Arc<Background>> {
+        Some(self.bg.clone())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         if !self.unflushed {
             return Ok(());
         }
-        self.overlay.sync_all()?;
-        self.rewrite_record()?;
+        let bg = self.bg.clone();
+        bg.syncing(|| {
+            self.overlay.sync_all()?;
+            self.rewrite_record()
+        })?;
         // The backing is never written through this node, so it has nothing
         // of ours to flush.
         self.unflushed = false;
         Ok(())
+    }
+
+    /// The overlay's data, and the record that lists its sectors: a sector
+    /// is only found again if both are on the disk. The record is not
+    /// compacted and `unflushed` stays set for the flush that does that.
+    fn flush_data(&mut self) -> io::Result<()> {
+        let bg = self.bg.clone();
+        bg.syncing(|| {
+            self.overlay.sync_data()?;
+            if let Some(record) = &self.record {
+                record.sync_data()?;
+            }
+            Ok(())
+        })
     }
 
     fn discard(&mut self, offset: u64, len: u64) -> io::Result<()> {
@@ -642,6 +949,7 @@ impl BlockNode for CowNode {
         self.dirty.clear();
         self.unflushed = true;
         self.record = None;
+        self.bg.set_record(None);
         let _ = std::fs::remove_file(self.sidecar_path());
         self.overlay.set_len(0)?;
         self.overlay.seek(SeekFrom::Start(0))?;
@@ -652,9 +960,9 @@ impl BlockNode for CowNode {
     /// (sorted). Mirrors [`crate::cow_disk::CowDisk::export_overlay`].
     fn export_overlay(&mut self, dest: &Path) -> io::Result<Vec<u64>> {
         self.overlay.sync_all()?;
-        crate::cow_disk::reflink_or_copy(&self.overlay_path, dest)?;
         let mut dirty: Vec<u64> = self.dirty.iter().copied().collect();
         dirty.sort_unstable();
+        crate::cow_disk::reflink_or_copy(&self.overlay_path, dest, &dirty)?;
         Ok(dirty)
     }
 
@@ -668,12 +976,13 @@ impl BlockNode for CowNode {
     /// in the middle therefore reads the base image: a disk the guest really
     /// had, though neither the one before the import nor the one imported.
     /// A copy that fails (no space) leaves the same thing.
-    fn import_overlay(&mut self, source: &Path, dirty: Vec<u64>) -> io::Result<()> {
+    fn import_overlay(&mut self, source: &Path, mut dirty: Vec<u64>) -> io::Result<()> {
+        dirty.sort_unstable();
         self.dirty.clear();
         self.unflushed = true;
         self.rewrite_record()?;
         let copied = if source.exists() {
-            crate::cow_disk::reflink_or_copy(source, &self.overlay_path)
+            crate::cow_disk::reflink_or_copy(source, &self.overlay_path, &dirty)
         } else {
             std::fs::File::create(&self.overlay_path).map(|_| ())
         };
@@ -684,6 +993,7 @@ impl BlockNode for CowNode {
             .write(true)
             .create(true)
             .open(&self.overlay_path)?;
+        self.bg.set_data(Some(&self.overlay));
         copied?;
         self.dirty = dirty.into_iter().collect();
         self.unflushed = true;
@@ -700,15 +1010,15 @@ pub struct ChdNode {
     /// rebuild the base; it is restored before the operation returns.
     hd: Option<ChdHd>,
     sector_size: u64,
-    /// Written since the CHD was last closed and opened again (see
-    /// [`BlockNode::flush`] below).
-    unflushed: bool,
     /// Capacity in bytes, so it can be answered while the handle is closed.
     bytes: u64,
-    /// What a flush that closed the handle but could not open it again left
-    /// behind. Every operation that needs the CHD tries again first, so a
-    /// transient failure is an I/O error for that command, not a dead node.
+    /// What a commit or rollback that closed the handle but could not open
+    /// it again left behind. Every operation that needs the CHD tries again
+    /// first, so a transient failure is an I/O error for that command, not a
+    /// dead node.
     closed: Option<ClosedChd>,
+    /// Follows the CHD's file across a commit or rollback.
+    bg: Arc<Background>,
 }
 
 /// What [`ChdNode`] keeps of a CHD it has closed and not yet reopened.
@@ -727,16 +1037,28 @@ impl ChdNode {
         let hd = ChdHd::open(path, cow)?;
         let sector_size = u64::from(hd.sector_size());
         let bytes = hd.size();
-        Ok(Self { hd: Some(hd), sector_size, unflushed: false, bytes, closed: None })
+        let bg = Background::for_durable(hd.file());
+        Ok(Self { hd: Some(hd), sector_size, bytes, closed: None, bg })
     }
 
-    /// Open the CHD again if a flush closed it and could not.
+    /// Open the CHD again if a commit or rollback closed it and could not.
     fn ensure_open(&mut self) -> io::Result<()> {
         if let Some(c) = &self.closed {
-            self.hd = Some(ChdHd::open(&c.base, c.cow)?);
+            let hd = ChdHd::open(&c.base, c.cow)?;
+            self.bg.set_durable(Some(hd.file()));
+            self.hd = Some(hd);
             self.closed = None;
         }
         Ok(())
+    }
+
+    /// Close the CHD, so its files can be replaced or removed, and leave
+    /// what opens it again.
+    fn close(&mut self, closed: ClosedChd) {
+        // The background thread's handle would keep the file open.
+        self.bg.set_durable(None);
+        self.hd = None;
+        self.closed = Some(closed);
     }
 
     fn hd(&self) -> &ChdHd {
@@ -772,36 +1094,45 @@ impl BlockNode for ChdNode {
             return Err(invalid("CHD writes must be sector-aligned"));
         }
         check_range(self.hd().size(), offset, buf.len() as u64)?;
-        self.unflushed = true;
-        self.hd_mut().write_sectors(offset / ss, buf)
+        let written = self.hd_mut().write_sectors(offset / ss, buf);
+        // Also after a failed write: an earlier hunk may have gone out.
+        self.bg.mark();
+        // A write that gave a hunk its first data holds the hunk's map entry
+        // until a sync. A kill would lose the entry and keep any later write,
+        // and a filesystem cannot recover from losing an earlier write but
+        // not a later one. Sync now, so every write is in the file before
+        // the next one starts. Writes to hunks the CHD already holds, the
+        // common case once a disk is in use, cost nothing more.
+        let file = self.hd().file();
+        if file.holds_map_entries() {
+            let synced = self.bg.syncing(|| file.sync(false));
+            return written.and(synced);
+        }
+        written
     }
 
-    /// libchdman has no flush: the writes it has accepted are all in its file
-    /// only once it is closed, and a node that is leaked, as at a
-    /// `process::exit`, never closes it (the last hunks written come back
-    /// unwritten). So close the CHD and open it again, which is the one way to
-    /// make them durable. It costs a reopen only when something was written
-    /// since the last flush.
+    fn background(&self) -> Option<Arc<Background>> {
+        Some(self.bg.clone())
+    }
+
+    /// The CHD's data goes straight to its file; the map entries for hunks
+    /// it allocated are held until a sync has put that data on the disk
+    /// (see [`crate::chd_disk::ChdFile`]). So a flush is a sync of the file,
+    /// with the held entries written between two syncs of the data.
     fn flush(&mut self) -> io::Result<()> {
         self.ensure_open()?;
-        if !self.unflushed {
-            return Ok(());
-        }
-        let hd = self.hd.take().expect("CHD handle present outside commit/rollback");
-        let base = hd.base_path().to_str().ok_or_else(|| invalid("non-UTF-8 CHD path"))?.to_string();
-        self.closed = Some(ClosedChd {
-            base: base.clone(),
-            cow: hd.is_cow(),
-            overlay: hd.overlay_paths(),
-            pending: hd.pending_sync(),
-            dirty: hd.diff_dirty(),
-        });
-        drop(hd); // closes the file, writing out what libchdman held back
-        // Closed and written out: the writes are durable even if this fails.
-        self.unflushed = false;
-        self.ensure_open()
+        let file = self.hd().file();
+        self.bg.syncing(|| file.sync(true))
     }
 
+    fn flush_data(&mut self) -> io::Result<()> {
+        self.ensure_open()?;
+        let file = self.hd().file();
+        self.bg.syncing(|| file.sync(false))
+    }
+
+    /// A CHD presents the merged view itself, with no backing node, so a
+    /// discarded range reads as zeroes, as it does on a raw image.
     fn discard(&mut self, offset: u64, len: u64) -> io::Result<()> {
         check_range(self.bytes, offset, len)?;
         let zeros = vec![0u8; len as usize];
@@ -865,8 +1196,8 @@ impl BlockNode for ChdNode {
             .ok_or_else(|| invalid("non-UTF-8 CHD path"))?
             .to_string();
 
-        self.hd = None; // close so flatten_diff can rename over the base
-        self.closed = Some(ClosedChd {
+        // Close so flatten_diff can rename over the base.
+        self.close(ClosedChd {
             base: base_str,
             cow,
             overlay: Some((base.clone(), diff.clone())),
@@ -878,7 +1209,6 @@ impl BlockNode for ChdNode {
         // disk can be reopened; surface the fold error after restoring the node.
         // A reopen that fails leaves `closed` for the next command to retry.
         self.ensure_open()?;
-        self.unflushed = false;
         folded?;
         Ok(1)
     }
@@ -896,8 +1226,8 @@ impl BlockNode for ChdNode {
             .ok_or_else(|| invalid("non-UTF-8 CHD path"))?
             .to_string();
 
-        self.hd = None; // close before reopening over the (untouched) base
-        self.closed = Some(ClosedChd {
+        // Close before reopening over the (untouched) base.
+        self.close(ClosedChd {
             base: base_str,
             cow,
             overlay: Some((base.clone(), diff.clone())),
@@ -906,7 +1236,6 @@ impl BlockNode for ChdNode {
         });
         let _ = std::fs::remove_file(&diff);
         self.ensure_open()?;
-        self.unflushed = false;
         Ok(())
     }
 }
@@ -1246,14 +1575,19 @@ mod tests {
     /// Build a 256 KiB compressed hard-disk CHD full of `byte`, and return its
     /// path. MAME's v5 compression map asserts below one hunk, so keep it large.
     fn compressed_chd(byte: u8) -> PathBuf {
+        compressed_chd_of(vec![byte; 256 * 1024])
+    }
+
+    /// Build a compressed hard-disk CHD with 4 KiB hunks holding `data`.
+    fn compressed_chd_of(data: Vec<u8>) -> PathBuf {
         use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
         use libchdman_rs::CHD_CODEC_ZLIB;
         use std::io::Cursor;
 
         let base = tmp_path("chd").with_extension("chd");
-        let logical = 256 * 1024u64;
+        let logical = data.len() as u64;
         create_from_reader(
-            Cursor::new(vec![byte; logical as usize]),
+            Cursor::new(data),
             &base,
             HdCreateOptions {
                 logical_size: logical,
@@ -1275,54 +1609,217 @@ mod tests {
         let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(overlay));
     }
 
-    /// libchdman has no flush: what it has accepted is in the file only once
-    /// it is closed, which a node left behind by `process::exit` never is.
-    /// `mem::forget` stands in for that exit; the write must still be there
-    /// when the CHD is opened again, both in a diff and with the COW flag, at
-    /// the start, middle and end of the disk.
+    /// A node left behind by `process::exit` is never closed. `mem::forget`
+    /// stands in for that exit; a write that a flush, a data sync or the
+    /// background thread has made durable must still be there when the CHD
+    /// is opened again, both in a diff and with the COW flag, at the start,
+    /// middle and end of the disk.
     #[test]
-    fn chd_flushed_writes_survive_an_exit_that_skips_drop() {
-        for cow in [false, true] {
-            for lba in [0u64, 9, 511] {
-                let base = compressed_chd(0xAB);
-                let mut node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
-                node.write(lba * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
-                node.flush().unwrap();
-                std::mem::forget(node);
+    fn chd_synced_writes_survive_an_exit_that_skips_drop() {
+        for sync in ["flush", "flush_data", "background"] {
+            for cow in [false, true] {
+                for lba in [0u64, 9, 511] {
+                    let base = compressed_chd(0xAB);
+                    let mut node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
+                    // A write that gives a hunk its first data syncs itself;
+                    // the second lands in place and waits for the sync.
+                    node.write(lba * SECTOR_SIZE, &[0x11; SECTOR_BYTES]).unwrap();
+                    node.write(lba * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
+                    match sync {
+                        "flush" => node.flush().unwrap(),
+                        "flush_data" => node.flush_data().unwrap(),
+                        _ => assert!(node.background().unwrap().sync_pending().unwrap()),
+                    }
+                    std::mem::forget(node);
 
-                let mut node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
-                let mut got = [0u8; SECTOR_BYTES];
-                node.read(lba * SECTOR_SIZE, &mut got).unwrap();
-                assert_eq!(got, [0x5A; SECTOR_BYTES], "cow={cow} lba={lba}");
-                drop(node);
-                let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
-                let _ = std::fs::remove_file(base);
+                    let mut node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
+                    let mut got = [0u8; SECTOR_BYTES];
+                    node.read(lba * SECTOR_SIZE, &mut got).unwrap();
+                    assert_eq!(got, [0x5A; SECTOR_BYTES], "{sync} cow={cow} lba={lba}");
+                    drop(node);
+                    remove_chd(&base);
+                }
             }
         }
     }
 
-    /// A flush whose reopen fails reports it and leaves a node that works
-    /// again once the file is back, not one that panics on its next command.
-    #[test]
-    fn chd_flush_that_cannot_reopen_leaves_a_usable_node() {
-        let base = compressed_chd(0xAB);
-        let away = base.with_extension("away");
-        let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
-        node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
-        std::fs::rename(&base, &away).unwrap();
-        assert!(node.flush().is_err(), "the base is missing, so the reopen fails");
-        assert_eq!(node.size(), 256 * 1024);
-        assert!(node.is_cow(), "the diff is still known");
-        std::fs::rename(&away, &base).unwrap();
-        let mut got = [0u8; SECTOR_BYTES];
-        node.read(9 * SECTOR_SIZE, &mut got).unwrap();
-        assert_eq!(got, [0x5A; SECTOR_BYTES], "the write made it to the diff");
-        drop(node);
-        let _ = std::fs::remove_file(crate::chd_disk::diff_path_for(&base));
-        let _ = std::fs::remove_file(base);
+    /// The 4-byte map entry of hunk `hunk` as the CHD file on the disk has it.
+    fn chd_map_entry(path: &Path, hunk: u64) -> u32 {
+        let f = std::fs::read(path).unwrap();
+        let map = u64::from_be_bytes(f[40..48].try_into().unwrap()) as usize;
+        let at = map + hunk as usize * 4;
+        u32::from_be_bytes(f[at..at + 4].try_into().unwrap())
     }
 
-    /// A CHD node whose base has been moved away and whose flush has failed
+    /// A write to a hunk the diff does not hold yet appends the hunk and
+    /// points the map at it. The map entry reaches the file only with a
+    /// sync, which puts the hunk's data on the disk first, so the map on the
+    /// disk never points at data that is not there. The node's own write
+    /// syncs at once (see `chd_kill_keeps_writes_in_order`), so the CHD
+    /// under it is written directly to see the entry held.
+    #[test]
+    fn chd_map_entry_reaches_the_file_only_with_a_sync() {
+        let base = compressed_chd(0xAB);
+        let diff = crate::chd_disk::diff_path_for(&base);
+        let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
+        // Hunk 2 of 4 KiB, sector 17 of it.
+        node.hd_mut().write_sectors(17, &[0x5A; SECTOR_BYTES]).unwrap();
+        assert_eq!(chd_map_entry(&diff, 2), 0, "held until a sync");
+        node.flush_data().unwrap();
+        let entry = chd_map_entry(&diff, 2);
+        assert_ne!(entry, 0, "written by the sync");
+        let f = std::fs::read(&diff).unwrap();
+        let hunk = &f[entry as usize * 4096..][..4096];
+        assert_eq!(&hunk[512..1024], &[0x5A; SECTOR_BYTES][..], "the entry points at the write");
+        assert_eq!(&hunk[..512], &[0xAB; SECTOR_BYTES][..], "and the rest of the hunk is the base's");
+        drop(node);
+        remove_chd(&base);
+    }
+
+    /// The background thread alone, with no explicit flush, makes writes
+    /// durable, map entries included: a copy of the files as the host has
+    /// them, taken while the node is still open and never closed, stands in
+    /// for a SIGKILL. Reads and writes go on meanwhile, as a busy guest's
+    /// do. The node's thread runs on a short interval so the test waits for
+    /// the sync, not for the production five seconds.
+    #[test]
+    fn chd_background_sync_covers_a_busy_disk_at_a_kill() {
+        let base = compressed_chd(0xAB);
+        let diff = crate::chd_disk::diff_path_for(&base);
+        let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
+        let fast = Background::idle(Duration::from_millis(100));
+        let file: Arc<dyn Durable> = node.hd().file();
+        fast.set_durable(Some(file));
+        node.bg = fast.clone();
+        fast.spawn().unwrap();
+        let hunks = 60u64;
+        for round in 0..3u8 {
+            for h in 0..hunks {
+                let at = (h * 8 + u64::from(round) + 1) * SECTOR_SIZE;
+                node.write(at, &[0x10 + round; SECTOR_BYTES]).unwrap();
+                let mut got = [0u8; SECTOR_BYTES];
+                node.read(at, &mut got).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        // Whether every write is on the host's disk yet: reopen a copy of
+        // the files and read them all back.
+        let copy = tmp_path("chd-kill").with_extension("chd");
+        let durable = || {
+            let ok = std::fs::copy(&base, &copy).is_ok()
+                && std::fs::copy(&diff, crate::chd_disk::diff_path_for(&copy)).is_ok()
+                && match ChdNode::open(copy.to_str().unwrap(), false) {
+                    Ok(mut again) => (0..3u8).all(|round| {
+                        (0..hunks).all(|h| {
+                            let at = (h * 8 + u64::from(round) + 1) * SECTOR_SIZE;
+                            let mut got = [0u8; SECTOR_BYTES];
+                            again.read(at, &mut got).is_ok() && got == [0x10 + round; SECTOR_BYTES]
+                        })
+                    }),
+                    Err(_) => false,
+                };
+            remove_chd(&copy);
+            ok
+        };
+        assert!(wait_for(durable), "the background sync alone made the writes durable");
+        fast.finish();
+        drop(node);
+        remove_chd(&base);
+    }
+
+    /// A kill leaves the CHD as the host's files have it. Whatever it loses,
+    /// it must not keep a write and lose one the guest made before it: a
+    /// filesystem's log recovery assumes it sees a prefix of its writes. A
+    /// copy of the files taken while the node is open, with no sync in
+    /// between, stands in for the kill. The earlier write goes to a hunk new
+    /// to the diff, the later one in place to a hunk the diff already holds.
+    #[test]
+    fn chd_kill_keeps_writes_in_order() {
+        let base = compressed_chd(0xAB);
+        let diff = crate::chd_disk::diff_path_for(&base);
+        let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
+        node.write(0, &[0x11; SECTOR_BYTES]).unwrap();
+        node.flush().unwrap();
+        // Hunk 0 is now held by the diff and synced; hunk 3 is new to it.
+        node.write(3 * 4096, &[0x22; SECTOR_BYTES]).unwrap();
+        node.write(SECTOR_SIZE, &[0x33; SECTOR_BYTES]).unwrap();
+
+        let copy = tmp_path("chd-order").with_extension("chd");
+        std::fs::copy(&base, &copy).unwrap();
+        std::fs::copy(&diff, crate::chd_disk::diff_path_for(&copy)).unwrap();
+        let mut again = ChdNode::open(copy.to_str().unwrap(), false).unwrap();
+        let mut earlier = [0u8; SECTOR_BYTES];
+        again.read(3 * 4096, &mut earlier).unwrap();
+        let mut later = [0u8; SECTOR_BYTES];
+        again.read(SECTOR_SIZE, &mut later).unwrap();
+        drop(again);
+        remove_chd(&copy);
+        assert!(
+            later != [0x33; SECTOR_BYTES] || earlier == [0x22; SECTOR_BYTES],
+            "the later write survived the kill and the earlier one did not (earlier reads {:#04x})",
+            earlier[0]
+        );
+        drop(node);
+        remove_chd(&base);
+    }
+
+    /// Zeroes written over a hunk a diff does not hold yet read back as
+    /// zeroes, not as the base: a whole hunk, a sector of a hunk whose other
+    /// sectors are zero in the base, and a discard, which reads as zeroes on
+    /// a CHD as on a raw image. Checked before and after a reopen, since
+    /// MAME's one-hunk cache can show a write that never reached the file.
+    #[test]
+    fn chd_zeroes_over_an_untouched_hunk_read_back_as_zeroes() {
+        const HUNK: usize = 4096;
+        // 0xAB everywhere except hunk 5, which is zero but for its sector 3.
+        let mut data = vec![0xABu8; 256 * 1024];
+        data[5 * HUNK..6 * HUNK].fill(0);
+        data[5 * HUNK + 3 * SECTOR_BYTES..][..SECTOR_BYTES].fill(0xAB);
+        let cases: [(&str, u64, usize); 4] = [
+            ("whole-hunk write", 2 * HUNK as u64, HUNK),
+            ("one-sector write", 5 * HUNK as u64 + 3 * SECTOR_SIZE, SECTOR_BYTES),
+            ("whole-hunk discard", 7 * HUNK as u64, HUNK),
+            ("one-sector discard", 9 * HUNK as u64 + SECTOR_SIZE, SECTOR_BYTES),
+        ];
+        for cow in [false, true] {
+            let base = compressed_chd_of(data.clone());
+            let mut node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
+            for (what, offset, len) in cases {
+                if what.ends_with("discard") {
+                    node.discard(offset, len as u64).unwrap();
+                } else {
+                    node.write(offset, &vec![0; len]).unwrap();
+                }
+            }
+            node.flush().unwrap();
+            for reopened in [false, true] {
+                if reopened {
+                    drop(node);
+                    node = ChdNode::open(base.to_str().unwrap(), cow).unwrap();
+                }
+                for (what, offset, len) in cases {
+                    // Read a different hunk first, so MAME's cache does not
+                    // hold the one under test.
+                    let mut other = vec![0u8; HUNK];
+                    node.read(0, &mut other).unwrap();
+                    let mut got = vec![0xEEu8; len];
+                    node.read(offset, &mut got).unwrap();
+                    assert!(got.iter().all(|&b| b == 0), "{what}, cow={cow}, reopened={reopened}");
+                    // The rest of the hunk keeps the base's bytes.
+                    let start = offset as usize / HUNK * HUNK;
+                    let mut hunk = vec![0u8; HUNK];
+                    node.read(start as u64, &mut hunk).unwrap();
+                    let mut want = data[start..start + HUNK].to_vec();
+                    want[offset as usize - start..][..len].fill(0);
+                    assert!(hunk == want, "{what}: rest of the hunk, cow={cow}, reopened={reopened}");
+                }
+            }
+            drop(node);
+            remove_chd(&base);
+        }
+    }
+
+    /// A CHD node whose base has been moved away and whose commit has failed
     /// to reopen it. Returns the node and the paths to put the base back.
     fn closed_chd_node() -> (ChdNode, PathBuf, PathBuf) {
         let base = compressed_chd(0xAB);
@@ -1330,7 +1827,9 @@ mod tests {
         let mut node = ChdNode::open(base.to_str().unwrap(), false).unwrap();
         node.write(9 * SECTOR_SIZE, &[0x5A; SECTOR_BYTES]).unwrap();
         std::fs::rename(&base, &away).unwrap();
-        assert!(node.flush().is_err());
+        assert!(node.commit().is_err());
+        assert_eq!(node.size(), 256 * 1024);
+        assert!(node.is_cow(), "the diff is still known");
         (node, base, away)
     }
 
@@ -1625,7 +2124,7 @@ mod tests {
     }
 
     /// An import that fails after taking the live overlay away (here the
-    /// source is a directory, as a full disk would also fail the copy) must
+    /// source cannot be opened, as a full disk would also fail the copy) must
     /// not leave the old record over the emptied overlay: its sectors would
     /// read as zeroes or fail. A kill at the same point reads the same way.
     #[test]
@@ -1638,9 +2137,25 @@ mod tests {
         node.flush().unwrap();
         node.write(5 * SECTOR_SIZE, &[0x05u8; 2 * SECTOR_BYTES]).unwrap();
 
-        let unreadable = tmp_path("cow-import-dir");
-        std::fs::create_dir(&unreadable).unwrap();
+        // A file that cannot be opened. (A directory will not do: the sparse
+        // copy clamps to its reported length, which can be tiny, and copies
+        // nothing without failing.)
+        let unreadable = tmp_path("cow-import-unreadable");
+        std::fs::write(&unreadable, [0u8; 4 * SECTOR_BYTES]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::remove_file(&unreadable).unwrap();
+            std::fs::create_dir(&unreadable).unwrap();
+        }
         assert!(node.import_overlay(&unreadable, vec![1, 2]).is_err());
+        #[cfg(unix)]
+        std::fs::remove_file(&unreadable).unwrap();
+        #[cfg(not(unix))]
         std::fs::remove_dir(&unreadable).unwrap();
         std::mem::forget(node);
 
@@ -2018,6 +2533,38 @@ mod tests {
         let _ = std::fs::remove_file(&export_path);
     }
 
+    /// An import of an unsorted dirty list, then a kill: the record the next
+    /// run reads lists exactly the imported sectors and the overlay holds
+    /// their data, which the sparse fallback copies by the (sorted) list.
+    #[test]
+    fn cow_import_survives_a_kill_with_the_imported_sectors() {
+        let (backing, backing_path) = raw_filled(0xAA, 8 * SECTOR_BYTES);
+        let overlay_path = tmp_path("cow-import-kill");
+        let export_path = tmp_path("cow-import-kill-src");
+        let size = 8 * SECTOR_SIZE;
+        let mut node = CowNode::new(Some(Box::new(backing)), &overlay_path, size).unwrap();
+        node.write(SECTOR_SIZE, &[0x11u8; SECTOR_BYTES]).unwrap();
+        node.write(6 * SECTOR_SIZE, &[0x66u8; SECTOR_BYTES]).unwrap();
+        let dirty = node.export_overlay(&export_path).unwrap();
+        node.rollback().unwrap();
+
+        let mut shuffled = dirty.clone();
+        shuffled.reverse();
+        node.import_overlay(&export_path, shuffled).unwrap();
+        std::mem::forget(node);
+
+        let mut node = reopen_after_kill(&backing_path, &overlay_path, size);
+        assert_eq!(node.dirty_count(), 2);
+        assert_eq!(sector(&mut node, 1), [0x11u8; SECTOR_BYTES]);
+        assert_eq!(sector(&mut node, 6), [0x66u8; SECTOR_BYTES]);
+        assert_eq!(sector(&mut node, 3), [0xAAu8; SECTOR_BYTES]);
+
+        drop(node);
+        cleanup(&overlay_path);
+        let _ = std::fs::remove_file(&backing_path);
+        let _ = std::fs::remove_file(&export_path);
+    }
+
     #[test]
     fn chd_node_reports_pending_sync_and_overlay_paths() {
         let base = compressed_chd(0xAB);
@@ -2192,5 +2739,143 @@ mod tests {
         let b = iso("queue-b", 2, 4);
         c.add(b.clone()).unwrap();
         assert_eq!(c.discs(), [a, b], "a queued disc follows the active one, unopened");
+    }
+
+    fn bg_file(tag: &str) -> (PathBuf, File) {
+        let path = tmp_path(tag);
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        (path, file)
+    }
+
+    /// Wait for `cond`, up to 5 s.
+    fn wait_for(cond: impl Fn() -> bool) -> bool {
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// The thread syncs once for a write and then not at all while nothing
+    /// is written: it parks. A later write wakes it again.
+    #[test]
+    fn background_sync_runs_only_with_unflushed_writes() {
+        let (path, file) = bg_file("bg-idle");
+        let bg = Background::with_interval(&file, Duration::from_millis(20));
+        bg.spawn().unwrap();
+        let syncs = || bg.syncs();
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(syncs(), 0, "idle: nothing to sync");
+
+        bg.mark();
+        assert!(wait_for(|| syncs() == 1), "a write is synced");
+        assert!(!bg.is_pending());
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(syncs(), 1, "and then it is idle again");
+
+        bg.mark();
+        bg.mark();
+        assert!(wait_for(|| syncs() == 2), "a later write wakes it");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(syncs(), 2, "a burst is one sync");
+        bg.finish();
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A write marked before the thread exists is synced once it does.
+    #[test]
+    fn a_write_marked_before_the_thread_starts_is_synced() {
+        let (path, file) = bg_file("bg-early");
+        let bg = Background::with_interval(&file, Duration::from_millis(20));
+        bg.mark();
+        bg.spawn().unwrap();
+        assert!(wait_for(|| bg.syncs() == 1), "synced without another write");
+        bg.finish();
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A node's own sync clears the flag before it runs and sets it again if
+    /// it fails, so the thread retries what the node could not make durable.
+    #[test]
+    fn a_failed_explicit_sync_leaves_the_writes_for_the_thread() {
+        let (path, file) = bg_file("bg-retry");
+        let bg = Background::with_interval(&file, Duration::from_secs(60));
+        bg.mark();
+        assert!(bg.syncing(|| Ok(())).is_ok());
+        assert!(!bg.is_pending(), "a sync that worked leaves nothing");
+        bg.mark();
+        let failed: io::Result<()> = bg.syncing(|| Err(io::Error::other("disk full")));
+        assert!(failed.is_err());
+        assert!(bg.is_pending(), "a sync that failed leaves the writes waiting");
+        // A write during the sync is not lost to it.
+        let _ = bg.syncing(|| {
+            bg.mark();
+            Ok(())
+        });
+        assert!(bg.is_pending());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A node's own flush leaves nothing for the thread to do.
+    #[test]
+    fn an_explicit_flush_clears_the_background_sync() {
+        let path = tmp_path("bg-flush");
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let mut node = RawNode::open(&path).unwrap();
+        node.write(0, &[1u8; 512]).unwrap();
+        let bg = node.background().expect("a writable image has one");
+        assert!(bg.is_pending());
+        node.flush().unwrap();
+        assert!(!bg.is_pending());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// So does a sync of the data alone, as a write with FUA makes: the
+    /// thread has nothing left to sync for a raw image or an overlay.
+    #[test]
+    fn syncing_a_nodes_data_clears_the_background_sync() {
+        let path = tmp_path("bg-data");
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let mut raw = RawNode::open(&path).unwrap();
+        raw.write(0, &[1u8; 512]).unwrap();
+        let bg = raw.background().unwrap();
+        assert!(bg.is_pending());
+        raw.flush_data().unwrap();
+        assert!(!bg.is_pending());
+        let _ = std::fs::remove_file(&path);
+
+        let overlay = tmp_path("bg-data-cow");
+        let mut cow = CowNode::new(None, &overlay, 8 * 512).unwrap();
+        cow.write(0, &[1u8; 512]).unwrap();
+        let bg = cow.background().unwrap();
+        assert!(bg.is_pending());
+        cow.flush_data().unwrap();
+        assert!(!bg.is_pending());
+    }
+
+    /// The overlay's thread syncs the files the overlay has now, after the
+    /// record is replaced and after an import replaces the overlay file.
+    #[test]
+    fn a_cow_overlay_marks_writes_for_the_background_sync() {
+        let overlay = tmp_path("bg-cow");
+        let mut node = CowNode::new(None, &overlay, 8 * 512).unwrap();
+        let bg = node.background().expect("an overlay has one");
+        assert!(!bg.is_pending());
+        node.write(0, &[1u8; 512]).unwrap();
+        assert!(bg.is_pending());
+        assert!(bg.sync_pending().unwrap());
+        assert!(!bg.sync_pending().unwrap(), "nothing more to sync");
+        node.flush().unwrap();
+        node.write(512, &[2u8; 512]).unwrap();
+        assert!(bg.is_pending(), "a write after a flush marks again");
+        assert!(RawNode::open_readonly(&overlay).unwrap().background().is_none());
+        drop(node);
+        let _ = std::fs::remove_file(crate::cow_disk::sidecar_path_for(&overlay));
+        let _ = std::fs::remove_file(overlay);
     }
 }

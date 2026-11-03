@@ -161,6 +161,7 @@ pub mod build_features {
     }
 }
 
+pub mod validate_config;
 pub mod config;
 pub mod traits;
 #[macro_use]
@@ -243,5 +244,7 @@ mod display_stop_tests;
 mod platform_profile_tests;
 #[cfg(test)]
 mod exit_persistence_tests;
+#[cfg(test)]
+mod block_node_sync_bench;
 #[cfg(test)]
 pub(crate) mod test_board;

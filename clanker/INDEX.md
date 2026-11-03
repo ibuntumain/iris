@@ -100,6 +100,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 
 | Note | Kind | Title |
 |---|---|---|
+| [virtio-serial-design.md](devices/virtio-serial-design.md) | design | virtio-serial: one transport-neutral core, mmio in a GIO slot (IP22/24/28) and pci (IP30); threading, byte order and open items |
 | [empty-gio-slot-reads-bus-error.md](devices/empty-gio-slot-reads-bus-error.md) | rule | Reads of an empty GIO slot end in a bus error (ABORT_EN); all ones made the PROM poll a phantom Newport 200 000 times headless |
 | [audio-test-suite.md](devices/audio-test-suite.md) | howto | The audio test suite (`test/audiotest`): rates x channels x widths through the audio library, playaiff and sfplay, checked against the Octane's capture |
 | [cpal-alsa-busy-poll.md](devices/cpal-alsa-busy-poll.md) | rule | cpal's ALSA backend can spin a core: `[audio] host = "pulseaudio"` |
@@ -109,6 +110,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [hpc3-rx-channel-refused-while-active.md](devices/hpc3-rx-channel-refused-while-active.md) | history | A receive channel that refuses while reporting itself active |
 | [indigo2-eeprom-byte-lane-gap.md](devices/indigo2-eeprom-byte-lane-gap.md) | rule | Indigo2 motherboard EEPROM: PROM writes via byte access, HPC3 only handled 32-bit |
 | [ip28-512mb-banks.md](devices/ip28-512mb-banks.md) | howto | IP28 512 MB banks |
+| [o2-icon-backdrop-crosshatch.md](devices/o2-icon-backdrop-crosshatch.md) | open | O2 icon boxes crosshatch: GL dithers the panel's own colour, truncated just under the 5-bit grid; the guest's drawing, unconfirmed against hardware; `re dither off` compares |
 | [o2-readback-transfer-registers.md](devices/o2-readback-transfer-registers.md) | rule | O2 glReadPixels: the frame-buffer-to-linear transfer, GL vertices, edge type, src steps and linStride as IRIX uses them |
 | [ip32-o2-bringup-log.md](devices/ip32-o2-bringup-log.md) | history | The O2 (IP32) bring-up log: PROM, POST, CRIME/MACE/GBE, SCSI, PCI, the OSes |
 | [ip32-headless-irix-panics.md](devices/ip32-headless-irix-panics.md) | rule | O2 TLBMISS at 0xff800000 in early boot was `crmFifoWait` timing out on our host-thread RE; status polls now wait for the engine (fixed) |
@@ -245,11 +247,14 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 
 ## odyssey/
 
-Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Not emulated; references and groundwork only.
+Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Modelled on the Octane (`[graphics] board = "v12"` and the other three).
 
 | Note | Kind | Title |
 |---|---|---|
+| [bringup.md](odyssey/bringup.md) | howto | VPro on the Octane: board catalogue, Crossbow code 5, PROM/IRIX minimums, disk images |
+| [gotchas.md](odyssey/gotchas.md) | rule | VPro gotchas: IMPACT installs lack the driver, textport FIFO cost, the f64 depth path |
 | [public-references.md](odyssey/public-references.md) | open | Odyssey (VPro) public references: two console-level drivers, no GL stream |
+| [threads-and-locks.md](odyssey/threads-and-locks.md) | design | VPro threads, who owns the board and raster state, the processors' lock, the lock-free display, the command ring and its ordering rules |
 
 ## hostgl/
 
@@ -309,7 +314,7 @@ Snapshots, `iris-ci`, scratch volumes, round-trip tests.
 
 | Note | Kind | Title |
 |---|---|---|
-| [ci-mode-overlay-path-is-tmpiris-ci-pid-scsiidoverlay.md](snapshot/ci-mode-overlay-path-is-tmpiris-ci-pid-scsiidoverlay.md) | howto | CI mode overlay path is /tmp/iris-ci-PID-scsiID.overlay |
+| [ci-mode-overlay-is-in-the-temporary-directory.md](snapshot/ci-mode-overlay-is-in-the-temporary-directory.md) | howto | CI mode overlay path is $TMPDIR/iris-ci-PID-START-scsiID.overlay |
 | [iris-ci-is-the-canonical-ci-socket-interface.md](snapshot/iris-ci-is-the-canonical-ci-socket-interface.md) | howto | iris-ci is the canonical CI socket interface |
 | [l1d-tag-must-match-the-cache-line-layout.md](snapshot/l1d-tag-must-match-the-cache-line-layout.md) | rule | L1D cache tag must match one manual layout, not two |
 | [machine-pointer-holders-must-share-the-drop-slot.md](snapshot/machine-pointer-holders-must-share-the-drop-slot.md) | rule | Raw `*mut Machine` holders must share the slot that Drop nulls |
@@ -379,6 +384,7 @@ Running IRIX as a guest: install, network setup, shell quirks, X defaults.
 | [irix-install.md](irix/irix-install.md) | howto | Installing IRIX on iris (from scratch) |
 | [keyboard-issues.md](irix/keyboard-issues.md) | open | IRIX Keyboard Issues |
 | [networking.md](irix/networking.md) | howto | IRIX 6.5 Networking Configuration |
+| [octane-halt-request-outlives-a-quit.md](irix/octane-halt-request-outlives-a-quit.md) | rule | Octane: quitting during the PROM's halt leaves the next boot at "Okay to power off" |
 
 ## build/
 

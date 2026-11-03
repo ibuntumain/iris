@@ -413,7 +413,10 @@ The export is a single root, so mount it as `/`:
 ```
 
 Use the gateway address shown in the GUI (it tracks your NAT subnet). The server
-fakes uid/gid/mode so the export behaves the same regardless of the host OS.
+fakes uid/gid/mode so the export behaves the same regardless of the host OS. The one
+mode bit it keeps is the execute bit (on Unix hosts): a file the host marks
+executable shows as `0755`, and a guest `chmod` or `CREATE` that sets or clears an
+execute bit changes the host file, so a binary linked on the share can run from it.
 
 In PCAP mode there is no gateway, so set `[network] nfs_pcap_ip` to a free
 address on your LAN; the server answers there instead and the guest mounts
@@ -603,7 +606,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # serial_port_b = 8881          # serial channel B (ttyd1, the console); likewise
 # keyboard = "ansi"             # host keyboard shape: "ansi", "iso" or "jis" (see Keyboard)
 # ci = false                    # CI control socket (see README)
-# ci_socket = "/tmp/iris.sock"  # Windows default: "127.0.0.1:19851"
+# ci_socket = "/tmp/iris.sock"  # default: iris.sock in $TMPDIR, else /tmp; Windows: "127.0.0.1:19851"
 # ci_display = false
 # serial_log = "ttyd1.log"
 
@@ -616,12 +619,12 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # ── Machine ──────────────────────────────────────────────────────────────────
 
 [machine]
-profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md)
+profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md); --machine NAME picks any
 cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
 # cpus  = 2                 # Octane only: a second processor (docs/Octane/multiprocessor.md)
 
 [graphics]
-board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact) or "none"
+board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact), "v6", "v8", "v10", "v12" ("vpro:v12" and so on; need IRIX 6.5.10 or later installed with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12) or "none"
 heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
@@ -643,6 +646,8 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 path    = "scsi1.raw"       # raw or .chd image
 cdrom   = false
 overlay = false             # true = copy-on-write overlay in scsi1.raw.overlay
+# write_cache = true        # the disk's write cache (default true). true: a write completes once the host has it and a sync follows within ~5 s, so a host crash or
+                            # power cut can lose the last ~5 s of writes. false: every write is stored on the host's disk before it completes, as on SGI's drives (slower). See STORAGE.md.
 # controller = 0            # Indigo2 and O2 have two: 0 or 1 (the O2's 1 is its external bus); or write [scsi.17]
 
 # A CD-ROM. path may be empty to start with an empty tray.
@@ -743,6 +748,29 @@ addresses the second controller.
 
 ---
 
+## Checking a configuration
+
+`iris --validate --config FILE` reads a configuration the way a run would and
+reports what is wrong with it, without starting the machine, opening a window
+or touching the sound device. It exits 0 and prints `iris: FILE: ok (machine)`
+if a run from the command line would start, and otherwise exits 1 with one
+`Configuration error:` line per problem on stderr; a missing disk image is one,
+because a command-line run stops on it. A `Warning:` line is for something a run
+carries on past, such as a missing `prom` file on the Indy or Indigo2, which run
+their built-in PROM. Other options (`--scsi1`, `--cpu` and so on) apply first,
+as they do in a run.
+
+It checks that the file parses and has no unknown keys; that the settings agree
+(`machine.profile` with its processor, count, banks, graphics board and SCSI
+IDs, and the Unix serial sockets); that the PROM, every disk and CD image, the
+`load_elf` file and the NFS, TFTP and rsh directories exist; that the directories
+for the serial logs, serial sockets and scratch volumes exist; and that
+`serial_port_a`, `serial_port_b`, `monitor_port` and `gdb_port` are different
+ports. Whether a port is free, or a file is a valid image, is only known when a
+machine starts.
+
+---
+
 ## Command-line options
 
 All options are optional and override the corresponding `iris.toml` value.
@@ -756,8 +784,9 @@ Configuration
   --prom <FILE>               PROM image
   --nvram <FILE>              NVRAM file (default: nvram.bin)
   --nveeprom <FILE>           Indigo2 NVRAM EEPROM file (default: nveeprom.bin)
-  --ip22                      Emulate an Indigo2 (IP22) instead of an Indy (IP24)
-  --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact
+  --machine <NAME>            Machine to emulate (a [machine] profile name); `help` lists them
+  --ip22                      Same as --machine indigo2_ip22
+  --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12
   --cpu <MODEL>               r4400 (default), r5000, or r10000
   --bank0..--bank3 <MB>       RAM bank sizes (0/8/16/32/64/128; IP28: also 256/512)
   --clock-fixed-mhz <MHZ>     CP0 Count frequency (IP22/IP24: 33; IP28: 97.5)
@@ -766,6 +795,7 @@ Storage
   --scsi1/2/3/7 <FILE>        Hard disk image at that SCSI ID
   --cdrom4/5/6 <FILE>         CD-ROM primary disc at that SCSI ID
   --cdrom4/5/6-extra <ISO>    Additional changer disc (repeatable)
+  --no-write-cache            Turn every hard disk's write cache off (write_cache = false): slower, but a host crash loses no completed write
   --no-scsi-deferred-int      Disable deferred SCSI status interrupts
 
 Display and audio
@@ -785,12 +815,14 @@ Networking
 
 Automation and debugging
   --ci                        Enable the CI socket; hide the window unless --ci-display
-  --ci-socket <PATH>          Socket path (default /tmp/iris.sock)
+  --ci-socket <PATH>          Socket path (default iris.sock in $TMPDIR, else /tmp;
+                              iris-ci must share TMPDIR or be given the path)
   --ci-display                With --ci, keep the window
   --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
   --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
   --monitor-port <PORT>       Monitor TCP port (default 8888)
   --vnc [ADDR]                VNC server on ADDR (host:port or port; default 127.0.0.1:5900)
+  --validate                  Check the --config file and exit; 0 if iris would start
   --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
   --serial-port-b <PORT>      Serial channel B TCP port (default 8881)
   --serial-socket-a <PATH>    Also serve channel A on a Unix socket
@@ -946,3 +978,10 @@ A snapshot refuses to load onto a different CPU model or host architecture. See
 [snapshot coverage](STORAGE.md#snapshots-and-rollback) and `clanker/snapshot/`.
 GR2 currently omits VRAM/full drawing state; IMPACT saves no board state yet.
 See [TODO.md](clanker/TODO.md) for device/checkpoint completion work.
+
+The Indy, Indigo2, O2 and Octane have snapshots. An Octane snapshot is
+refused with two processors or with an IMPACT or VPro board fitted: the stop
+does not yet bring both processors to one recorded instruction boundary, and
+neither board saves its state. Loading an Octane snapshot writes its boot flash and
+NVRAM over the configured flash and NVRAM files, so a PROM flashed since the
+save is replaced by the one the snapshot holds.

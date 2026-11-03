@@ -1043,6 +1043,31 @@ fn an_acknowledgement_does_not_erase_a_later_completion() {
 }
 
 #[test]
+fn clearing_the_interrupt_keeps_a_completion_the_driver_was_not_shown() {
+    let r = Rig::with_disk("unseen", 0, 64);
+    let (probe, line) = LevelProbe::line();
+    r.isp.connect_interrupt(line);
+    r.init_rings(8, 8);
+    r.w(reg::BUS_CTRL, CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE);
+    r.put_entry(0, &tur_entry(0x5001));
+    r.doorbell(1);
+    assert_eq!(r.r(reg::RESPONSE_QUEUE), 1, "the driver reads the producer count");
+    // The next completion lands after that read and before the driver
+    // clears the interrupt: a model with no bus latency does this at once.
+    r.put_entry(1, &tur_entry(0x5002));
+    r.doorbell(2);
+    r.w(reg::RESPONSE_QUEUE, 1);
+    r.ack();
+    assert!(probe.level(), "the clear must not swallow a completion nobody has been shown");
+    assert_eq!(r.r(reg::BUS_STATUS), STATUS_INT_REQ | STATUS_RISC_INT_REQ);
+    assert_eq!(r.r(reg::RESPONSE_QUEUE), 2);
+    r.w(reg::RESPONSE_QUEUE, 2);
+    r.ack();
+    assert!(!probe.level(), "once the driver has read it, the clear drops the line");
+    assert_eq!(r.r(reg::BUS_STATUS), 0);
+}
+
+#[test]
 fn a_held_completion_posts_and_resignals_when_the_driver_frees_room() {
     let r = Rig::with_disk("held", 0, 64);
     r.init_rings(8, 4);
@@ -1606,6 +1631,24 @@ const S: i64 = 1_000_000_000;
 /// A bus reset of `bus` with `secs` seconds of hold-off.
 fn bus_reset(r: &Rig, secs: u16, bus: u16) {
     assert_eq!(r.cmd(&[mbox::BUS_RESET, secs, bus]), mbox::COMPLETE);
+}
+
+/// A bus reset puts a disk's write cache bit back to the value it powers up
+/// with, before the next command: a guest that cleared WCE finds it set again.
+#[test]
+fn a_bus_reset_puts_a_disks_write_cache_back() {
+    let r = Rig::bare();
+    r.isp.bus().attach_cached_image(1, &image("wce-reset", 64)).expect("attach");
+    r.init_rings(4, 4);
+    r.isp.bus().select_write_cache(1, false);
+    assert!(!r.isp.bus().write_cache_reported(1), "the guest cleared it");
+    bus_reset(&r, 0, 0);
+    // MODE SENSE(6) of the caching page, through the ring.
+    r.put_entry(0, &request(0x31, 1, &[0x1a, 0x08, 0x08, 0, 24, 0], &[(BUF, 24)]));
+    r.doorbell(1);
+    assert_eq!(g16(&r.status(0), 10), IOCB_COMPLETE);
+    assert_eq!(r.mem.get(BUF + 4, 1)[0], 0x08, "caching page");
+    assert_eq!(r.mem.get(BUF + 6, 1)[0] & 0x04, 0x04, "WCE is back");
 }
 
 /// A TUR for the disk at target 1.

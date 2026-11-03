@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::config::{CpuModel, MachineConfig};
+use crate::config::{CpuModel, MachineConfig, MachineProfile};
 use crate::cpu::mips_core::CyclesPtr;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_cache_shadow::{R10000O2ShadowCache, R5000ShadowCache};
@@ -162,11 +162,7 @@ impl O2Machine {
         let o2 = &cfg.o2;
         // `prom`, or the last release's file when `prom` is the shared default
         // and that file is not there: there is no embedded O2 PROM.
-        let prom_path = if cfg.prom != crate::config::DEFAULT_PROM || std::path::Path::new(&cfg.prom).exists() {
-            cfg.prom.clone()
-        } else {
-            O2_PROM_FILE.to_string()
-        };
+        let prom_path = MachineProfile::O2Ip32.prom_path(&cfg.prom);
         let prom = std::fs::read(&prom_path)
             .map_err(|e| format!("O2 PROM {prom_path}: {e} (set `prom` to the O2 PROM image; 4.18 is the last release)"))?;
         // `banks`: the kit in each DIMM pair from A (validate checked them).
@@ -224,7 +220,11 @@ impl O2Machine {
         let (mut nat, mut frames) = (None, None);
         let net = crate::net::GatewayConfig::from_network(&cfg.network());
         if let Some(link) = crate::net::Link::with_gateway(net.clone())? {
-            eprintln!("iris: O2 Ethernet on NAT: gateway {}, guest {} (DHCP)", net.gateway_ip, net.client_ip);
+            if net.mode == crate::config::NetMode::Stream {
+                eprintln!("iris: O2 Ethernet on {}", link.describe());
+            } else {
+                eprintln!("iris: O2 Ethernet on NAT: gateway {}, guest {} (DHCP)", net.gateway_ip, net.client_ip);
+            }
             frames = Some(link.frames());
             nat = Some((link.nat(), (net.client_ip, net.gateway_ip, net.netmask)));
             bus.mace.mec.attach(link);
@@ -664,37 +664,8 @@ impl O2Machine {
                 m.schema_version
             ));
         }
-        // As the Indy: build, CPU and disks must match;
-        // IRIS_SNAPSHOT_SKIP_CHECK=1 makes those warnings.
-        let mut fatal = Vec::new();
-        let features: Vec<String> = m.features.iter()
-            .filter(|f| !crate::snapshot::RETIRED_FEATURES.contains(&f.as_str())).cloned().collect();
-        if features != crate::snapshot::enabled_features() {
-            fatal.push(format!("build features differ: snapshot [{}] vs current [{}]",
-                m.features.join(","), crate::snapshot::enabled_features().join(",")));
-        }
-        if let Some(e) = crate::snapshot::cpu_model_mismatch(m.cpu_model.as_deref(), self.cpu.model_name()) {
-            fatal.push(e);
-        }
-        if let Some(e) = crate::snapshot::cache_model_mismatch(m.cpu_cache.as_deref(), m.cpu_model.as_deref(), self.cpu.cache_kind()) {
-            fatal.push(e);
-        }
-        for d in &m.disks {
-            match self.disks.iter().find(|c| c.id == d.id) {
-                None => fatal.push(format!("snapshot disk {}:{} ('{}') is not configured in this run", d.id / 16, d.id % 16, d.path)),
-                Some(c) if c.size_bytes != d.size_bytes => fatal.push(format!(
-                    "disk {}:{} ('{}') size differs: snapshot {} bytes vs current {}", d.id / 16, d.id % 16, d.path, d.size_bytes, c.size_bytes)),
-                Some(_) => {}
-            }
-        }
-        if !fatal.is_empty() {
-            let msg = format!("snapshot provenance mismatch:\n  - {}", fatal.join("\n  - "));
-            if std::env::var("IRIS_SNAPSHOT_SKIP_CHECK").is_ok_and(|v| !v.is_empty() && v != "0") {
-                eprintln!("load_snapshot: {msg} [IRIS_SNAPSHOT_SKIP_CHECK set; continuing]");
-            } else {
-                return Err(format!("{msg}\n(set IRIS_SNAPSHOT_SKIP_CHECK=1 to override)"));
-            }
-        }
+        // As the Indy: build, CPU and disks must match.
+        crate::snapshot::check_provenance(&m, self.cpu.model_name(), self.cpu.cache_kind(), &self.disks)?;
         let sv = m.schema_version;
         let state = |base: &str| snap.read_state(base, sv).map_err(|e| format!("{base}: {e}"));
         let chunks = snap.read_chunks_manifest().map_err(|e| format!("chunks.bin: {e}"))?;

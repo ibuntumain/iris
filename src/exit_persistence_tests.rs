@@ -82,10 +82,11 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Where `--ci` keeps its overlays, which are named for the process.
+/// Where `--ci` keeps its overlays, which are named for the process and the
+/// run.
 fn ci_overlays() -> Vec<PathBuf> {
-    let prefix = format!("iris-ci-{}-scsi", std::process::id());
-    std::fs::read_dir("/tmp")
+    let prefix = format!("iris-ci-{}-", std::process::id());
+    std::fs::read_dir(std::env::temp_dir())
         .map(|rd| {
             rd.flatten()
                 .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
@@ -234,8 +235,9 @@ fn config(machine: Machine, dir: &Dir, ci: bool) -> MachineConfig {
     cfg.nvram = dir.file("nvram").display().to_string();
     cfg.nveeprom = dir.file("nveeprom").display().to_string();
     // CI mode keeps the CPU parked, gives the machine a serial backend for the
-    // control socket and moves the overlays to /tmp. Without it the machine is
-    // never started, so nothing runs. Port 0: the monitor takes any free port.
+    // control socket and moves the overlays to the temporary directory.
+    // Without it the machine is never started, so nothing runs. Port 0: the
+    // monitor takes any free port.
     cfg.ci = ci;
     cfg.monitor_port = Some(0);
     cfg.scsi.clear();
@@ -579,6 +581,28 @@ fn plain_main_return_then_drop() {
     round_trip(Machine::Indy, &[Exit::MainReturn, Exit::Drop], false, false)
 }
 
+/// A `--ci` run boots its disks from the images, not from an overlay an
+/// earlier run of the same process ID left in the temporary directory.
+#[test]
+fn a_ci_run_ignores_an_earlier_runs_overlay() {
+    let _serial = serial();
+    on_big_stack(|| {
+        let dir = Dir::new("earlier-run");
+        make_images(&dir);
+        let earlier = std::env::temp_dir().join(format!("iris-ci-{}-0-scsi1.overlay", std::process::id()));
+        std::fs::write(&earlier, vec![0xeeu8; BLOCKS * BLOCK]).unwrap();
+        let mut record = (BLOCKS as u64).to_le_bytes().to_vec();
+        for lba in 0..BLOCKS as u64 {
+            record.extend_from_slice(&lba.to_le_bytes());
+        }
+        std::fs::write(crate::cow_disk::sidecar_path_for(&earlier), record).unwrap();
+        let mut m = build(config(Machine::Indy, &dir, true));
+        Expect::new().check(&mut *m, "a fresh --ci run");
+        drop(m);
+        assert!(earlier.exists(), "the earlier run's overlay is left alone");
+    });
+}
+
 /// A guest reboot first changes what the exit has to cover.
 #[test]
 fn reset_then_power_off() {
@@ -697,7 +721,7 @@ fn no_process_exit_bypasses_the_flush() {
         // The bare-metal test device ends the run with the guest's exit code.
         ("dev/testdev.rs", 1, "bare-metal test device, a harness only"),
         // Command-line and configuration front ends: nothing is running yet.
-        ("config.rs", 5, "command-line and configuration errors"),
+        ("config.rs", 9, "command-line and configuration errors, the --validate result and --machine"),
         ("iris_ci_main.rs", 1, "the iris-ci client"),
         ("crash_diag.rs", 1, "fatal-signal handler: the process is already dying"),
     ];
